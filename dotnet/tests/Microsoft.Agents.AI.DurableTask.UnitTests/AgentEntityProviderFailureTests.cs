@@ -29,6 +29,56 @@ public sealed class AgentEntityProviderFailureTests
     private static readonly DurableDataConverter s_converter = new();
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ServiceOwnerConflictSkipsExternalStoreAndKeepsCorrelationRetryableAsync(bool failingStore)
+    {
+        EntityBatchResult seed = await DispatchAsync(CreateAgent(new ProbeClient(), new ProbeProvider()), null, "seed");
+        ProbeProvider provider = new()
+        {
+            Stage = failingStore ? "storeAfter" : null,
+            Failure = failingStore ? new IOException(PrivateMarker) : null,
+        };
+        ProbeClient client = new() { ResponseConversationId = "service-conversation" };
+        ChatClientAgent agent = new(client, new ChatClientAgentOptions
+        {
+            Name = "agent",
+            ChatHistoryProvider = provider,
+            ThrowOnChatHistoryProviderConflict = false,
+            ClearOnChatHistoryProviderConflict = false,
+        });
+
+        EntityBatchResult rejected = await DispatchAsync(agent, seed.EntityState, "retryable");
+
+        Assert.Null(rejected.FailureDetails);
+        Assert.Equal(typeof(DurableAgentHistoryBindingMismatchException).FullName, Failure(rejected).ErrorType);
+        Assert.Equal(seed.EntityState, rejected.EntityState);
+        Assert.Empty(Actions(rejected));
+        Assert.Equal(1, provider.LoadCount);
+        Assert.Equal(0, provider.StoreCount);
+        Assert.Equal(1, provider.RestoredVersion);
+        Assert.Equal(1, client.Count);
+        Assert.Same(provider, agent.ChatHistoryProvider);
+        DurableAgentState rolledBack = ReadState(rejected);
+        Assert.False(rolledBack.Data.TerminalResults!.ContainsKey("retryable"));
+        Assert.False(rolledBack.Data.CompletionReceipts!.ContainsKey("retryable"));
+        Assert.False(DurableAgentHistoryBinding.IsPendingProviderInitialization(rolledBack.Data.HistoryBinding));
+
+        ProbeProvider retryProvider = new();
+        ProbeClient retryClient = new();
+        EntityBatchResult retry = await DispatchAsync(
+            CreateAgent(retryClient, retryProvider), rejected.EntityState, "retryable");
+
+        Assert.Null(Result(retry).FailureDetails);
+        Assert.Equal(1, retryProvider.LoadCount);
+        Assert.Equal(1, retryProvider.StoreCount);
+        Assert.Equal(1, retryProvider.RestoredVersion);
+        Assert.Equal(1, retryClient.Count);
+        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome,
+            ReadState(retry).Data.CompletionReceipts!["retryable"].Outcome);
+    }
+
+    [Theory]
     [InlineData("load", "plain")]
     [InlineData("lazyLoad", "plain")]
     [InlineData("storeBefore", "plain")]
@@ -1026,6 +1076,7 @@ public sealed class AgentEntityProviderFailureTests
         public int Count { get; private set; }
         public List<ChatMessage> LastMessages { get; private set; } = [];
         public Exception? Failure { get; init; }
+        public string? ResponseConversationId { get; init; }
         public object? GetService(Type serviceType, object? serviceKey = null) => null;
         public void Dispose() { }
         public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
@@ -1042,7 +1093,10 @@ public sealed class AgentEntityProviderFailureTests
             {
                 throw this.Failure;
             }
-            yield return new ChatResponseUpdate(ChatRole.Assistant, "response");
+            yield return new ChatResponseUpdate(ChatRole.Assistant, "response")
+            {
+                ConversationId = this.ResponseConversationId,
+            };
         }
     }
 
