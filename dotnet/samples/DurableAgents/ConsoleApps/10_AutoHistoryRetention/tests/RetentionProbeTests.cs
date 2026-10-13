@@ -16,6 +16,77 @@ namespace AutoHistoryRetentionTests;
 public sealed class RetentionProbeTests
 {
     [Fact]
+    public void ExternalConsumerConfiguresPublicAutoWithoutTestHooks()
+    {
+        DurableAgentsOptions? configured = null;
+        ServiceCollection services = new();
+        services.ConfigureDurableAgents(options =>
+        {
+            HistoryRetentionDemo.ConfigureRetention(options);
+            configured = options;
+        });
+
+        Assert.NotNull(configured);
+        Assert.Equal(DurableAgentHistoryRetentionMode.Auto, configured.HistoryRetentionMode);
+        Assert.Equal(HistoryRetentionDemo.MaxStateBytes, configured.MaxStateBytes);
+        Assert.Equal(HistoryRetentionDemo.HighWatermark, configured.HistoryRetentionHighWatermark);
+        Assert.Equal(HistoryRetentionDemo.LowWatermark, configured.HistoryRetentionLowWatermark);
+    }
+
+    [Theory]
+    [InlineData("missingBudget")]
+    [InlineData("keepAllBudget")]
+    [InlineData("reversedWatermarks")]
+    public void InvalidPublicSettingsRejectBeforeFactoryOrTransportCallbacks(string kind)
+    {
+        int callbacks = 0;
+        ServiceCollection services = new();
+        Assert.Throws<InvalidOperationException>(() => services.ConfigureDurableAgents(
+            options =>
+            {
+                options.AddAIAgentFactory("agent", _ =>
+                {
+                    callbacks++;
+                    return new RecordingAgent("agent");
+                });
+                if (kind != "keepAllBudget")
+                {
+                    options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+                }
+                if (kind != "missingBudget")
+                {
+                    options.MaxStateBytes = 32 * 1024;
+                }
+                if (kind == "reversedWatermarks")
+                {
+                    options.HistoryRetentionLowWatermark = 0.9;
+                    options.HistoryRetentionHighWatermark = 0.8;
+                }
+            },
+            workerBuilder: _ => callbacks++,
+            clientBuilder: _ => callbacks++));
+
+        Assert.Equal(0, callbacks);
+    }
+
+    [Theory]
+    [InlineData("Endpoint=http://localhost:8080;Authentication=None")]
+    [InlineData("Endpoint=http://localhost:8080;TaskHub=default;Authentication=None")]
+    [InlineData("Endpoint=http://localhost:8080;TaskHub=DEFAULT;Authentication=None")]
+    [InlineData("Endpoint=http://localhost:8080;TaskHub=;Authentication=None")]
+    public void SampleRejectsMissingOrDefaultHub(string connection)
+    {
+        Assert.Throws<ArgumentException>(() => HistoryRetentionDemo.ValidateIsolatedConnection(connection));
+    }
+
+    [Fact]
+    public void SampleAcceptsExplicitNonDefaultHub()
+    {
+        HistoryRetentionDemo.ValidateIsolatedConnection(
+            "Endpoint=http://localhost:8080;TaskHub=retention-isolated-demo;Authentication=None");
+    }
+
+    [Fact]
     public void ProductionAgentOptionsEnforceBoundedModelOutput()
     {
         ChatClientAgentOptions options = HistoryRetentionDemo.CreateAgentOptions();

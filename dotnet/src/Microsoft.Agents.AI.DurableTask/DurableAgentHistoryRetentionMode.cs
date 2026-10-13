@@ -5,7 +5,7 @@ namespace Microsoft.Agents.AI.DurableTask;
 /// <summary>
 /// Controls how durable agent conversation state is retained.
 /// </summary>
-internal enum DurableAgentHistoryRetentionMode
+public enum DurableAgentHistoryRetentionMode
 {
     /// <summary>
     /// Never proactively removes conversation entries. Persistence can still fail when a backend or provider
@@ -21,6 +21,8 @@ internal enum DurableAgentHistoryRetentionMode
     /// binding, provider continuation, TTL, and other execution-control state are protected. The newest
     /// transcript exchange and system messages are never evicted; if protected state cannot fit below the
     /// safe write threshold, the operation fails instead of persisting oversized state.
+    /// This mode explicitly enables schema 2 persistence for new durable sessions; it does not migrate
+    /// existing legacy sessions or delete history owned by an external provider or model service.
     /// </remarks>
     Auto,
 }

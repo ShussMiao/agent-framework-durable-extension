@@ -16,6 +16,8 @@ Durable agents extend the standard Microsoft Agent Framework with **durable stat
 > [!NOTE]
 > For a step-by-step tutorial and deployment guidance, see [Azure Functions (Durable)](https://learn.microsoft.com/agent-framework/integrations/azure-functions) on Microsoft Learn.
 
+.NET offers explicit opt-in [automatic durable-history retention](automatic-history-retention.md) for new isolated sessions. KeepAll and schema 1.2 remain the defaults. The guide distinguishes transcript retention from compaction, result expiry and entity TTL, and documents preservation of old sessions and rollback limits; Python's shared schema-2 reader is read-only, not an equivalent producer opt-in.
+
 ## How durable agents work
 
 Durable agents are implemented on top of [Durable Entities](https://learn.microsoft.com/azure/azure-functions/durable/durable-functions-entities) (also called "virtual actors"). Each **agent session** maps to one entity instance whose state contains the full conversation history. When you send a message to a durable agent, the following happens:

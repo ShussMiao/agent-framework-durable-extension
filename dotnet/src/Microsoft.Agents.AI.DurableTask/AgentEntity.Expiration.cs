@@ -133,7 +133,7 @@ internal partial class AgentEntity
             if (!this._options.EnablePersistentRequestOutcomes)
             {
                 throw new InvalidOperationException(
-                    $"Result expiration requires {nameof(DurableAgentsOptions.EnablePersistentRequestOutcomes)} to be enabled.");
+                    "Schema 2 result expiration requires explicit automatic history retention with a valid state budget.");
             }
 
             // Unlike a new run, cleanup must not assign history identities or promote legacy state.

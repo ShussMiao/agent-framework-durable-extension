@@ -3105,12 +3105,13 @@ public sealed class AgentEntityHistoryTests
     }
 
     [Fact]
-    public void AutoDoesNotInitializeMailboxStateWithoutInternalGate()
+    public void PublicAutoInitializesMailboxStateWithoutInternalGate()
     {
         DurableAgentsOptions options = new()
         {
             EnablePersistentRequestOutcomes = false,
             HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto,
+            MaxStateBytes = 32 * 1024,
         };
         Dictionary<Type, object> services = new()
         {
@@ -3124,10 +3125,10 @@ public sealed class AgentEntityHistoryTests
 
         DurableAgentState initialized = entity.Initialize(operation.Object);
 
-        Assert.Equal(DurableAgentState.CurrentSchemaVersion, initialized.SchemaVersion);
-        Assert.False(initialized.PersistentRequestOutcomesAuthorized);
-        Assert.Null(initialized.Data.TerminalResults);
-        Assert.Null(initialized.Data.CompletionReceipts);
+        Assert.Equal(DurableAgentState.RevisedSchemaVersion, initialized.SchemaVersion);
+        Assert.True(initialized.PersistentRequestOutcomesAuthorized);
+        Assert.Empty(initialized.Data.TerminalResults!);
+        Assert.Empty(initialized.Data.CompletionReceipts!);
     }
 
     [Fact]

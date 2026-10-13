@@ -60,8 +60,8 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
 
     protected override DurableAgentState InitializeState(TaskEntityOperation entityOperation)
     {
-        // Readers accept both state layouts, but this internal rollout gate controls whether this runtime may create
-        // a revised mailbox containing authoritative terminal results and completion receipts.
+        _ = this._options.GetRetentionSettings();
+        // Only an absent entity generation can initialize a new mailbox without legacy completion evidence.
         bool shouldInitializePersistentRequestOutcomes =
             this._options.EnablePersistentRequestOutcomes && IsAgentRunOperation(entityOperation);
         return shouldInitializePersistentRequestOutcomes
@@ -171,7 +171,9 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             {
                 throw new DurableAgentStateCorruptionException(
                     "Automatic history retention requires schema 2 mailbox state. Legacy terminal transcript " +
-                    "entries must be converted from independently authoritative complete history before delivery.");
+                    "entries must be converted from independently authoritative complete history before delivery. " +
+                    "Public Auto does not authorize legacy migration; preserve this session on its original " +
+                    "deployment and start a new isolated session.");
             }
             if (legacyMailboxMigrationRequested &&
                 migrationAuthorized &&
@@ -208,7 +210,8 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             this.State.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
         {
             throw new InvalidOperationException(
-                $"New persistent request outcomes require {nameof(DurableAgentsOptions.EnablePersistentRequestOutcomes)} to be enabled.");
+                "New schema 2 work requires explicit automatic history retention with a valid state budget. " +
+                "Disabling Auto does not downgrade existing state; retain Auto or use a separate legacy session.");
         }
 
         this._cancellationToken.ThrowIfCancellationRequested();
@@ -223,7 +226,9 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         {
             throw new DurableAgentStateCorruptionException(
                 "Automatic history retention requires schema 2 mailbox state. Legacy terminal transcript " +
-                "entries must be converted from independently authoritative complete history before execution.");
+                "entries must be converted from independently authoritative complete history before execution. " +
+                "Public Auto does not authorize legacy migration; preserve this session on its original " +
+                "deployment and start a new isolated session.");
         }
 
         DurableAgentState workingState = migrateLegacy

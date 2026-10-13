@@ -46,11 +46,14 @@ public sealed class DurableAgentsOptions
     /// Defaults to <see langword="false"/>.
     /// </summary>
     /// <remarks>
-    /// This internal switch supports execution tests only; it is not a production rollout API.
-    /// Public activation awaits shared contract, consumer/rollback, and late-duplicate policy agreement.
-    /// Readers support both layouts regardless of this setting.
+    /// Automatic history retention explicitly enables this writer for new entity generations.
+    /// The setter remains internal for execution tests; readers support both layouts regardless of this setting.
     /// </remarks>
-    internal bool EnablePersistentRequestOutcomes { get; set; }
+    internal bool EnablePersistentRequestOutcomes
+    {
+        get => field || this.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto;
+        set;
+    }
 
     /// <summary>
     /// Gets or sets whether a certified provider adapter may commit explicitly attested terminal failures.
@@ -84,8 +87,8 @@ public sealed class DurableAgentsOptions
     /// When persistent request outcomes are enabled, committed runs schedule entity-local payload cleanup.
     /// Physical removal may lag expiry; polling reports unavailable without modifying state.
     /// Imported states without a scheduled check need an explicit cleanup operation or a successful new run.
-    /// The schema-2 mailbox writer remains an internal, default-off rollout capability in this release, so this
-    /// public setting does not activate mailbox persistence by itself.
+    /// This setting does not activate mailbox persistence by itself. Explicitly enabling automatic history
+    /// retention activates schema 2 for new entity generations; existing legacy sessions are not migrated.
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">The retention period is not positive.</exception>
     public TimeSpan? ResultRetentionPeriod
@@ -131,13 +134,18 @@ public sealed class DurableAgentsOptions
     } = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    /// Gets or sets the internal pressure-retention mode.
+    /// Gets or sets retention for durable entity conversation history. Defaults to
+    /// <see cref="DurableAgentHistoryRetentionMode.KeepAll"/>.
     /// </summary>
     /// <remarks>
-    /// Pressure retention remains behind the same internal rollout gate as schema 2 mailbox writes.
-    /// It is not a public activation surface until every participating reader and rollback target is compatible.
+    /// <see cref="DurableAgentHistoryRetentionMode.Auto"/> explicitly enables schema 2 mailbox writes for
+    /// new entity generations and requires <see cref="MaxStateBytes"/>. Existing legacy sessions are rejected,
+    /// not automatically migrated. Use an isolated hub or independently segregated new sessions with
+    /// mailbox-aware workers, pollers, tools, and rollback binaries. This option cannot verify deployment routing.
+    /// Disabling Auto does not downgrade existing schema 2 state or authorize new work against it.
+    /// Receipt-bearing entities are not automatically deleted by the legacy idle TTL.
     /// </remarks>
-    internal DurableAgentHistoryRetentionMode HistoryRetentionMode
+    public DurableAgentHistoryRetentionMode HistoryRetentionMode
     {
         get;
         set => field = Enum.IsDefined(value)
@@ -149,9 +157,14 @@ public sealed class DurableAgentsOptions
     } = DurableAgentHistoryRetentionMode.KeepAll;
 
     /// <summary>
-    /// Gets or sets the explicit storage-envelope byte budget for internal automatic retention.
+    /// Gets or sets the explicit positive storage-envelope byte budget required by automatic retention.
     /// </summary>
-    internal int? MaxStateBytes
+    /// <remarks>
+    /// The budget measures the complete UTF-8 escaped JSON-string entity state, including protected
+    /// results, completion receipts, session continuation and metadata. It is not a token or transcript limit.
+    /// Set this only with <see cref="DurableAgentHistoryRetentionMode.Auto"/>.
+    /// </remarks>
+    public int? MaxStateBytes
     {
         get;
         set => field = value is null or > 0
@@ -163,9 +176,11 @@ public sealed class DurableAgentsOptions
     }
 
     /// <summary>
-    /// Gets or sets an internal override for the fraction at which pressure retention starts.
+    /// Gets or sets the fraction of <see cref="MaxStateBytes"/> at which automatic retention starts.
+    /// Defaults to 0.85 when not specified.
     /// </summary>
-    internal double? HistoryRetentionHighWatermark
+    /// <remarks>Watermarks must satisfy 0 &lt; low &lt; high &lt;= 1 and require Auto mode.</remarks>
+    public double? HistoryRetentionHighWatermark
     {
         get;
         set
@@ -176,9 +191,14 @@ public sealed class DurableAgentsOptions
     }
 
     /// <summary>
-    /// Gets or sets an internal override for the fraction pressure retention targets.
+    /// Gets or sets the fraction of <see cref="MaxStateBytes"/> targeted by automatic retention.
+    /// Defaults to 0.70 when not specified.
     /// </summary>
-    internal double? HistoryRetentionLowWatermark
+    /// <remarks>
+    /// Watermarks must satisfy 0 &lt; low &lt; high &lt;= 1 and require Auto mode. If protected state
+    /// prevents reaching this target, a write can still succeed below the high watermark.
+    /// </remarks>
+    public double? HistoryRetentionLowWatermark
     {
         get;
         set
@@ -311,7 +331,7 @@ public sealed class DurableAgentsOptions
     /// <remarks>
     /// Registering an agent that a workflow already discovered is allowed: the explicit registration takes over,
     /// so an agent can be promoted to a standalone agent regardless of whether the workflow was configured first.
-    /// Static fixed-owner incompatibilities are rejected during this call when the internal schema 2 writer is
+    /// Static fixed-owner incompatibilities are rejected during this call when the schema 2 writer is
     /// active. Validation that depends on the completed options composition or restored session remains at entity
     /// execution time, before provider, session, or model side effects.
     /// </remarks>

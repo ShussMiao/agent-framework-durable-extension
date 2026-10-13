@@ -1,16 +1,26 @@
 # Opt-in Pressure Retention Sample
 
 > [!IMPORTANT]
-> This is a draft/experimental sample. Automatic transcript retention requires schema 2 mailbox
-> state, whose writer is internal and disabled by default. The runnable entry point fails closed
-> before reading credentials or contacting the model or DTS. Do not enable this scenario in
-> mixed-runtime production until Python, the dashboard, pollers, rollback tooling, and every other
-> reader meet the schema 2 rollout floor.
+> This sample explicitly enables public Auto retention and schema 2 for a new session. Use a fresh
+> isolated task hub with compatible workers, pollers, tools and rollback binaries. It requires a
+> feature-introducing build and the independently approved provider-failure change in
+> [#131](https://github.com/microsoft/agent-framework-durable-extension/pull/131), not a guessed released
+> package version. Existing 1.x sessions are rejected, not migrated. See the
+> [ordered upgrade, old-session isolation and rollback guide](../../../../../../docs/features/durable-agents/automatic-history-retention.md).
 
-The public sample source preserves the intended prompts, bounded model options, marker diagnostic,
-and OpenTelemetry registration. It does **not** configure a retention mode or state budget because
-those activation settings are internal. The real package unit tests apply the draft profile through
-the existing internal, default-disabled test hook.
+The entry point uses the supported public options, a bounded model response, an illustrative marker
+diagnostic and OpenTelemetry metrics. KeepAll remains the default outside this opt-in:
+
+```csharp
+services.ConfigureDurableAgents(options =>
+{
+    options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+    options.MaxStateBytes = 32 * 1024;
+    options.HistoryRetentionHighWatermark = 0.85;
+    options.HistoryRetentionLowWatermark = 0.70;
+    options.AddAIAgent(agent);
+});
+```
 
 ## Scenario
 
@@ -19,7 +29,7 @@ without printing their filler text, and asks the model to recall the exact marke
 retention. Agent instructions keep every response under 20 words and `MaxOutputTokens = 64`
 enforces a service-request bound so protected result mailboxes do not dominate the state floor.
 
-The 32 KiB budget was checked against schema 2 state containing eight bounded terminal results,
+The offline SDK tests check the 32 KiB budget against schema 2 state containing bounded terminal results,
 completion receipts, the fixed history binding, serialized agent session, and bookkeeping.
 Seven 4 KiB inputs plus their state envelopes cross the 85% high watermark, while the protected
 mailbox and session floor still fits below it. `Auto` can therefore remove old model-transcript
@@ -37,8 +47,9 @@ with an argument exception. The scenario validates before invoking callbacks or 
 invalid markers cannot cause model calls or mutate the session. Valid markers are preserved
 unchanged and compared using exact, case-sensitive matching.
 
-The real `Microsoft.Agents.AI.DurableTask.UnitTests` project provides the white-box correctness
-proof. It captures later model input, inspects persisted and reloaded entity state, retrieves the
+The real `Microsoft.Agents.AI.DurableTask.UnitTests` project provides white-box coverage through the
+SDK transactional entity batch dispatcher. It captures later model input, inspects serialized and
+reloaded state, retrieves the
 original completed result from the mailbox, and redelivers the original correlation while checking
 that the model is not executed again.
 
@@ -54,8 +65,11 @@ This is durable entity **pressure retention**, not Microsoft Agent Framework sta
 compaction or `FollowCompaction`. It does not summarize old messages. It removes old transcript
 from later model input while durable execution and delivery evidence remains available.
 
-This release exposes no public retention-mode selection. Internal `KeepAll` remains the
-default-off policy and performs no proactive transcript deletion.
+Public `KeepAll` remains the default and performs no proactive transcript deletion. Explicit Auto
+requires a positive byte budget; optional watermarks must satisfy `0 < low < high <= 1`.
+Do not switch active schema-2 sessions to default KeepAll expecting continued execution: it revokes
+writer authorization, not the persisted schema. Raising Auto's budget can reduce pressure only within
+verified backend limits. No public in-place legacy migration or receipt-deleting TTL is enabled.
 
 `Auto` cannot make every payload fit. A single oversized protected newest inline `DataContent`,
 tool result, terminal result, or other protected state can still exceed the high watermark. The
@@ -100,15 +114,31 @@ behavior when correctness matters.
 
 ## Run the sample
 
-The entry point is intentionally unsupported and exits before accessing credentials or services:
+Install the .NET 10 SDK and configure Microsoft CFS for package restores. Create a fresh task hub with
+only compatible workers; a non-default name and acknowledgement do not themselves certify isolation.
+Set the model configuration in your own shell, using an identity authorized for that model:
 
-```bash
-cd dotnet/samples/DurableAgents/ConsoleApps/10_AutoHistoryRetention
-dotnet run --framework net10.0
+```powershell
+$env:FOUNDRY_PROJECT_ENDPOINT = "https://YOUR-ENDPOINT/api/projects/YOUR-PROJECT"
+$env:FOUNDRY_MODEL = "YOUR-MODEL-DEPLOYMENT"
+$env:DURABLE_TASK_SCHEDULER_CONNECTION_STRING = "Endpoint=http://localhost:8080;TaskHub=retention-isolated-demo;Authentication=None"
+$env:DURABLE_AGENTS_ISOLATED_HUB = "true"
+Set-Location dotnet\samples\DurableAgents\ConsoleApps\10_AutoHistoryRetention
+dotnet restore --source https://packagefeedproxy.microsoft.io/nuget/v3/index.json
+dotnet run --framework net10.0 --no-restore
 ```
 
-It prints the draft-gate explanation and exits with code 2. A future public activation design must
-be reviewed before this becomes runnable.
+Enter a project topic of at most 80 characters. The host creates a new durable session, sends seven
+moderate notes and prints the diagnostic response with `Present`, `Unavailable` or `Inconclusive`.
+No wall-clock expiry wait is required. The default provider owns the entity transcript; no old or remote
+conversation is imported. `DefaultAzureCredential` is used for development; prefer a specific credential
+for production.
+
+Without the isolation acknowledgement, the entry point exits with code 2 before accessing model
+configuration or services. Missing/default task-hub configuration fails explicitly with no fallback.
+For an external NuGet consumer, replace the local product ProjectReference with a PackageReference to
+the actual feature-introducing evaluation package/build; AF dependency versions alone do not supply Auto.
+Backend/model execution requires your configured services; offline tests do not certify the hosted backend.
 
 ## Tests
 
@@ -116,7 +146,9 @@ be reviewed before this becomes runnable.
 dotnet test --project tests\10_AutoHistoryRetention.Tests.csproj -c Release -f net10.0
 ```
 
-The sample-local tests use only public APIs. They cover bounded agent options, prompt construction,
+The sample-local tests have no friend access and use only public APIs. They compile/configure Auto
+without internal switches, reject invalid options before factory/transport callbacks, validate explicit
+non-default hub selection, and cover bounded agent options, prompt construction,
 the no-wait marker diagnostic, conservative result classification, invalid-marker rejection before
 agent/model calls or output/session mutation, and real OpenTelemetry meter registration/export.
 
@@ -126,9 +158,11 @@ has friend access:
 ```powershell
 dotnet test --project ..\..\..\..\tests\Microsoft.Agents.AI.DurableTask.UnitTests\Microsoft.Agents.AI.DurableTask.UnitTests.csproj `
     -c Release -f net10.0 `
-    --filter-method "*DraftSampleProfileEvictsTranscriptButPreservesCompletionAndIdempotencyAsync"
+    --filter-class "*AgentEntityProviderFailureTests"
 ```
 
-That regression applies the draft profile through the internal test gate and proves transcript
-eviction, connected tool grouping, mailbox and receipt preservation, persisted-state reload,
-idempotent duplicate delivery, later model-input removal, and product retention telemetry.
+Those regressions exercise public Auto without internal writer/migration authorization through the SDK
+transactional dispatcher, including cold reload, mailbox/receipt preservation, duplicates, expiry,
+legacy rejection, provider/service boundaries, protected capacity and commit/outbox rollback. Existing
+history tests additionally cover connected tool/system grouping and attempt-level telemetry.
+Actual isolated-backend atomicity remains a separate merge/release gate.

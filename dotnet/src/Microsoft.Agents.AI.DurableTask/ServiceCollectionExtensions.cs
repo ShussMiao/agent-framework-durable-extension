@@ -136,6 +136,7 @@ public static class ServiceCollectionExtensions
 
         // Apply the configuration immediately to capture agent names for keyed service registration
         configure(sharedOptions);
+        _ = sharedOptions.Agents.GetRetentionSettings();
 
         // Register keyed services for any new agents
         RegisterAgentKeyedServices(services, sharedOptions);
