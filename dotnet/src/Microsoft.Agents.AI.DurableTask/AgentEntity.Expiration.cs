@@ -14,6 +14,31 @@ internal partial class AgentEntity
 {
     private static readonly TimeSpan s_minimumResultExpirationSignalDelay = TimeSpan.FromMinutes(1);
 
+    private bool ShouldPreserveLegacyCleanupState(TaskEntityOperation operation)
+    {
+        if (this._options.HistoryRetentionMode != DurableAgentHistoryRetentionMode.Auto ||
+            operation.HasInput ||
+            (!string.Equals(operation.Name, nameof(CheckAndExpireResults), StringComparison.OrdinalIgnoreCase) &&
+             !string.Equals(operation.Name, nameof(CheckAndDeleteIfExpired), StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        DurableAgentState? persistedState =
+            (DurableAgentState?)operation.State.GetState(typeof(DurableAgentState));
+        if (persistedState is null ||
+            persistedState.SchemaVersion == DurableAgentState.RevisedSchemaVersion ||
+            persistedState.Data.ExpirationTimeUtc.HasValue)
+        {
+            return false;
+        }
+
+        this._cancellationToken.ThrowIfCancellationRequested();
+        ValidateForCommit(persistedState);
+        // These legacy operations are no-ops. Bypass SDK write-back to preserve even noncanonical JSON bytes.
+        return true;
+    }
+
     /// <summary>
     /// Determines whether a scheduled result-expiration signal still owns the current persisted schedule generation.
     /// </summary>
@@ -109,7 +134,7 @@ internal partial class AgentEntity
         {
             this._cancellationToken.ThrowIfCancellationRequested();
             _ = DurableAgentStateSchemaVersion.ParseSupported(this.State.SchemaVersion);
-            if (IsMissingEntityPlaceholder(this.State))
+            if (this.IsMissingEntityPlaceholder(this.State))
             {
                 // A late signal must not resurrect an entity deleted in the meantime.
                 this.State = null!;
@@ -172,7 +197,7 @@ internal partial class AgentEntity
 
         // A delayed signal can outlive a deleted entity. TaskEntity initializes missing state
         // before dispatch, so remove that otherwise-empty placeholder instead of recreating it.
-        if (!expirationTime.HasValue && IsMissingEntityPlaceholder(this.State))
+        if (!expirationTime.HasValue && this.IsMissingEntityPlaceholder(this.State))
         {
             this.State = null!;
             return;
@@ -249,11 +274,13 @@ internal partial class AgentEntity
     }
 
     /// <summary>
-    /// Detects the empty state object created by the base dispatcher when a delayed signal targets a missing entity.
+    /// Detects an unchanged empty state created by the SDK for this operation, never a loaded snapshot or clone.
     /// </summary>
-    private static bool IsMissingEntityPlaceholder(DurableAgentState state)
+    private bool IsMissingEntityPlaceholder(DurableAgentState state)
     {
-        return state.Data.ConversationHistory.Count == 0 &&
+        // SDK 1.18 initializes only absent state. Shape alone cannot distinguish persisted empty legacy state.
+        return ReferenceEquals(state, this._initializedEntityGeneration) &&
+            state.Data.ConversationHistory.Count == 0 &&
             state.Data.TerminalResults is null &&
             state.Data.CompletionReceipts is null &&
             state.Data.HistoryBinding.ValueKind == JsonValueKind.Undefined &&

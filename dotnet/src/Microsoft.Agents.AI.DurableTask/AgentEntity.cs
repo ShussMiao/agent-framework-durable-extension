@@ -32,6 +32,8 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
     private readonly CancellationToken _cancellationToken = cancellationToken != default
         ? cancellationToken
         : services.GetService<IHostApplicationLifetime>()?.ApplicationStopping ?? CancellationToken.None;
+    private DurableAgentState? _initializedEntityGeneration;
+    private DurableAgentState? _initializedMailboxGeneration;
 
     /// <summary>
     /// Rejects stale scheduled result-expiration operations before the standard entity dispatcher can initialize
@@ -47,8 +49,15 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
     /// </remarks>
     ValueTask<object?> ITaskEntity.RunAsync(TaskEntityOperation operation)
     {
+        this._initializedEntityGeneration = null;
+        this._initializedMailboxGeneration = null;
         if (IsScheduledResultExpirationOperation(operation) &&
             !this.ShouldDispatchScheduledResultExpiration(operation))
+        {
+            return new ValueTask<object?>((object?)null);
+        }
+
+        if (this.ShouldPreserveLegacyCleanupState(operation))
         {
             return new ValueTask<object?>((object?)null);
         }
@@ -64,9 +73,17 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         // Only an absent entity generation can initialize a new mailbox without legacy completion evidence.
         bool shouldInitializePersistentRequestOutcomes =
             this._options.EnablePersistentRequestOutcomes && IsAgentRunOperation(entityOperation);
-        return shouldInitializePersistentRequestOutcomes
-            ? CreateEmptyPersistentRequestOutcomeState()
-            : base.InitializeState(entityOperation);
+        if (!shouldInitializePersistentRequestOutcomes)
+        {
+            this._initializedEntityGeneration = base.InitializeState(entityOperation);
+            return this._initializedEntityGeneration;
+        }
+
+        // SDK 1.18 calls InitializeState only when operation.State has no current state.
+        // Keep this operation-local identity; an empty imported mailbox is not a new generation.
+        this._initializedMailboxGeneration = CreateEmptyPersistentRequestOutcomeState();
+        this._initializedEntityGeneration = this._initializedMailboxGeneration;
+        return this._initializedMailboxGeneration;
     }
 
     /// <summary>

@@ -86,6 +86,8 @@ Every reachable worker, poller, host, importer, scheduler, dashboard and rollbac
 
 Existing 1.0/1.1/1.2 entities remain legacy under KeepAll. Auto rejects them before agent factories or model/provider callbacks, including an empty-looking transcript. Absence of truncation metadata is not proof that earlier completions were never evicted. The internal certified-fixture converter is not a supported public in-place migration API. Pruned/unknown history, old custom providers and unprovable completion indexes require isolation, not a trust callback, empty receipt maps or inferred receipts.
 
+No-input result or idle-TTL cleanup does not reset a persisted empty legacy snapshot into a new generation. Only state initialized by the SDK from actual absence in that operation can be discarded as a missing-entity placeholder. Cleanup therefore cannot authorize a following Auto run against that legacy session; the default KeepAll deployment's legitimate TTL expiration policy is unchanged.
+
 ## Rollback and disabling eviction
 
 1. Stop admission to the Auto namespace, drain or preserve inflight work, and export canonical schema-2 state plus provider continuation before changing runtime configuration.
