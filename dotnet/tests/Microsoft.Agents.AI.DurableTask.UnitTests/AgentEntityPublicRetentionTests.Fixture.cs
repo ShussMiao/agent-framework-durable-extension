@@ -1,4 +1,4 @@
-// Copyright (c) Microsoft. All rights reserved.
+﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System.Diagnostics.CodeAnalysis;
 using DurableTask.Core.Entities;
@@ -58,7 +58,7 @@ public sealed partial class AgentEntityPublicRetentionTests
             .AddSingleton(options)
             .AddSingleton(options.GetAgentFactories())
             .AddSingleton(new Mock<DurableTaskClient>("test").Object)
-            .AddSingleton<Microsoft.Extensions.Logging.ILoggerFactory>(NullLoggerFactory.Instance)
+            .AddSingleton<Extensions.Logging.ILoggerFactory>(NullLoggerFactory.Instance)
             .AddSingleton<TimeProvider>(new Clock(now))
             .AddSingleton(Mock.Of<IHostApplicationLifetime>())
             .BuildServiceProvider();
