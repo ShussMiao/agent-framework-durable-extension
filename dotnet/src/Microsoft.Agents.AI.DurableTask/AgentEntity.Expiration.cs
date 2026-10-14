@@ -152,7 +152,7 @@ internal partial class AgentEntity
         {
             this._cancellationToken.ThrowIfCancellationRequested();
             _ = DurableAgentStateSchemaVersion.ParseSupported(this.State.SchemaVersion);
-            if (this.IsMissingEntityPlaceholder(this.State))
+            if (IsMissingEntityPlaceholder(this.State))
             {
                 // A late signal must not resurrect an entity deleted in the meantime.
                 this.State = null!;
@@ -217,7 +217,7 @@ internal partial class AgentEntity
 
         // A delayed signal can outlive a deleted entity. TaskEntity initializes missing state
         // before dispatch, so remove that otherwise-empty placeholder instead of recreating it.
-        if (!expirationTime.HasValue && this.IsMissingEntityPlaceholder(this.State))
+        if (!expirationTime.HasValue && IsMissingEntityPlaceholder(this.State))
         {
             this.State = null!;
             return;
@@ -294,13 +294,11 @@ internal partial class AgentEntity
     }
 
     /// <summary>
-    /// Detects an unchanged empty state created by the SDK for this operation, never a loaded snapshot or clone.
+    /// Detects the empty state object created by the base dispatcher when a delayed signal targets a missing entity.
     /// </summary>
-    private bool IsMissingEntityPlaceholder(DurableAgentState state)
+    private static bool IsMissingEntityPlaceholder(DurableAgentState state)
     {
-        // Only this operation's SDK-created object proves absence; an equally empty loaded state is not disposable.
-        return ReferenceEquals(state, this._initializedEntityGeneration) &&
-            state.Data.ConversationHistory.Count == 0 &&
+        return state.Data.ConversationHistory.Count == 0 &&
             state.Data.TerminalResults is null &&
             state.Data.CompletionReceipts is null &&
             state.Data.HistoryBinding.ValueKind == JsonValueKind.Undefined &&

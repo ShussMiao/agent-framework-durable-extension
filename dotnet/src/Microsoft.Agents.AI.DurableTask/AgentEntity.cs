@@ -32,7 +32,6 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
     private readonly CancellationToken _cancellationToken = cancellationToken != default
         ? cancellationToken
         : services.GetService<IHostApplicationLifetime>()?.ApplicationStopping ?? CancellationToken.None;
-    private DurableAgentState? _initializedEntityGeneration;
     private DurableAgentDeploymentMode _deploymentMode;
     private bool _schemaV2WritesEnabled;
     private DurableAgentRetentionSettings _retentionSettings;
@@ -51,7 +50,6 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
     /// </remarks>
     ValueTask<object?> ITaskEntity.RunAsync(TaskEntityOperation operation)
     {
-        this._initializedEntityGeneration = null;
         this.CaptureOperationConfiguration();
         if (IsScheduledResultExpirationOperation(operation) &&
             !this.ShouldDispatchScheduledResultExpiration(operation))
@@ -81,16 +79,9 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         // Only an absent entity generation can initialize a new mailbox without legacy completion evidence.
         bool shouldInitializePersistentRequestOutcomes =
             this._schemaV2WritesEnabled && IsAgentRunOperation(entityOperation);
-        if (!shouldInitializePersistentRequestOutcomes)
-        {
-            this._initializedEntityGeneration = base.InitializeState(entityOperation);
-            return this._initializedEntityGeneration;
-        }
-
-        // SDK 1.18 calls InitializeState only when operation.State has no current state.
-        // Keep this operation-local identity; an empty imported mailbox is not a new generation.
-        this._initializedEntityGeneration = CreateEmptyPersistentRequestOutcomeState();
-        return this._initializedEntityGeneration;
+        return shouldInitializePersistentRequestOutcomes
+            ? CreateEmptyPersistentRequestOutcomeState()
+            : base.InitializeState(entityOperation);
     }
 
     private void CaptureOperationConfiguration()
