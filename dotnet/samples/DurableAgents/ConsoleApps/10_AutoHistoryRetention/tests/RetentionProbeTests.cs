@@ -1,7 +1,6 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text.Json;
 using AutoHistoryRetention;
@@ -16,66 +15,6 @@ namespace AutoHistoryRetentionTests;
 
 public sealed class RetentionProbeTests
 {
-    [Fact]
-    public async Task SampleEntryRequiresEnvironmentAcknowledgementBeforeServiceConfigurationAsync()
-    {
-        ProcessStartInfo start = new("dotnet")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-        start.ArgumentList.Add(typeof(HistoryRetentionDemo).Assembly.Location);
-        start.Environment.Remove("DURABLE_AGENTS_DEPLOYMENT_MODE");
-        using Process sample = Process.Start(start)!;
-        Task<string> output = sample.StandardOutput.ReadToEndAsync();
-        Task<string> error = sample.StandardError.ReadToEndAsync();
-        await sample.WaitForExitAsync(TestContext.Current.CancellationToken);
-
-        Assert.Equal(2, sample.ExitCode);
-        Assert.Empty(await output);
-        string message = await error;
-        Assert.Contains("Sample 10 uses environment configuration", message, StringComparison.Ordinal);
-        Assert.Contains("DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2", message, StringComparison.Ordinal);
-        Assert.Contains("DurableAgentsOptions.DeploymentMode", message, StringComparison.Ordinal);
-        Assert.Contains("DurableAgentDeploymentMode.SchemaV2", message, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void SampleConfigurationUsesSchemaV2AndDemoRetentionBudget()
-    {
-        DurableAgentsOptions? configured = null;
-        ServiceCollection services = new();
-        services.ConfigureDurableAgents(options =>
-        {
-            HistoryRetentionDemo.ConfigureRetention(options);
-            configured = options;
-        });
-
-        Assert.NotNull(configured);
-        Assert.Equal(DurableAgentDeploymentMode.SchemaV2, configured.DeploymentMode);
-        Assert.Equal(DurableAgentHistoryRetentionMode.Auto, configured.HistoryRetentionMode);
-        Assert.Equal(HistoryRetentionDemo.MaxStateBytes, configured.MaxStateBytes);
-        Assert.Equal(HistoryRetentionDemo.HighWatermark, configured.HistoryRetentionHighWatermark);
-        Assert.Equal(HistoryRetentionDemo.LowWatermark, configured.HistoryRetentionLowWatermark);
-    }
-
-    [Theory]
-    [InlineData("Endpoint=http://localhost:8080;Authentication=None")]
-    [InlineData("Endpoint=http://localhost:8080;TaskHub=default;Authentication=None")]
-    [InlineData("Endpoint=http://localhost:8080;TaskHub=DEFAULT;Authentication=None")]
-    [InlineData("Endpoint=http://localhost:8080;TaskHub=;Authentication=None")]
-    public void SampleRejectsMissingOrDefaultHub(string connection)
-    {
-        Assert.Throws<ArgumentException>(() => HistoryRetentionDemo.ValidateIsolatedConnection(connection));
-    }
-
-    [Fact]
-    public void SampleAcceptsExplicitNonDefaultHub()
-    {
-        HistoryRetentionDemo.ValidateIsolatedConnection(
-            "Endpoint=http://localhost:8080;TaskHub=retention-isolated-demo;Authentication=None");
-    }
-
     [Fact]
     public void ProductionAgentOptionsEnforceBoundedModelOutput()
     {

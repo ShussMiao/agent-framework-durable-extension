@@ -152,13 +152,12 @@ Backend/model execution requires your configured services; offline tests do not 
 dotnet test --project tests\10_AutoHistoryRetention.Tests.csproj -c Release -f net10.0
 ```
 
-The sample tests cover its environment-only entry guard, retention configuration, explicit non-default hub selection,
-bounded agent options, prompt construction,
+The sample tests cover bounded agent options, prompt construction,
 the no-wait marker diagnostic, conservative result classification, invalid-marker rejection before
 agent/model calls or output/session mutation, and real OpenTelemetry meter registration/export.
 
-The product unit tests cover public deployment and retention settings, early validation,
-and state/retention behavior through the SDK dispatcher:
+The product unit tests cover public deployment and retention settings, the sample's environment-only entry guard,
+retention configuration and non-default hub selection, early validation, and state/retention behavior through the SDK dispatcher:
 
 ```powershell
 dotnet test --project ..\..\..\..\tests\Microsoft.Agents.AI.DurableTask.UnitTests\Microsoft.Agents.AI.DurableTask.UnitTests.csproj `
