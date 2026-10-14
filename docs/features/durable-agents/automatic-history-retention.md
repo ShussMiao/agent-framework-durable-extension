@@ -1,59 +1,55 @@
-# Automatic durable-history retention in .NET
+# Automatic history retention in .NET
 
-Deployment acknowledgement and retention are independent. `Legacy` and `KeepAll` remain the .NET defaults: new state is schema 1.2 and no transcript is proactively removed. An acknowledged `SchemaV2` deployment writes canonical 2.0 with either KeepAll or Auto.
+Long-running agent sessions accumulate conversation history over time. **Automatic history retention (`Auto`)** keeps your durable entity state within a target byte budget by automatically pruning the oldest conversation turns when state size crosses a high watermark, while preserving completion receipts, active results, and recent context.
 
-Before activation, follow the shared [C# and Python schema-v2 migration guide](schema-v2-migration.md). It is the single operator guide for reader/fleet preparation, exact code/environment resolution, legacy preservation, routing, validation and rollback.
+> [!NOTE]
+> Automatic retention requires **Schema v2** (`DurableAgentDeploymentMode.SchemaV2` or `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`). By default, .NET uses `Legacy` (Schema `1.2.0`) and `KeepAll` (no pruning). For upgrade and task-hub rollout steps, see the [Schema v2 migration guide](schema-v2-migration.md).
+
+## Configuration
 
 ```csharp
 services.ConfigureDurableAgents(options =>
 {
     options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
     options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-    // Optional override; omitted or null uses 1,048,576 bytes (1 MiB).
+
+    // Optional: defaults to 1 MiB (1,048,576 bytes), 0.85 high watermark, 0.70 low watermark
     options.MaxStateBytes = 32 * 1024;
     options.HistoryRetentionHighWatermark = 0.85;
     options.HistoryRetentionLowWatermark = 0.70;
+
     options.AddAIAgent(agent);
 });
 ```
 
-Instead of assigning `DeploymentMode`, the exact environment value `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` can supply the acknowledgement. It does not prove routing or isolation. Auto without it or the code acknowledgement is rejected before factory/transport/model/provider execution or state mutation.
+You can also enable Schema v2 via the environment variable `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` instead of setting `options.DeploymentMode` in code.
 
-## Budget and ownership
+## How budgeting and pruning work
 
-Auto measures the full UTF-8 escaped JSON-string storage envelope, not token count, raw transcript size or Python's budget accounting. At the high watermark it removes an oldest prefix of eligible atomic transcript components toward low. A write may succeed below high without reaching low when protected components prevent further eviction.
+- **Whole-entity byte budget:** `Auto` measures the full serialized entity state (UTF-8 JSON storage envelope), not token count.
+- **Default budget and watermarks:** `MaxStateBytes` defaults to **1 MiB (`1,048,576` bytes)** when omitted or `null`. Watermarks default to `0.85` (high) and `0.70` (low), and must satisfy `0 < low < high <= 1` when `Auto` is active.
+- **Eviction behavior:** When the serialized state reaches `HistoryRetentionHighWatermark`, the runtime removes the oldest eligible conversation turns in atomic groups until the state fits below `HistoryRetentionLowWatermark` (or until only protected entries remain below the high watermark).
+- **Protected state (never pruned):**
+  - System messages
+  - The newest user/assistant exchange
+  - Connected tool-call and tool-result chains (turns and linked tool calls are evicted atomically—never half a turn)
+  - Terminal result mailbox payloads, completion receipts, session continuation, and history binding metadata
+- **When protected state exceeds the budget:** If a single large message, tool result, or accumulated receipts push the protected state over the high watermark even after all eligible history is removed, the turn fails with an `InvalidOperationException` rather than corrupting state or deleting completion receipts.
+- **Switching back to `KeepAll`:** Under `KeepAll`, `MaxStateBytes` and watermark values are ignored. You can switch `HistoryRetentionMode` from `Auto` to `KeepAll` without removing your budget settings.
 
-Auto defaults to exactly 1,048,576 bytes (1 MiB); a positive override changes that budget, while
-explicit null uses the default rather than disabling Auto. Auto watermarks satisfy `0 < low < high <= 1`.
-KeepAll ignores budget/watermark settings and never prunes because they are configured. Property domains
-remain positive-or-null for budget and finite fractions in (0, 1] for individual watermarks; their relationship
-is checked only under Auto. Backend/provider limits still apply under either policy.
+## History ownership and providers
 
-The newest exchange, system messages and connected correlation/tool groups are protected, along with mailbox results, permanent receipts, binding, continuation, bookkeeping and unknown JSON. A protected floor that cannot fit fails closed; external effects already made are not undone. Receipt growth is unbounded.
-
-| Owner | Both isolated policies |
+| History configuration | Behavior under `SchemaV2` (`KeepAll` and `Auto`) |
 | --- | --- |
-| Implicit default ChatClientAgent or generic PreloadEntityHistory | Entity transcript supplies context; only Auto can evict eligible groups |
-| Custom external provider | Stable provider key and restorable declared continuation; no transcript mirror or remote deletion |
-| Model-service conversation | Stable logical key and real restored conversation ID; no remote deletion |
-| Generic CurrentRequestOnly/opaque session | Explicit logical provider key; opaque session protected |
-| Explicit in-memory provider with reducers/filters or local per-service-call history | Rejected by the fixed-owner contract rather than silently replaced |
+| **Default (`ChatClientAgent` / entity-owned history)** | Conversation history is stored in the entity transcript; `Auto` prunes the oldest eligible turns under byte pressure. |
+| **Custom `ChatHistoryProvider`** | Requires `history.ProviderKey` and persisted `StateKeys` continuation. History lives in your external store; the entity does not mirror or delete it. |
+| **Service-managed conversation (e.g., Foundry thread ID)** | Requires `history.ProviderKey`. History lives in the model service; the entity stores only the conversation ID. |
+| **`CurrentRequestOnly` / opaque session** | Requires `history.ProviderKey`. Only the current turn is sent; opaque session state is preserved. |
+| **Explicit `InMemoryChatHistoryProvider` with custom reducers/filters** | Not supported under `SchemaV2` (rejected before execution). Use default entity history or a custom `ChatHistoryProvider`. |
 
-Result payload expiry is separate from transcript retention and preserves receipts. Schema-2 whole-entity TTL deletion is disabled. Auto does not implement FollowCompaction or model-context summarization.
+> [!TIP]
+> **Compaction vs. retention:** Agent Framework's `CompactionProvider` reduces which messages are sent to the model on each turn, whereas `Auto` retention prunes the durable entity state when approaching storage size limits. See [Sample 10](../../../dotnet/samples/DurableAgents/ConsoleApps/10_AutoHistoryRetention/README.md) for a runnable `Auto` retention example.
 
-## External callback failures are not terminal completion
+## External history providers and retry safety
 
-External providers and service-managed history remain allowed under both isolated KeepAll and Auto.
-Unrecovered external load/store callback errors propagate and roll back local state/outgoing signals;
-they do not create a framework failed receipt. A load error before model invocation leaves that model
-uncalled; a store error after execution can follow model/tool effects or a successful remote write.
-Retrying the same uncommitted correlation can execute again. Cancellation, timeout and response loss
-can also leave effects ambiguous. Successful committed receipts still deduplicate completed requests,
-but cannot protect uncommitted side effects.
-
-The application owns idempotency and reconciliation. See the shared guide's
-[operation-key, ledger, remote-lookup and outbox guidance](schema-v2-migration.md#make-retries-safe-in-your-application).
-Provider-failure finalization is tracked separately in
-[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
-
-Use [Sample 10](../../../dotnet/samples/DurableAgents/ConsoleApps/10_AutoHistoryRetention/README.md) for the bounded 32 KiB/.85/.70 demonstration. Configure measured production budgets against the real backend and validate atomicity, restart and duplicate delivery there; offline tests are not backend certification.
+External `ChatHistoryProvider` callbacks and tool calls run outside the durable entity transaction. If an external load or store callback throws an exception, the entity rolls back local state changes without creating a completion receipt, so a retry may execute the turn again ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)). See [Make retries safe in your application](schema-v2-migration.md#make-retries-safe-in-your-application) in the migration guide for idempotency-key patterns.

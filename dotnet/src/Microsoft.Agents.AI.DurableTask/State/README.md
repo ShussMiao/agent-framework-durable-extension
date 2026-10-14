@@ -76,20 +76,15 @@ other revised semantic checks consistently on read and write.
 ## Revised execution-state foundation
 
 > [!IMPORTANT]
-> Schema `2.0.0` is being adopted through a staged cross-runtime rollout. Production .NET readers and writers currently default to
-> schema `1.2.0`. Supported schema 2 is readable. SchemaV2 explicitly authorizes new schema-2 sessions with
-> either KeepAll or Auto; it does not convert existing 1.x entities.
+> Production .NET readers and writers default to Schema `1.2.0` (`Legacy`), while readers also accept Schema `2.0.0`. Setting `options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2` (or `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`) enables Schema `2.0.0` writes for new sessions with either `KeepAll` or `Auto` retention. Existing `1.x` entities are not converted in place.
 
 The mailbox contract and optional opaque history profile use schema `2.0.0`. This is intentionally a fail-closed major
 version: a 1.x worker preserves unknown fields but does not understand completion receipts, so allowing it to
 process revised state could rerun work whose transcript result was already removed. The .NET reader now
 supports schema-2 results and receipts, while new state continues to default to `1.2.0`.
-Enable new schema-2 sessions with `options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;`
-in code, or set `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` before startup. Retention is configured separately.
-Use the shared [C# and Python migration guide](../../../../docs/features/durable-agents/schema-v2-migration.md).
-Compatible routing is an operator requirement, not a capability detected by options. Existing 2.0 state
-is preserved rather than downgraded, and committed duplicates remain readable with writes disabled.
-New requests against existing 2.0 state fail before agent execution when writer authorization is disabled.
+See the [Schema v2 migration guide](../../../../docs/features/durable-agents/schema-v2-migration.md) for deployment and rollback guidance.
+Existing 2.0 state is preserved rather than downgraded, and committed duplicates remain readable when `DeploymentMode` is `Legacy`.
+New requests against existing 2.0 state fail before agent execution when `SchemaV2` is not enabled.
 In revised state, `terminalResults` stores immutable result envelopes by correlation ID outside
 `conversationHistory`, while `completionReceipts` retains completion evidence after a result payload expires.
 An `available` receipt requires a matching result; an `unavailable` receipt proves completion without a result
@@ -153,12 +148,7 @@ With the schema-2 writer enabled, one successful durable entity operation atomic
 terminal result and receipt together with that operation's session continuation, ingestion bookkeeping,
 entity-local transcript, whole-entity TTL, optional binding, and other local control state. External provider
 writes and tool side effects are outside that entity-local transaction. A failed outer invocation or durable
-commit does not establish a new completion receipt. Public external history-provider callback failures
-propagate without a failed receipt and preserve the last committed local continuation. A store failure
-after model/tool execution or a remote write can repeat effects on retry, including the same correlation.
-Local rollback never undoes external effects. External and service-managed history remain supported
-under KeepAll and Auto; applications own idempotency and reconciliation. See the
-[provider failure boundary](../README.md#durable-completion-and-delivery). A separate internal, default-off
+commit does not establish a new completion receipt. External history-provider callback exceptions roll back local state without creating a failed receipt ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)); see [Make retries safe in your application](../../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application). A separate internal, default-off
 finalization capability requires a certified adapter to explicitly attest accepted input, provider phase, and
 non-retryable/exhausted finality; the resulting session must serialize and the failed result, receipt, session,
 and accepted request evidence must pass the normal commit path. No generic exception/message/status inference
@@ -166,24 +156,16 @@ is permitted. Legacy conversion uses only retained authoritative
 terminal evidence, never calls the model/tools, and cannot invent receipts for already-evicted results.
 Previously persisted legacy state stays legacy unless independently authorized as complete history;
 retained transcript alone does not establish that authorization. Known truncation/compaction prevents
-conversion. Public SchemaV2 initializes 2.0 only for SDK-proven missing-state Run generations.
+conversion. Public `SchemaV2` initializes `2.0.0` only for newly created sessions.
 Whole-entity deletion of 2.0 state has a separate internal gate, disabled by default. Stored legacy
 deadlines cannot erase receipts, and there is no implicit schema-2 entity TTL.
-
-Provider-failure finalization is tracked separately in
-[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
-Use the shared [application retry-safety guidance](../../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application);
-durable receipts alone cannot deduplicate uncommitted side effects.
 
 Schema 2.0 must not be activated as a cross-language write format until every participating runtime either
 implements the mailbox/binding contract or explicitly rejects the new major version. The current C# reader is
 fail-closed for unsupported versions and defaults new writes to 1.2. Other runtimes require coordinated version
 gating before a 2.0 producer is enabled; preserving unknown fields alone is not sufficient because an
 unaware worker could ignore completion receipts and rerun completed work.
-Public activation does not verify backend atomicity or routing compatibility. Before deployment, validate
-state-and-outbox rollback, restart and duplicate dispatch against an actual isolated backend and worker.
-Mock-only coverage or a skipped integration test is insufficient. See the
-[integration safety and execution instructions](../../../tests/Microsoft.Agents.AI.DurableTask.IntegrationTests/README.md).
+See the [integration test instructions](../../../tests/Microsoft.Agents.AI.DurableTask.IntegrationTests/README.md) for verifying state-and-outbox rollback, restart, and duplicate dispatch against an isolated backend.
 
 ## State Examples
 

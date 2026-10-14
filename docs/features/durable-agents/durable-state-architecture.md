@@ -4,11 +4,7 @@ Each durable agent session is represented by one Durable Entity. The entity coor
 
 Schema 2 separates request completion from conversation history. A completed request remains completed when its transcript is removed or its result expires, and a resumed session uses exactly one source of conversation history.
 
-Schema `2.0.0` is an explicit .NET deployment acknowledgement through SchemaV2, supplied by code
-or the exact shared environment value. KeepAll and Auto independently select retention within that deployment.
-Readers accept supported 1.x and 2.0; default Legacy writes remain 1.2. Existing entities are not automatically
-migrated. Follow the shared [C# and Python migration guide](schema-v2-migration.md); compatible wire state is not
-permission to interchange mutable provider sessions or workflow engines.
+In .NET, Schema `1.2.0` (`Legacy`) is the default writer, while readers support both `1.x` and `2.0.0`. Opting into `DurableAgentDeploymentMode.SchemaV2` (or `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`) enables Schema `2.0.0` writes for new sessions, with either `KeepAll` or `Auto` history retention. Existing `1.x` entities are not migrated in place—see the [Schema v2 migration guide](schema-v2-migration.md).
 
 The [schema 2 contract](../../../schemas/README.md) defines the wire fields and cross-runtime invariants.
 
@@ -136,9 +132,7 @@ The application or external provider remains responsible for availability, autho
 ## History configuration
 
 Closed public replay choices are represented by `DurableAgentHistoryReplayMode`, with `PreloadEntityHistory` and `CurrentRequestOnly`.
-Resolved `DurableAgentDeploymentMode.SchemaV2` enables schema-2 writes for SDK-proven absent generations.
-KeepAll and Auto independently select retention; Auto defaults to a 1 MiB envelope budget with positive overrides. Loaded legacy
-state is not publicly migrated. History ownership remains a closed internal enum after resolution.
+`DurableAgentDeploymentMode.SchemaV2` enables Schema 2.0 writes for newly created sessions, while `KeepAll` and `Auto` independently configure history retention (`Auto` defaults to a 1 MiB budget). Existing `1.x` state is not migrated in place. History ownership remains a closed internal enum after resolution.
 
 Agent names and logical provider identities are open sets, so an enum is not appropriate for them. History policy is attached to `AddAIAgent` or `AddAIAgentFactory` through `DurableAgentHistoryOptions`; callers do not repeat the agent name. `DurableAgentHistoryProviderKey` validates the logical provider identity before registration. It crosses the JSON wire as a string for interoperability, but applications can define it once as a static typed value.
 
@@ -174,13 +168,7 @@ Only a successful outer entity operation publishes a new terminal result. The fo
 
 An external service or provider may have observed a call even when the entity commit fails. Schema 2 prevents a committed completion from being forgotten; it cannot make external side effects atomic with the entity store.
 
-Public C# external load/store callback failures do not create framework failed receipts. Load failure
-before model invocation leaves the model uncalled in that path; store failure after model/tool effects
-or remote writes leaves acknowledgement ambiguous. Retry may execute again under the same correlation.
-KeepAll and Auto both allow external and service-managed history; the application owns idempotency and
-reconciliation, including cancellation, timeout and response-loss ambiguity. See
-[application retry safety](schema-v2-migration.md#make-retries-safe-in-your-application) and
-[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
+External `ChatHistoryProvider` load and store callback failures propagate and roll back local entity state without creating a completion receipt ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)). See [Make retries safe in your application](schema-v2-migration.md#make-retries-safe-in-your-application) for idempotency guidance.
 
 ## Documentation authority
 

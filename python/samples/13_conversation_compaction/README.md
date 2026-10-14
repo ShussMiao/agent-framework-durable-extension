@@ -3,9 +3,7 @@
 Shows an agent whose conversation history is **persisted durably** and **compacted as it grows**,
 using the same configuration you would write for in-process Agent Framework.
 
-For schema-v2 deployment, retention and upgrade guidance, see the shared
-[schema-v2 migration guide](../../../docs/features/durable-agents/schema-v2-migration.md).
-The guide distinguishes current host and language behavior.
+For Schema v2 upgrade and history retention guidance, see the [Schema v2 migration guide](../../../docs/features/durable-agents/schema-v2-migration.md).
 
 > [!WARNING]
 > Use a new isolated task hub shared only with compatible canonical `2.0.0` workers and upgraded

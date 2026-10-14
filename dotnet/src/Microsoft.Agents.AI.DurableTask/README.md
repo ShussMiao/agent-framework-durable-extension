@@ -39,16 +39,7 @@ For a comprehensive tour of all the functionality, concepts, and APIs, check out
 
 ## Durable completion and delivery
 
-`DurableAgentsOptions.DeploymentMode` independently selects the state writer: Legacy/schema 1.2 is the
-default; SchemaV2 acknowledges a compatible isolated deployment for new schema-2 sessions.
-Set `options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;` in code, or set
-`DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` before startup. Both paths supply the same acknowledgement.
-Both KeepAll and Auto work with SchemaV2. Auto uses a 1 MiB budget by default, permits a positive
-`MaxStateBytes` override, and validates watermarks; it never activates a writer or migrates 1.x state.
-Budget/watermark settings are inert under KeepAll.
-See the shared [C# and Python migration guide](../../../docs/features/durable-agents/schema-v2-migration.md),
-[retention API and provider matrix](../../../docs/features/durable-agents/automatic-history-retention.md)
-and [runnable Sample 10](../../samples/DurableAgents/ConsoleApps/10_AutoHistoryRetention/README.md).
+`DurableAgentsOptions.DeploymentMode` selects the state schema for new sessions: `Legacy` (Schema `1.2.0`) is the default, and `SchemaV2` (`options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;` or `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`) enables Schema `2.0.0` with either `KeepAll` or `Auto` history retention. `Auto` defaults to a 1 MiB (`1,048,576` bytes) state budget and `0.85`/`0.70` watermarks; under `KeepAll`, budget and watermark settings are ignored. See [Automatic history retention in .NET](../../../docs/features/durable-agents/automatic-history-retention.md), the [Schema v2 migration guide](../../../docs/features/durable-agents/schema-v2-migration.md), and [Sample 10](../../samples/DurableAgents/ConsoleApps/10_AutoHistoryRetention/README.md).
 
 An invocation correlation ID is an idempotency key, not a transcript position. Do not reuse it for
 different work. Legacy state resolves terminal responses and errors from the retained transcript.
@@ -90,27 +81,7 @@ own idempotency guarantees.
 
 Only a successfully committed outer invocation creates a new success receipt. Validation failures,
 cancellation, ordinary model/provider errors, serialization/capacity failures, and failed entity commits
-remain retryable; they are not converted into terminal receipts.
-
-**External and service-managed history remain supported under isolated KeepAll and Auto.** Unrecovered
-external history-provider load/store callback errors propagate and roll back local state and staged
-outgoing signals without a new framework failed result or receipt. A load failure before model invocation
-leaves that model uncalled; a store failure after execution may follow model/tool effects or a successful
-remote write. Retrying the same uncommitted correlation can execute again: this is an **at-least-once
-retry risk**, not remote rollback or exactly-once execution. Cancellation, timeout, response loss and
-uncertain commit acknowledgement can likewise be ambiguous after execution begins. Committed successful
-receipts deduplicate completed correlations, not effects for which no receipt was committed.
-
-Applications own idempotency and reconciliation: propagate a stable application operation key to tools,
-APIs and provider records, persist completed results and Pending/Completed/Ambiguous ledger entries,
-upsert deterministic message IDs, query remote status before retry and use a transactional outbox only
-where an actual transaction exists. Fence automatic retries and reconcile non-idempotent ambiguous actions
-manually. `RunRequest.CorrelationId` is internal; `DurableAgentContext` has no public correlation-ID accessor.
-See [public examples and recovery guidance](../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application).
-Provider-failure finalization is tracked separately in
-[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
-
-A separate internal capability can commit
+remain retryable; they are not converted into terminal receipts. External and service-managed history providers are supported under both `KeepAll` and `Auto`, and callback exceptions roll back local entity state without recording a completion receipt ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)). See [Make retries safe in your application](../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application) for idempotency guidance. A separate internal capability can commit
 a provider failure only when a certified adapter explicitly attests the provider phase (`Load`, `Invoke`,
 or `Store`), finality (`NonRetryable` or `RetriesExhausted`), and accepted input. The runtime then serializes
 the resulting session, validates sanitized error metadata, and commits the failed result and receipt through
@@ -132,20 +103,9 @@ before this layer can implement that retry safely.
 Completion receipts last until entity deletion. `DurableAgentsOptions.ResultRetentionPeriod` defaults
 to the shared 60-second delivery window and accepts another positive duration or `null` for no payload
 expiry. Result-payload retention and whole-entity TTL are separate policies. Deleting the entity also deletes its
-idempotency evidence. SchemaV2 is the explicit schema-2 deployment acknowledgement for new entity generations,
-independently of KeepAll or Auto.
-Every participating worker, client and reader must support schema v2 or reject it and remain isolated from it.
-Applications must enforce this routing; options cannot certify a distributed fleet.
-Receipt-deleting entity TTL and independently attested legacy conversion remain internal test capabilities,
-disabled by default. There is no public migration callback or receipt-deletion switch.
-Existing legacy sessions are rejected by either isolated retention policy before execution; retain them on their original deployment
-and start a new isolated namespace/session rather than infer complete evidence from a retained or empty transcript.
-Changing Auto to KeepAll retains schema-2 writer authorization when SchemaV2 remains acknowledged.
-Returning to Legacy leaves revised state readable for committed duplicates but rejects new schema-2 work
-and mutating result cleanup. Raising Auto's budget can reduce eviction only within verified backend limits.
+idempotency evidence. `SchemaV2` enables Schema 2.0 writes for new sessions independently of `KeepAll` or `Auto`, while existing `1.x` sessions are rejected rather than migrated in place. Switching `Auto` to `KeepAll` stops pruning while continuing Schema 2.0 writes; reverting to `Legacy` leaves existing Schema 2.0 state readable for committed duplicates and polling while rejecting new Schema 2.0 turns.
 Legacy TTL behavior is preserved, but old deadlines cannot delete schema-2 receipts without a separately agreed
-deletion policy. Unknown-field
-preservation by an older worker is not sufficient. See [state compatibility](State/README.md).
+deletion policy. See [state compatibility](State/README.md).
 
 With the mailbox writer explicitly enabled, a successful new run also removes already-expired mailbox
 payloads and maintains one logical entity-local `CheckAndExpireResults` schedule for the earliest
@@ -327,12 +287,9 @@ decorators; this implementation does not use reflection, type-name scanning, gue
 factory double invocation.
 
 Pressure retention is an explicit public opt-in. Default `KeepAll` performs no proactive history
-eviction; backend or provider size limits can still reject a write. Public Auto uses exactly 1,048,576 bytes
-by default; a positive `MaxStateBytes` overrides it, and explicit null resolves to that default rather than
-disabling Auto. Budget/watermark settings, including overrides, are behaviorally inert under KeepAll.
+eviction; backend or provider size limits can still reject a write. Public `Auto` defaults to 1 MiB (`1,048,576` bytes); a positive `MaxStateBytes` overrides it, and `null` uses the 1 MiB default. Under `KeepAll`, budget and watermark settings are ignored.
 
-The high and low watermarks default to 0.85 and 0.70. Property values must be finite fractions in (0, 1];
-Auto additionally requires `low < high`, while KeepAll ignores their relationship. The high watermark
+The high and low watermarks default to 0.85 and 0.70 (`0 < low < high <= 1` when `Auto` is active). The high watermark
 starts a retention attempt, which removes the oldest eligible
 transcript groups toward the low watermark. Measurement serializes the complete extension state through the
 durable converter and then measures its JSON-string storage envelope, including quote, backslash, and non-ASCII
@@ -340,10 +297,7 @@ escaping. The state includes terminal-result mailboxes, completion receipts, fix
 provider or agent continuation, TTL, ingestion and workflow bookkeeping, truncation evidence, media, and
 metadata. Backend framing outside that stored string remains backend-specific.
 
-Public Auto never authorizes conversion of loaded legacy sessions, even if their transcript looks complete
-or empty. The independently certified-fixture converter remains internal; preserve old sessions by isolation.
-Legacy Auto operations fail before model or provider side effects. A deterministically impossible protected floor, including the accepted
-request for entity-owned history, is also rejected before model/provider invocation.
+Public `Auto` does not convert existing `1.x` sessions in place; `SchemaV2` rejects existing `1.x` sessions before model or provider calls. A protected floor that already exceeds the budget is also rejected before model or provider invocation.
 
 Only `conversationHistory` transcript entries are eligible for pressure eviction. Mailbox result envelopes,
 completion receipts, fixed history binding, serialized continuation, TTL, and other execution controls are
@@ -367,9 +321,7 @@ the budget, in which case retention fails atomically without committing the work
 > in [the accepted review follow-up](https://github.com/microsoft/agent-framework-durable-extension/pull/97#discussion_r4168013183).
 
 Schema 2 mailbox results remain authoritative after their transcript copies are removed, so duplicate execution
-and polling return the same retained result. History ownership alone cannot certify complete legacy
-completion evidence; either public SchemaV2 retention policy rejects existing 1.x sessions without conversion. Retention itself fails closed if legacy transcript terminals are still the
-only completion evidence.
+and polling return the same retained result. Existing `1.x` sessions are rejected under `SchemaV2` rather than converted in place.
 
 If all eligible transcript is removed and the protected floor still reaches the high watermark,
 the operation fails with an `InvalidOperationException` describing the protected floor without committing the

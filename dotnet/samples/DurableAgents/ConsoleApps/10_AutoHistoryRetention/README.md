@@ -1,24 +1,14 @@
-# Opt-in Pressure Retention Sample
+# Automatic History Retention Sample
 
-> [!IMPORTANT]
-> This sample selects SchemaV2 in code and enables public Auto retention for a new session.
-> For real deployments, use schema-v2-compatible versions in a fresh isolated hub with compatible workers,
-> clients and readers. Existing 1.x sessions are rejected, not migrated. Follow the shared
-> [C# and Python migration guide](../../../../../docs/features/durable-agents/schema-v2-migration.md).
+> [!NOTE]
+> This sample enables **Schema v2** (`DurableAgentDeploymentMode.SchemaV2`) and **Automatic history retention** (`DurableAgentHistoryRetentionMode.Auto`) for a new durable agent session. For production upgrade and task-hub rollout steps, see the [Schema v2 migration guide](../../../../../docs/features/durable-agents/schema-v2-migration.md).
 
-The entry point uses the supported public options, a bounded model response, an illustrative marker
-diagnostic and OpenTelemetry metrics. KeepAll remains the default outside this opt-in:
-
-**Sample 10 selects `SchemaV2` in code:** `ConfigureRetention` sets
-`options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;`, so no deployment environment setting
-is required. Applications can alternatively set `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`.
-These are equivalent activation paths in the SDK. A present invalid environment value is rejected
-even with a valid code option.
+The sample configures a 32 KiB state budget so you can observe automatic history pruning after just a few turns:
 
 ```csharp
 services.ConfigureDurableAgents(options =>
 {
-    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
+    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2; // Or set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2
     options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
     options.MaxStateBytes = 32 * 1024; // Demo override; Auto otherwise defaults to 1 MiB.
     options.HistoryRetentionHighWatermark = 0.85;
@@ -70,22 +60,15 @@ This is durable entity **pressure retention**, not Microsoft Agent Framework sta
 compaction or `FollowCompaction`. It does not summarize old messages. It removes old transcript
 from later model input while durable execution and delivery evidence remains available.
 
-Public Legacy and KeepAll remain the defaults. SchemaV2 also supports KeepAll without proactive
-transcript deletion. Auto requires isolated deployment acknowledgement and defaults to exactly 1 MiB;
-this demonstration overrides it to 32 KiB. Explicit null uses the default; optional watermarks satisfy
-`0 < low < high <= 1`. To stop proactive pruning, retain SchemaV2 and choose KeepAll: existing budget
-and watermark settings become inert without needing to clear them. Returning to Legacy does not downgrade schema-2 state or
-authorize new work. No public in-place migration or receipt-deleting TTL is enabled.
+By default, .NET uses `Legacy` (Schema 1.2) and `KeepAll`. When `SchemaV2` is enabled, `Auto` defaults to a 1 MiB (`1,048,576` bytes) budget (`HighWatermark = 0.85`, `LowWatermark = 0.70`), which this sample overrides to 32 KiB. To stop automatic pruning, keep `SchemaV2` and switch `HistoryRetentionMode` to `KeepAll`.
 
 `Auto` cannot make every payload fit. A single oversized protected newest inline `DataContent`,
 tool result, terminal result, or other protected state can still exceed the high watermark. The
-operation then fails rather than persisting oversized state. That protected-state failure is
-different from cumulative transcript pressure, and application-level payload references or
-transport limits remain separate concerns.
+operation then fails rather than persisting oversized state.
 
 ## OpenTelemetry metrics
 
-The sample uses the standard OpenTelemetry metrics pipeline and console exporter:
+The sample registers the `agent_framework.durabletask` meter (`DurableAgentTelemetry.MeterName`) with the OpenTelemetry console exporter:
 
 ```csharp
 services.AddOpenTelemetry()
@@ -94,9 +77,7 @@ services.AddOpenTelemetry()
         .AddConsoleExporter(...));
 ```
 
-The shared meter is `agent_framework.durabletask`, exposed through
-`DurableAgentTelemetry.MeterName`. Corrected retention builds emit the cross-runtime
-`durable.retention.*` instruments:
+Emitted `durable.retention.*` instruments:
 
 - `durable.retention.evaluations`
 - `durable.retention.budget`
@@ -108,25 +89,11 @@ The shared meter is `agent_framework.durabletask`, exposed through
 - `durable.retention.write_attempts`
 - `durable.retention.operations`
 
-Retention dimensions are bounded operational fields such as `mechanism`, `outcome`,
-`commit_status`, `phase`, `stage`, and `deletion_staged`. They do not include agent, session,
-correlation, message, or content dimensions. Outcomes include `below_threshold`, `staged`,
-`protected_floor`, `returned`, and `failed`.
-
-These measurements are emitted for attempts before entity commit. A later persistence failure or
-retry can roll back or duplicate what telemetry observed. Metrics are operational evidence, not
-durable committed truth or an exact-once state query. Pair them with durable state and application
-behavior when correctness matters.
+Metrics are recorded while staging state before the entity commits, so a failed or retried commit may still emit attempt metrics.
 
 ## Run the sample
 
-Install the .NET 10 SDK, configure Microsoft CFS for package restores and start the local Durable Task
-Scheduler emulator. Set the model configuration in your own shell, using an identity authorized for that model:
-
-`DURABLE_TASK_SCHEDULER_CONNECTION_STRING` is optional. When unset, the sample uses the standard local
-emulator connection `Endpoint=http://localhost:8080;TaskHub=default;Authentication=None`.
-Override it for another scheduler or task hub. For real deployments, use a fresh isolated hub with
-compatible workers, clients and readers; neither the connection string nor code-selected SchemaV2 proves isolation.
+Start the local Durable Task Scheduler emulator and set your Foundry model environment variables:
 
 ```powershell
 $env:FOUNDRY_PROJECT_ENDPOINT = "https://YOUR-ENDPOINT/api/projects/YOUR-PROJECT"
@@ -136,15 +103,7 @@ dotnet restore --source https://packagefeedproxy.microsoft.io/nuget/v3/index.jso
 dotnet run --framework net10.0 --no-restore
 ```
 
-Enter a project topic of at most 80 characters. The host creates a new durable session, sends seven
-moderate notes and prints the diagnostic response with `Present`, `Unavailable` or `Inconclusive`.
-No wall-clock expiry wait is required. The default provider owns the entity transcript; no old or remote
-conversation is imported. `DefaultAzureCredential` is used for development; prefer a specific credential
-for production.
-
-For a NuGet consumer, use a package version that includes these durable-agent APIs;
-Agent Framework dependency versions alone do not supply them.
-Backend/model execution requires your configured services; offline tests do not certify the hosted backend.
+`DURABLE_TASK_SCHEDULER_CONNECTION_STRING` is optional and defaults to `Endpoint=http://localhost:8080;TaskHub=default;Authentication=None`. Enter a project topic (up to 80 characters) when prompted; the app creates a new durable session, sends seven turns, and prints whether the initial marker was recalled (`Present`, `Unavailable`, or `Inconclusive`).
 
 ## Tests
 
@@ -152,36 +111,10 @@ Backend/model execution requires your configured services; offline tests do not 
 dotnet test --project tests\10_AutoHistoryRetention.Tests.csproj -c Release -f net10.0
 ```
 
-The sample tests cover bounded agent options, prompt construction,
-the no-wait marker diagnostic, conservative result classification, invalid-marker rejection before
-agent/model calls or output/session mutation, and real OpenTelemetry meter registration/export.
-
-The product unit tests cover public deployment and retention settings, the sample's code-selected SchemaV2
-configuration and optional local-emulator connection, early validation, and state/retention behavior through the SDK dispatcher:
+To run the package unit tests for public `SchemaV2` and `Auto` retention:
 
 ```powershell
 dotnet test --project ..\..\..\..\tests\Microsoft.Agents.AI.DurableTask.UnitTests\Microsoft.Agents.AI.DurableTask.UnitTests.csproj `
     -c Release -f net10.0 `
     --filter-class "*AgentEntityPublicRetentionTests"
 ```
-
-Those tests cover cold reload, result/receipt preservation, duplicates, expiry,
-legacy rejection, provider/service boundaries, protected capacity and commit/outbox rollback. Existing
-history tests additionally cover connected tool/system grouping and attempt-level telemetry.
-Validate actual isolated-backend atomicity before deploying to production.
-
-## Retry safety with external history
-
-The demo uses entity-owned history, but external providers and service-managed conversations remain
-supported under isolated KeepAll and Auto with their existing logical-key and continuation requirements.
-An external load/store callback failure propagates, rolls back local state/signals and creates no new
-framework failed receipt. Load failure before model execution leaves the model uncalled; store failure
-after execution can leave remote writes and model/tool effects ambiguous. The same uncommitted correlation
-can run again. Cancellation, timeout and response loss can also be ambiguous.
-
-Applications own idempotency and reconciliation. Preserve an application operation key, forward it to
-tools/APIs/provider records, persist results and an ambiguity ledger, upsert deterministic message IDs and
-look up remote status before retrying. Use a transactional outbox only inside an actual transaction;
-manually reconcile non-idempotent effects when necessary. See
-[public API examples](../../../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application)
-and [the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
