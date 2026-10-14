@@ -161,11 +161,27 @@ has friend access:
 ```powershell
 dotnet test --project ..\..\..\..\tests\Microsoft.Agents.AI.DurableTask.UnitTests\Microsoft.Agents.AI.DurableTask.UnitTests.csproj `
     -c Release -f net10.0 `
-    --filter-class "*AgentEntityProviderFailureTests"
+    --filter-class "*AgentEntityPublicRetentionTests"
 ```
 
 Those regressions exercise public Auto without internal writer/migration authorization through the SDK
 transactional dispatcher, including cold reload, mailbox/receipt preservation, duplicates, expiry,
 legacy rejection, provider/service boundaries, protected capacity and commit/outbox rollback. Existing
 history tests additionally cover connected tool/system grouping and attempt-level telemetry.
-Actual isolated-backend atomicity remains a separate merge/release gate.
+Validate actual isolated-backend atomicity before deploying to production.
+
+## Retry safety with external history
+
+The demo uses entity-owned history, but external providers and service-managed conversations remain
+supported under isolated KeepAll and Auto with their existing logical-key and continuation requirements.
+An external load/store callback failure propagates, rolls back local state/signals and creates no new
+framework failed receipt. Load failure before model execution leaves the model uncalled; store failure
+after execution can leave remote writes and model/tool effects ambiguous. The same uncommitted correlation
+can run again. Cancellation, timeout and response loss can also be ambiguous.
+
+Applications own idempotency and reconciliation. Preserve an application operation key, forward it to
+tools/APIs/provider records, persist results and an ambiguity ledger, upsert deterministic message IDs and
+look up remote status before retrying. Use a transactional outbox only inside an actual transaction;
+manually reconcile non-idempotent effects when necessary. See
+[public API examples](../../../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application)
+and [the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).

@@ -33,7 +33,6 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         ? cancellationToken
         : services.GetService<IHostApplicationLifetime>()?.ApplicationStopping ?? CancellationToken.None;
     private DurableAgentState? _initializedEntityGeneration;
-    private DurableAgentState? _initializedMailboxGeneration;
     private DurableAgentDeploymentMode _deploymentMode;
     private bool _persistentRequestOutcomesEnabled;
     private DurableAgentRetentionSettings _retentionSettings;
@@ -53,7 +52,6 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
     ValueTask<object?> ITaskEntity.RunAsync(TaskEntityOperation operation)
     {
         this._initializedEntityGeneration = null;
-        this._initializedMailboxGeneration = null;
         this.CaptureOperationConfiguration();
         if (IsScheduledResultExpirationOperation(operation) &&
             !this.ShouldDispatchScheduledResultExpiration(operation))
@@ -90,9 +88,8 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
 
         // SDK 1.18 calls InitializeState only when operation.State has no current state.
         // Keep this operation-local identity; an empty imported mailbox is not a new generation.
-        this._initializedMailboxGeneration = CreateEmptyPersistentRequestOutcomeState();
-        this._initializedEntityGeneration = this._initializedMailboxGeneration;
-        return this._initializedMailboxGeneration;
+        this._initializedEntityGeneration = CreateEmptyPersistentRequestOutcomeState();
+        return this._initializedEntityGeneration;
     }
 
     private void CaptureOperationConfiguration()

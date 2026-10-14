@@ -156,7 +156,46 @@ options.AddAIAgent(externalOrServiceAgent, timeToLive: null,
 
 For Python, register the agent with its supported external provider or service-managed conversation configuration as documented by that provider; the worker budget does not give permission to delete the provider's data.
 
-Both local retention policies preserve binding and continuation and never trim the external store or model-service history. Do not switch owners, clear continuation or create a replacement remote conversation to make state fit. Load/store failures may be durably classified by a runtime's supported terminal-failure contract; this does not prove the external system had no effects.
+Both local retention policies preserve binding and continuation and never trim the external store or model-service history. External providers and service-managed conversations remain supported under both C# isolated KeepAll and Auto with the existing key, continuation and owner requirements. Do not switch owners, clear continuation or create a replacement remote conversation to make state fit.
+
+### Provider failures and at-least-once retry risk
+
+The public C# contract does **not** finalize external history-provider callback failures. An unrecovered load or store error propagates through the entity operation, with no new framework failed result or completion receipt. Local state and staged outgoing signals roll back to the last committed state; **remote effects do not roll back**. This behavior is the same under KeepAll and Auto.
+
+- A load error before model execution (including deferred enumeration consumed before the model call) leaves the model uncalled in that path. The provider may nevertheless already have made its own remote calls or changes.
+- A store error after model execution, tool calls or another side effect leaves their acknowledgement ambiguous. Retrying an uncommitted request, even with the **same correlation ID**, can execute them again. A remote write may have succeeded before the store callback threw.
+- Cancellation, timeout, response loss and uncertain entity acknowledgement can also be ambiguous after execution begins. Do not treat every exception as proof that nothing happened, or as a certified failed completion.
+- A committed successful v2 receipt still deduplicates its correlation, including after transcript pruning. That receipt cannot deduplicate effects from an execution whose callback or entity commit failed **before any receipt was committed**. Payload expiry does not reopen a committed correlation.
+
+Applications own idempotency and reconciliation. Provider-failure finalization is tracked separately in [External history-provider failures can cause at-least-once execution](https://github.com/microsoft/agent-framework-durable-extension/issues/143). This limitation does not disable external or service-managed history, and neither deployment acknowledgement nor Auto certifies failure finality.
+
+### Make retries safe in your application
+
+1. **Keep a stable operation key.** Use the request correlation as an operation idempotency key where your integration exposes it; do not assign a new ID to hide an ambiguous retry. In this C# SDK, `RunRequest.CorrelationId` is internal and `DurableAgentContext` has no public `CorrelationId` property. Public callers should also supply their own stable business operation ID and preserve it across retries. This is not a new SDK correlation override.
+2. **Propagate the application key explicitly** to tool arguments, APIs and provider records wherever supported. Do not assume the durable runtime automatically injects that key into external calls. For example, the existing public message API can carry an application key:
+
+   ```csharp
+   // operationId comes from your persisted application request, not a retry-generated GUID.
+   ChatMessage message = new(ChatRole.User, "Process the approved order")
+   {
+       AdditionalProperties = new() { ["operationId"] = operationId },
+   };
+   RunRequest request = new([message]);
+   ```
+
+   A custom history provider can inspect its public `InvokedContext.RequestMessages` and those message properties. Have your application/tool enforce the expected key; do not rely solely on a model choosing the correct argument. For an API with documented idempotency support:
+
+   ```csharp
+   using HttpRequestMessage call = new(HttpMethod.Post, approvedEndpoint);
+   call.Headers.TryAddWithoutValidation("Idempotency-Key", operationId);
+   // Attach the approved payload and use the API's documented key scope and retention.
+   ```
+
+3. **Persist completed results** in your application's operation ledger, not just the expiring durable response mailbox. Use states such as `Pending`, `Completed` and `Ambiguous`, with remote operation IDs, payload identity and the recorded result. Do not transition to Completed merely because local execution started; an uncertain acknowledgement belongs in Ambiguous.
+4. **Upsert deterministic history message IDs**, for example `{operationKey}:request:0` and `{operationKey}:response:0`, rather than appending duplicates on each callback attempt. Include phase/index and validate that the same key cannot accept different payloads. Where available, the request correlation can be the operation key; otherwise use the explicitly propagated application ID. Respect the provider's actual consistency and uniqueness guarantees.
+5. **Look up remote status/result before retrying** an ambiguous operation. Use the service's operation ID or idempotency key to recover a completed result or determine whether reconciliation is needed. Absence in the local durable mailbox alone is not evidence of remote non-execution.
+6. **Use a transactional outbox where a real transaction exists**, such as an application database that atomically stores the operation ledger and its outgoing intent. Deliver with idempotent consumers. An external store and DTS do not share an atomic transaction merely because both appear in one agent invocation.
+7. **Reconcile manually when necessary.** For non-idempotent actions or providers without reliable status lookup, fence automatic retries, inspect the remote system and resolve the Ambiguous ledger entry before allowing further execution. There is no generic exactly-once guarantee or universal automated recovery.
 
 ## What survives pruning, expiry and restart?
 
@@ -184,6 +223,7 @@ Where a Python version offers a separate privileged migration API, it is not aut
 - [ ] Later entity-owned model input excludes evicted transcript while retained results/receipts remain authoritative.
 - [ ] Logs distinguish configuration rejection, incompatible state/owner, unavailable results and capacity failures.
 - [ ] Retention telemetry is treated as attempt-level evidence, not an exactly-once committed-state ledger.
+- [ ] External callback load/store failure tests include cold retry with the same correlation; application operation keys, remote status lookup and ambiguous-result reconciliation are exercised.
 
 Use [C# Sample 10](../../../dotnet/samples/DurableAgents/ConsoleApps/10_AutoHistoryRetention/README.md) or the corresponding Python examples as bounded demonstrations, not proof that an arbitrary fleet or payload fits. Receipt growth remains unbounded; no retention policy promises unlimited turns.
 

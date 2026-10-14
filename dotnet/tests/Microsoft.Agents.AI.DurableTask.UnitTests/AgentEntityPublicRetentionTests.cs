@@ -9,7 +9,7 @@ using Microsoft.Extensions.AI;
 
 namespace Microsoft.Agents.AI.DurableTask.Tests.Unit;
 
-public sealed partial class AgentEntityProviderFailureTests
+public sealed partial class AgentEntityPublicRetentionTests
 {
     private static void ConfigureIsolated(DurableAgentsOptions options, bool auto)
     {
@@ -69,6 +69,165 @@ public sealed partial class AgentEntityProviderFailureTests
         Assert.Equal(0, client.Count);
         Assert.Equal(0, provider.LoadCount);
         Assert.Equal(0, provider.StoreCount);
+        EntityBatchResult retry = await DispatchAsync(CreateAgent(client, provider), rejected.EntityState, "next", mailbox: false,
+            configureOptions: configure);
+        Assert.Null(Result(retry).FailureDetails);
+        Assert.Equal(1, client.Count);
+        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome, ReadState(retry).Data.CompletionReceipts!["next"].Outcome);
+    }
+
+    [Theory]
+    [InlineData(false, "load", false)]
+    [InlineData(true, "load", false)]
+    [InlineData(false, "lazyLoad", false)]
+    [InlineData(true, "lazyLoad", false)]
+    [InlineData(false, "storeBefore", false)]
+    [InlineData(true, "storeBefore", false)]
+    [InlineData(false, "storeAfter", false)]
+    [InlineData(true, "storeAfter", false)]
+    [InlineData(false, "load", true)]
+    [InlineData(true, "load", true)]
+    [InlineData(false, "lazyLoad", true)]
+    [InlineData(true, "lazyLoad", true)]
+    [InlineData(false, "storeBefore", true)]
+    [InlineData(true, "storeBefore", true)]
+    [InlineData(false, "storeAfter", true)]
+    [InlineData(true, "storeAfter", true)]
+    public async Task ExternalCallbackFailureHasNoReceiptAndColdSameCorrelationRemainsExecutableAsync(
+        bool auto, string stage, bool first)
+    {
+        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
+        string? original = first ? null : (await DispatchAsync(
+            CreateAgent(new ProbeClient(), new ProbeProvider()), null, "seed",
+            mailbox: false, configureOptions: configure)).EntityState;
+        ProbeProvider provider = new() { Stage = stage, Failure = new IOException(PrivateMarker) };
+        ProbeClient client = new();
+        ChatClientAgent agent = CreateAgent(client, provider);
+        EntityBatchResult failed = await DispatchAsync(agent, original, "retryable", mailbox: false,
+            configureOptions: configure);
+        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
+        Assert.Equal(original, failed.EntityState);
+        Assert.Empty(Actions(failed));
+        Assert.Same(provider, agent.ChatHistoryProvider);
+        Assert.Equal(stage is "load" or "lazyLoad" ? 0 : 1, client.Count);
+        Assert.Equal(stage == "storeAfter" ? 1 : 0, provider.RemoteMessages.Count);
+        Assert.Equal(first ? null : 1, provider.RestoredVersion);
+        if (!first)
+        {
+            DurableAgentState rolledBack = ReadState(failed);
+            Assert.False(rolledBack.Data.CompletionReceipts!.ContainsKey("retryable"));
+            Assert.False(rolledBack.Data.TerminalResults!.ContainsKey("retryable"));
+            Assert.DoesNotContain(PrivateMarker, failed.EntityState, StringComparison.Ordinal);
+        }
+
+        ProbeProvider coldProvider = new() { Stage = stage, Failure = new IOException(PrivateMarker) };
+        ProbeClient coldClient = new();
+        EntityBatchResult failedAgain = await DispatchAsync(CreateAgent(coldClient, coldProvider), failed.EntityState,
+            "retryable", mailbox: false, configureOptions: configure);
+        Assert.Equal(typeof(IOException).FullName, Failure(failedAgain).ErrorType);
+        Assert.Equal(original, failedAgain.EntityState);
+        Assert.Empty(Actions(failedAgain));
+        Assert.Equal(stage is "load" or "lazyLoad" ? 0 : 1, coldClient.Count);
+        Assert.Equal(first ? null : 1, coldProvider.RestoredVersion);
+
+        ProbeProvider recoveredProvider = new();
+        ProbeClient recoveredClient = new();
+        EntityBatchResult retry = await DispatchAsync(CreateAgent(recoveredClient, recoveredProvider),
+            failedAgain.EntityState, "retryable", mailbox: false, configureOptions: configure);
+        Assert.Null(Result(retry).FailureDetails);
+        Assert.Equal(1, recoveredClient.Count);
+        Assert.Equal(first ? null : 1, recoveredProvider.RestoredVersion);
+        Assert.Empty(ReadState(retry).Data.ConversationHistory);
+        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome,
+            ReadState(retry).Data.CompletionReceipts!["retryable"].Outcome);
+
+        EntityBatchResult duplicate = await DispatchAsync(CreateAgent(recoveredClient, recoveredProvider),
+            retry.EntityState, "retryable", mailbox: false, configureOptions: configure);
+        Assert.Null(Result(duplicate).FailureDetails);
+        Assert.Equal(retry.EntityState, duplicate.EntityState);
+        Assert.Equal(1, recoveredClient.Count);
+        Assert.Equal(1, recoveredProvider.LoadCount);
+        Assert.Equal(1, recoveredProvider.StoreCount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StoreFailureAfterActualToolEffectRollsBackSdkOutboxButColdRetryRepeatsEffectAsync(bool auto)
+    {
+        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
+        EntityBatchResult seed = await DispatchAsync(CreateAgent(new ProbeClient(), new ProbeProvider()),
+            null, "seed", mailbox: false, configureOptions: configure);
+        int remoteEffects = 0;
+        AIFunction tool = AIFunctionFactory.Create(() =>
+        {
+            remoteEffects++;
+            _ = DurableAgentContext.Current.ScheduleNewOrchestration("tool-work");
+            return "accepted externally";
+        }, name: "perform_operation");
+        ChatClientAgent create(IChatClient client, ProbeProvider provider) => new(client, new ChatClientAgentOptions
+        {
+            Name = "agent",
+            ChatHistoryProvider = provider,
+            ChatOptions = new ChatOptions { Tools = [tool] },
+        });
+        ProbeProvider failingProvider = new() { Stage = "storeAfter", Failure = new IOException(PrivateMarker) };
+        ToolLoopClient failingClient = new(tool.Name);
+        EntityBatchResult failed = await DispatchAsync(create(failingClient, failingProvider),
+            seed.EntityState, "retryable", mailbox: false, configureOptions: configure);
+        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
+        Assert.Equal(seed.EntityState, failed.EntityState);
+        Assert.Empty(Actions(failed));
+        Assert.Equal(1, remoteEffects);
+        Assert.Equal(2, failingClient.Count);
+        Assert.Single(failingProvider.RemoteMessages);
+        Assert.False(ReadState(failed).Data.CompletionReceipts!.ContainsKey("retryable"));
+
+        ProbeProvider recoveredProvider = new() { RemoteMessages = failingProvider.RemoteMessages };
+        ToolLoopClient coldClient = new(tool.Name);
+        EntityBatchResult retry = await DispatchAsync(create(coldClient, recoveredProvider),
+            failed.EntityState, "retryable", mailbox: false, configureOptions: configure);
+        Assert.Null(Result(retry).FailureDetails);
+        Assert.Equal(2, remoteEffects);
+        Assert.Equal(2, coldClient.Count);
+        Assert.Equal(2, recoveredProvider.RemoteMessages.Count);
+        Assert.Equal(1, recoveredProvider.RestoredVersion);
+        Assert.Equal("tool-work", Assert.IsType<StartNewOrchestrationOperationAction>(Assert.Single(Actions(retry))).Name);
+        EntityBatchResult duplicate = await DispatchAsync(create(coldClient, recoveredProvider),
+            retry.EntityState, "retryable", mailbox: false, configureOptions: configure);
+        Assert.Null(Result(duplicate).FailureDetails);
+        Assert.Equal(retry.EntityState, duplicate.EntityState);
+        Assert.Empty(Actions(duplicate));
+        Assert.Equal(2, remoteEffects);
+        Assert.Equal(2, coldClient.Count);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ServiceModelFailurePreservesContinuationWithoutFinalityAndColdRetryExecutesAsync(bool auto)
+    {
+        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
+        EntityBatchResult seed = await DispatchAsync(
+            new ChatClientAgent(new ProbeClient { ResponseConversationId = "remote-conversation" }, name: "agent"),
+            null, "seed", mailbox: false, configureOptions: configure);
+        ProbeClient failing = new() { Failure = new IOException(PrivateMarker) };
+        EntityBatchResult failed = await DispatchAsync(new ChatClientAgent(failing, name: "agent"),
+            seed.EntityState, "retryable", mailbox: false, configureOptions: configure);
+        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
+        Assert.Equal(seed.EntityState, failed.EntityState);
+        Assert.Empty(Actions(failed));
+        Assert.Equal(1, failing.Count);
+        Assert.False(ReadState(failed).Data.CompletionReceipts!.ContainsKey("retryable"));
+
+        ProbeClient cold = new() { ResponseConversationId = "remote-conversation" };
+        EntityBatchResult retry = await DispatchAsync(new ChatClientAgent(cold, name: "agent"),
+            failed.EntityState, "retryable", mailbox: false, configureOptions: configure);
+        Assert.Null(Result(retry).FailureDetails);
+        Assert.Equal(1, cold.Count);
+        Assert.Single(cold.LastMessages);
+        Assert.Empty(ReadState(retry).Data.ConversationHistory);
+        Assert.Equal("remote-conversation", ReadState(retry).Data.Session!.Value.GetProperty("conversationId").GetString());
     }
 
     [Fact]
@@ -220,7 +379,7 @@ public sealed partial class AgentEntityProviderFailureTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task PublicIsolatedExternalFailureCompletionDoesNotDependOnRetentionAsync(bool auto)
+    public async Task PublicIsolatedExternalStoreFailureRollsBackAndColdRetryRepeatsModelAsync(bool auto)
     {
         ProbeProvider provider = new();
         ProbeClient client = new();
@@ -231,18 +390,31 @@ public sealed partial class AgentEntityProviderFailureTests
         provider.Failure = new IOException(PrivateMarker);
         EntityBatchResult failed = await DispatchAsync(agent, seed.EntityState, "failed", mailbox: false,
             configureOptions: configure);
-        Assert.Null(Result(failed).FailureDetails);
+        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
+        Assert.Equal(seed.EntityState, failed.EntityState);
+        Assert.Empty(Actions(failed));
         DurableAgentState state = ReadState(failed);
-        Assert.Equal(DurableAgentStateCompletionReceipt.FailedOutcome, state.Data.CompletionReceipts!["failed"].Outcome);
+        Assert.False(state.Data.CompletionReceipts!.ContainsKey("failed"));
+        Assert.False(state.Data.TerminalResults!.ContainsKey("failed"));
         Assert.Equal(ReadState(seed).Data.Session!.Value.GetRawText(), state.Data.Session!.Value.GetRawText());
         Assert.Empty(state.Data.ConversationHistory);
         Assert.DoesNotContain(PrivateMarker, failed.EntityState, StringComparison.Ordinal);
-        int calls = client.Count;
-        EntityBatchResult duplicate = await DispatchAsync(agent, failed.EntityState, "failed", mailbox: false,
+        Assert.Equal(2, client.Count);
+        Assert.Equal(2, provider.StoreCount);
+        ProbeClient retryClient = new();
+        ProbeProvider retryProvider = new();
+        EntityBatchResult retry = await DispatchAsync(CreateAgent(retryClient, retryProvider), failed.EntityState, "failed", mailbox: false,
             configureOptions: configure);
-        Assert.Equal(typeof(DurableAgentTerminalException).FullName, Failure(duplicate).ErrorType);
-        Assert.Equal(calls, client.Count);
-        Assert.Equal(failed.EntityState, duplicate.EntityState);
+        Assert.Null(Result(retry).FailureDetails);
+        Assert.Equal(1, retryClient.Count);
+        Assert.Equal(1, retryProvider.RestoredVersion);
+        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome, ReadState(retry).Data.CompletionReceipts!["failed"].Outcome);
+        EntityBatchResult duplicate = await DispatchAsync(CreateAgent(retryClient, retryProvider), retry.EntityState, "failed", mailbox: false,
+            configureOptions: configure);
+        Assert.Null(Result(duplicate).FailureDetails);
+        Assert.Equal(1, retryClient.Count);
+        Assert.Equal(1, retryProvider.StoreCount);
+        Assert.Equal(retry.EntityState, duplicate.EntityState);
     }
 
     [Theory]
@@ -698,12 +870,15 @@ public sealed partial class AgentEntityProviderFailureTests
         EntityBatchResult failed = await DispatchAsync(
             CreateAgent(client, provider), seed.EntityState, "failed",
             mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        Assert.Null(Result(failed).FailureDetails);
+        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
+        Assert.Equal(seed.EntityState, failed.EntityState);
+        Assert.Empty(Actions(failed));
         DurableAgentState written = ReadState(failed);
         Assert.Empty(written.Data.ConversationHistory);
         Assert.Equal(original.Data.Session!.Value.GetRawText(), written.Data.Session!.Value.GetRawText());
         Assert.Equal(original.Data.HistoryBinding.GetRawText(), written.Data.HistoryBinding.GetRawText());
-        Assert.Equal(DurableAgentStateCompletionReceipt.FailedOutcome, written.Data.CompletionReceipts!["failed"].Outcome);
+        Assert.False(written.Data.CompletionReceipts!.ContainsKey("failed"));
+        Assert.False(written.Data.TerminalResults!.ContainsKey("failed"));
         Assert.Equal(2, provider.StoreCount);
         Assert.DoesNotContain(PrivateMarker, failed.EntityState, StringComparison.Ordinal);
     }

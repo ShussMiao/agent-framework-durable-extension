@@ -174,6 +174,14 @@ Only a successful outer entity operation publishes a new terminal result. The fo
 
 An external service or provider may have observed a call even when the entity commit fails. Schema 2 prevents a committed completion from being forgotten; it cannot make external side effects atomic with the entity store.
 
+Public C# external load/store callback failures do not create framework failed receipts. Load failure
+before model invocation leaves the model uncalled in that path; store failure after model/tool effects
+or remote writes leaves acknowledgement ambiguous. Retry may execute again under the same correlation.
+KeepAll and Auto both allow external and service-managed history; the application owns idempotency and
+reconciliation, including cancellation, timeout and response-loss ambiguity. See
+[application retry safety](schema-v2-migration.md#make-retries-safe-in-your-application) and
+[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
+
 ## Documentation authority
 
 | Document | Authority |

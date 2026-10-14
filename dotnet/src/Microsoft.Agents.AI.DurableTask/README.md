@@ -89,7 +89,27 @@ own idempotency guarantees.
 
 Only a successfully committed outer invocation creates a new success receipt. Validation failures,
 cancellation, ordinary model/provider errors, serialization/capacity failures, and failed entity commits
-remain retryable; they are not converted into terminal receipts. A separate internal capability can commit
+remain retryable; they are not converted into terminal receipts.
+
+**External and service-managed history remain supported under isolated KeepAll and Auto.** Unrecovered
+external history-provider load/store callback errors propagate and roll back local state and staged
+outgoing signals without a new framework failed result or receipt. A load failure before model invocation
+leaves that model uncalled; a store failure after execution may follow model/tool effects or a successful
+remote write. Retrying the same uncommitted correlation can execute again: this is an **at-least-once
+retry risk**, not remote rollback or exactly-once execution. Cancellation, timeout, response loss and
+uncertain commit acknowledgement can likewise be ambiguous after execution begins. Committed successful
+receipts deduplicate completed correlations, not effects for which no receipt was committed.
+
+Applications own idempotency and reconciliation: propagate a stable application operation key to tools,
+APIs and provider records, persist completed results and Pending/Completed/Ambiguous ledger entries,
+upsert deterministic message IDs, query remote status before retry and use a transactional outbox only
+where an actual transaction exists. Fence automatic retries and reconcile non-idempotent ambiguous actions
+manually. `RunRequest.CorrelationId` is internal; `DurableAgentContext` has no public correlation-ID accessor.
+See [public examples and recovery guidance](../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application).
+Provider-failure finalization is tracked separately in
+[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
+
+A separate internal capability can commit
 a provider failure only when a certified adapter explicitly attests the provider phase (`Load`, `Invoke`,
 or `Store`), finality (`NonRetryable` or `RetriesExhausted`), and accepted input. The runtime then serializes
 the resulting session, validates sanitized error metadata, and commits the failed result and receipt through

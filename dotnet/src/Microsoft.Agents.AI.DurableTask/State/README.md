@@ -155,8 +155,11 @@ With the schema-2 writer enabled, one successful durable entity operation atomic
 terminal result and receipt together with that operation's session continuation, ingestion bookkeeping,
 entity-local transcript, whole-entity TTL, optional binding, and other local control state. External provider
 writes and tool side effects are outside that entity-local transaction. A failed outer invocation or durable
-commit does not establish a new completion receipt. Unrecovered external history-provider callback failures
-can commit sanitized failed outcomes while preserving the pre-invocation continuation; see the
+commit does not establish a new completion receipt. Public external history-provider callback failures
+propagate without a failed receipt and preserve the last committed local continuation. A store failure
+after model/tool execution or a remote write can repeat effects on retry, including the same correlation.
+Local rollback never undoes external effects. External and service-managed history remain supported
+under KeepAll and Auto; applications own idempotency and reconciliation. See the
 [provider failure boundary](../README.md#durable-completion-and-delivery). A separate internal, default-off
 finalization capability requires a certified adapter to explicitly attest accepted input, provider phase, and
 non-retryable/exhausted finality; the resulting session must serialize and the failed result, receipt, session,
@@ -165,9 +168,14 @@ is permitted. Legacy conversion uses only retained authoritative
 terminal evidence, never calls the model/tools, and cannot invent receipts for already-evicted results.
 Previously persisted legacy state stays legacy unless independently authorized as complete history;
 retained transcript alone does not establish that authorization. Known truncation/compaction prevents
-conversion. Public Auto initializes 2.0 only for SDK-proven missing-state generations.
+conversion. Public IsolatedV2 initializes 2.0 only for SDK-proven missing-state Run generations.
 Whole-entity deletion of 2.0 state has a separate internal gate, disabled by default. Stored legacy
 deadlines cannot erase receipts, and there is no implicit schema-2 entity TTL.
+
+Provider-failure finalization is tracked separately in
+[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
+Use the shared [application retry-safety guidance](../../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application);
+durable receipts alone cannot deduplicate uncommitted side effects.
 
 Schema 2.0 must not be activated as a cross-language write format until every participating runtime either
 implements the mailbox/binding contract or explicitly rejects the new major version. The current C# reader is

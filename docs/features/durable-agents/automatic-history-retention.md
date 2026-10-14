@@ -41,4 +41,19 @@ The newest exchange, system messages and connected correlation/tool groups are p
 
 Result payload expiry is separate from transcript retention and preserves receipts. Schema-2 whole-entity TTL deletion is disabled. Auto does not implement FollowCompaction or model-context summarization.
 
+## External callback failures are not terminal completion
+
+External providers and service-managed history remain allowed under both isolated KeepAll and Auto.
+Unrecovered external load/store callback errors propagate and roll back local state/outgoing signals;
+they do not create a framework failed receipt. A load error before model invocation leaves that model
+uncalled; a store error after execution can follow model/tool effects or a successful remote write.
+Retrying the same uncommitted correlation can execute again. Cancellation, timeout and response loss
+can also leave effects ambiguous. Successful committed receipts still deduplicate completed requests,
+but cannot protect uncommitted side effects.
+
+The application owns idempotency and reconciliation. See the shared guide's
+[operation-key, ledger, remote-lookup and outbox guidance](schema-v2-migration.md#make-retries-safe-in-your-application).
+Provider-failure finalization is tracked separately in
+[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
+
 Use [Sample 10](../../../dotnet/samples/DurableAgents/ConsoleApps/10_AutoHistoryRetention/README.md) for the bounded 32 KiB/.85/.70 demonstration. Configure measured production budgets against the real backend and validate atomicity, restart and duplicate delivery there; offline tests are not backend certification.
