@@ -12,8 +12,6 @@ Framework.
 > isolation. This is an operator acknowledgement, not proof of isolation, automatic history
 > migration, or a cross-runtime compatibility guarantee. See the
 > [common deployment requirements](../README.md#3-running-the-samples).
-> Use the shared [C# and Python schema-v2 migration guide](../../../../docs/features/durable-agents/schema-v2-migration.md)
-> for the reader-first decision tree and current language/host differences.
 
 ## Key Concepts Demonstrated
 

@@ -9,8 +9,6 @@ using the same configuration you would write for in-process Agent Framework.
 > isolation. This is an operator acknowledgement, not runtime proof of isolation or a migration
 > step. Keep old workflow histories on the old engine. Schema validation and localhost do not
 > prove isolation, and this sample does not establish .NET interoperability.
-> Follow the shared [C# and Python schema-v2 migration guide](../../../docs/features/durable-agents/schema-v2-migration.md)
-> rather than treating this sample's retention settings as schema activation.
 
 ## What this demonstrates
 

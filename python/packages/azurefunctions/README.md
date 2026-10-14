@@ -20,11 +20,12 @@ This unreleased host uses the [canonical Python runtime contract](../durabletask
 for schema `2.0.0` writes, legacy readers, response values, migration, sessions and workflow replay.
 This guide covers the Functions-specific behavior, not a separate compatibility promise.
 
-Follow the shared [C# and Python schema-v2 migration guide](../../../docs/features/durable-agents/schema-v2-migration.md).
-This current canonical host requires `deployment_mode="isolated_v2"` or
-`DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` and does not implement a Legacy/default 1.2 writer.
-An explicit argument takes precedence over the environment. Start fresh workflow instances;
-protocol `2` does not guarantee replay compatibility with earlier engines.
+`AgentFunctionApp` requires `deployment_mode="isolated_v2"` or
+`DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`. No other mode or automatic probe is supported.
+This acknowledges an isolated hub with upgraded workers and clients. It cannot prove isolation
+or detect peers. Use a new isolated hub and **fresh workflow instances, even after earlier v2 builds**.
+Protocol `2` does not guarantee replay compatibility. Keep old runs on their original workers and hub.
+The [ADR rollout gates](../../../docs/decisions/0032-durable-thread-compaction.md#state-evolution-and-compatibility) remain in force.
 
 Migration is a privileged backend entity operation, with no generated HTTP or MCP endpoint.
 Follow the shared [migration contract and request example](../durabletask/README.md#migration),
