@@ -34,6 +34,9 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         : services.GetService<IHostApplicationLifetime>()?.ApplicationStopping ?? CancellationToken.None;
     private DurableAgentState? _initializedEntityGeneration;
     private DurableAgentState? _initializedMailboxGeneration;
+    private DurableAgentDeploymentMode _deploymentMode;
+    private bool _persistentRequestOutcomesEnabled;
+    private DurableAgentRetentionSettings _retentionSettings;
 
     /// <summary>
     /// Rejects stale scheduled result-expiration operations before the standard entity dispatcher can initialize
@@ -44,13 +47,14 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
     /// and writes state after every successful dispatch, including successful void operations. The Durable Task runtime
     /// invokes entities through <see cref="ITaskEntity"/>, so reimplementing that interface gives scheduled-expiration
     /// signals a pre-dispatch guard. A stale delayed signal can therefore return without hydrating, creating, or
-    /// rewriting entity state. No-input cleanup calls are explicit recovery requests and intentionally continue through
-    /// the standard dispatcher.
+    /// rewriting entity state. Explicit cleanup normally continues through the standard dispatcher, except
+    /// byte-preserving no-ops for legacy state and disabled mailbox idle deletion.
     /// </remarks>
     ValueTask<object?> ITaskEntity.RunAsync(TaskEntityOperation operation)
     {
         this._initializedEntityGeneration = null;
         this._initializedMailboxGeneration = null;
+        this.CaptureOperationConfiguration();
         if (IsScheduledResultExpirationOperation(operation) &&
             !this.ShouldDispatchScheduledResultExpiration(operation))
         {
@@ -62,6 +66,11 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             return new ValueTask<object?>((object?)null);
         }
 
+        if (this.TryReadRollbackDuplicate(operation, out object? response))
+        {
+            return new ValueTask<object?>(response);
+        }
+
         // Explicit interface implementations are only callable through the interface. This resolves to the inherited
         // TaskEntity<DurableAgentState>.RunAsync method and preserves the standard dispatch and persistence behavior.
         return this.RunAsync(operation);
@@ -69,10 +78,10 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
 
     protected override DurableAgentState InitializeState(TaskEntityOperation entityOperation)
     {
-        _ = this._options.GetRetentionSettings();
+        this.CaptureOperationConfiguration();
         // Only an absent entity generation can initialize a new mailbox without legacy completion evidence.
         bool shouldInitializePersistentRequestOutcomes =
-            this._options.EnablePersistentRequestOutcomes && IsAgentRunOperation(entityOperation);
+            this._persistentRequestOutcomesEnabled && IsAgentRunOperation(entityOperation);
         if (!shouldInitializePersistentRequestOutcomes)
         {
             this._initializedEntityGeneration = base.InitializeState(entityOperation);
@@ -84,6 +93,53 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         this._initializedMailboxGeneration = CreateEmptyPersistentRequestOutcomeState();
         this._initializedEntityGeneration = this._initializedMailboxGeneration;
         return this._initializedMailboxGeneration;
+    }
+
+    private void CaptureOperationConfiguration()
+    {
+        this._retentionSettings = this._options.GetRetentionSettings();
+        this._deploymentMode = this._options.DeploymentMode;
+        this._persistentRequestOutcomesEnabled = this._options.EnablePersistentRequestOutcomes;
+    }
+
+    private bool TryReadRollbackDuplicate(TaskEntityOperation operation, out object? response)
+    {
+        response = null;
+        if (this._persistentRequestOutcomesEnabled || !IsAgentRunOperation(operation))
+        {
+            return false;
+        }
+
+        DurableAgentState? persisted =
+            (DurableAgentState?)operation.State.GetState(typeof(DurableAgentState));
+        if (persisted?.SchemaVersion != DurableAgentState.RevisedSchemaVersion)
+        {
+            return false;
+        }
+
+        RunRequest request = (RunRequest?)operation.GetInput(typeof(RunRequest))
+            ?? throw new ArgumentException("A run request is required.");
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.CorrelationId);
+        DurableAgentRunOutcome outcome;
+        try
+        {
+            outcome = DurableAgentStateOutcomeResolver.Resolve(persisted, request.CorrelationId, this._timeProvider.GetUtcNow());
+        }
+        catch (DurableAgentStateCorruptionException exception)
+        {
+            AgentSessionId sessionId = operation.Context.Id;
+            this.GetLogger(sessionId.Name, sessionId.Key).LogDurableOutcomeStateCorruption(exception, sessionId, request.CorrelationId);
+            throw;
+        }
+        if (outcome.Kind == DurableAgentRunOutcomeKind.Pending)
+        {
+            throw new InvalidOperationException(
+                "New schema 2 work requires IsolatedV2 deployment acknowledgement. Legacy mode permits read-only duplicates only.");
+        }
+
+        // Returning before the SDK dispatcher avoids republishing schema 2 through an unauthorized legacy writer.
+        response = outcome.GetResponse(request.CorrelationId);
+        return true;
     }
 
     /// <summary>
@@ -139,7 +195,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         // Logger category is Microsoft.DurableTask.Agents.{registeredAgentName}.{sessionId}
         ILogger logger = this.GetLogger(sessionId.Name, sessionId.Key);
         DurableAgentRetentionSettings retentionSettings =
-            this._options.GetRetentionSettings();
+            this._retentionSettings;
 
         string correlationId = request.CorrelationId;
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -177,19 +233,19 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             // Surface failures before optional migration so failed delivery never writes state.
             AgentResponse committedResponse = resolvedOutcome.GetResponse(correlationId);
             bool legacyMailboxMigrationRequested =
-                this._options.EnablePersistentRequestOutcomes &&
+                this._persistentRequestOutcomesEnabled &&
                 this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion;
             bool migrationAuthorized =
                 legacyMailboxMigrationRequested &&
                 this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
-            if (this._options.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto &&
+            if (this._deploymentMode == DurableAgentDeploymentMode.IsolatedV2 &&
                 this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
                 !migrationAuthorized)
             {
                 throw new DurableAgentStateCorruptionException(
-                    "Automatic history retention requires schema 2 mailbox state. Legacy terminal transcript " +
+                    "IsolatedV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
                     "entries must be converted from independently authoritative complete history before delivery. " +
-                    "Public Auto does not authorize legacy migration; preserve this session on its original " +
+                    "Public deployment acknowledgement does not authorize legacy migration; preserve this session on its original " +
                     "deployment and start a new isolated session.");
             }
             if (legacyMailboxMigrationRequested &&
@@ -216,35 +272,35 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
                 nameof(request));
         }
 
-        if (this._options.EnablePersistentRequestOutcomes)
+        if (this._persistentRequestOutcomesEnabled)
         {
             DurableAgentStateContract.ValidateIdentifier(
                 value: correlationId,
                 diagnosticPath: nameof(RunRequest.CorrelationId));
         }
 
-        if (!this._options.EnablePersistentRequestOutcomes &&
+        if (!this._persistentRequestOutcomesEnabled &&
             this.State.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
         {
             throw new InvalidOperationException(
-                "New schema 2 work requires explicit automatic history retention with a valid state budget. " +
-                "Disabling Auto does not downgrade existing state; retain Auto or use a separate legacy session.");
+                "New schema 2 work requires IsolatedV2 deployment acknowledgement. " +
+                "Legacy deployment mode does not downgrade existing state.");
         }
 
         this._cancellationToken.ThrowIfCancellationRequested();
         // TaskEntity hydrates State with the backend-owned object. Mutate an independent copy so
         // an exception leaves the hydrated state unchanged.
-        bool migrateLegacy = this._options.EnablePersistentRequestOutcomes &&
+        bool migrateLegacy = this._persistentRequestOutcomesEnabled &&
             this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
             this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
-        if (this._options.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto &&
+        if (this._deploymentMode == DurableAgentDeploymentMode.IsolatedV2 &&
             this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
             !migrateLegacy)
         {
             throw new DurableAgentStateCorruptionException(
-                "Automatic history retention requires schema 2 mailbox state. Legacy terminal transcript " +
+                "IsolatedV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
                 "entries must be converted from independently authoritative complete history before execution. " +
-                "Public Auto does not authorize legacy migration; preserve this session on its original " +
+                "Public deployment acknowledgement does not authorize legacy migration; preserve this session on its original " +
                 "deployment and start a new isolated session.");
         }
 
@@ -253,7 +309,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             : this.State.Clone();
         bool fixedOwnershipContractActive =
             workingState.SchemaVersion == DurableAgentState.RevisedSchemaVersion;
-        if (this._options.EnablePersistentRequestOutcomes &&
+        if (this._persistentRequestOutcomesEnabled &&
             fixedOwnershipContractActive)
         {
             workingState.PersistentRequestOutcomesAuthorized = true;
@@ -751,7 +807,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         AgentSessionId sessionId,
         ILogger logger)
     {
-        if (!this._options.EnablePersistentRequestOutcomes ||
+        if (!this._persistentRequestOutcomesEnabled ||
             !this._options.EnableProviderFailureFinalization ||
             workingState.SchemaVersion != DurableAgentState.RevisedSchemaVersion ||
             exception is OperationCanceledException ||
@@ -997,7 +1053,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
 
             retention = DurableAgentStateRetention.EnforceForCommit(
                 workingState,
-                this._options.GetRetentionSettings(),
+                this._retentionSettings,
                 currentTime,
                 logger,
                 sessionId);

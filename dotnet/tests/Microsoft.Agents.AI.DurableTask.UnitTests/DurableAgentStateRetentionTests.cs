@@ -36,7 +36,7 @@ public sealed class DurableAgentStateRetentionTests
         Assert.Equal(
             DurableAgentHistoryRetentionMode.KeepAll,
             options.HistoryRetentionMode);
-        Assert.Null(options.MaxStateBytes);
+        Assert.Equal(1_048_576, options.MaxStateBytes);
     }
 
     [Theory]
@@ -51,38 +51,66 @@ public sealed class DurableAgentStateRetentionTests
     }
 
     [Fact]
-    public void AutoRequiresExplicitPositiveBudget()
+    public void AutoUsesOneMiBWhenBudgetIsOmittedOrNull()
     {
         DurableAgentsOptions options = new()
         {
+            DeploymentMode = DurableAgentDeploymentMode.IsolatedV2,
             HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto,
         };
 
-        InvalidOperationException exception =
-            Assert.Throws<InvalidOperationException>(
-                () => _ = options.GetRetentionSettings());
-
-        Assert.Contains("explicit positive", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(1_048_576, options.MaxStateBytes);
+        Assert.Equal(1_048_576, options.GetRetentionSettings().MaxStateBytes);
+        options.MaxStateBytes = null;
+        Assert.Equal(1_048_576, options.GetRetentionSettings().MaxStateBytes);
     }
 
     [Fact]
-    public void KeepAllRejectsInapplicableRetentionConfiguration()
+    public void KeepAllIgnoresBudgetWithoutPruning()
     {
         DurableAgentsOptions options = new()
         {
             MaxStateBytes = 1_000,
         };
 
-        _ = Assert.Throws<InvalidOperationException>(
-            () => _ = options.GetRetentionSettings());
-        _ = Assert.Throws<InvalidOperationException>(
-            () => DurableAgentStateRetention.Enforce(
+        Assert.Null(options.GetRetentionSettings().MaxStateBytes);
+        Assert.Equal(0, DurableAgentStateRetention.Enforce(
                 CreateRevisedState(),
                 DurableAgentHistoryRetentionMode.KeepAll,
                 1_000,
                 DateTimeOffset.UtcNow,
                 NullLogger.Instance,
                 new AgentSessionId("agent", "session")));
+    }
+
+    [Theory]
+    [InlineData(null, 0.85, 0.70)]
+    [InlineData(1, 0.85, 0.70)]
+    [InlineData(1_048_576, 0.85, 0.70)]
+    [InlineData(null, 0.20, 0.90)]
+    [InlineData(1, 0.20, 0.90)]
+    [InlineData(1_048_576, 0.20, 0.90)]
+    [InlineData(null, 0.50, 0.50)]
+    [InlineData(1, 0.50, 0.50)]
+    [InlineData(1_048_576, 0.50, 0.50)]
+    public void KeepAllWatermarkAndBudgetOverridesAreInert(int? budget, double high, double low)
+    {
+        DurableAgentsOptions options = new()
+        {
+            DeploymentMode = DurableAgentDeploymentMode.IsolatedV2,
+            MaxStateBytes = budget,
+            HistoryRetentionHighWatermark = high,
+            HistoryRetentionLowWatermark = low,
+        };
+        DurableAgentRetentionSettings settings = options.GetRetentionSettings();
+        Assert.Equal(DurableAgentHistoryRetentionMode.KeepAll, settings.Mode);
+        Assert.Null(settings.MaxStateBytes);
+        DurableAgentState state = CreateLargeState(DateTimeOffset.UtcNow);
+        int count = state.Data.ConversationHistory.Count;
+        Assert.Equal(0, DurableAgentStateRetention.Enforce(state, settings.Mode, budget, DateTimeOffset.UtcNow,
+            NullLogger.Instance, new AgentSessionId("agent", "session")));
+        Assert.Equal(count, state.Data.ConversationHistory.Count);
+        Assert.Null(state.Data.Truncation);
     }
 
     [Theory]
@@ -106,6 +134,7 @@ public sealed class DurableAgentStateRetentionTests
     {
         DurableAgentsOptions options = new()
         {
+            DeploymentMode = DurableAgentDeploymentMode.IsolatedV2,
             HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto,
             MaxStateBytes = 10_000,
             HistoryRetentionHighWatermark = 0.9,

@@ -1,12 +1,10 @@
 # Opt-in Pressure Retention Sample
 
 > [!IMPORTANT]
-> This sample explicitly enables public Auto retention and schema 2 for a new session. Use a fresh
-> isolated task hub with compatible workers, pollers, tools and rollback binaries. It requires a
-> feature-introducing build and the independently approved provider-failure change in
-> [#131](https://github.com/microsoft/agent-framework-durable-extension/pull/131), not a guessed released
-> package version. Existing 1.x sessions are rejected, not migrated. See the
-> [ordered upgrade, old-session isolation and rollback guide](../../../../../../docs/features/durable-agents/automatic-history-retention.md).
+> This sample separately acknowledges IsolatedV2 and enables public Auto retention for a new session.
+> Use versions documented as schema-v2-compatible in a fresh isolated hub with compatible workers,
+> clients and readers. Existing 1.x sessions are rejected, not migrated. Follow the shared
+> [C# and Python migration guide](../../../../../docs/features/durable-agents/schema-v2-migration.md).
 
 The entry point uses the supported public options, a bounded model response, an illustrative marker
 diagnostic and OpenTelemetry metrics. KeepAll remains the default outside this opt-in:
@@ -14,8 +12,9 @@ diagnostic and OpenTelemetry metrics. KeepAll remains the default outside this o
 ```csharp
 services.ConfigureDurableAgents(options =>
 {
+    options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
     options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-    options.MaxStateBytes = 32 * 1024;
+    options.MaxStateBytes = 32 * 1024; // Demo override; Auto otherwise defaults to 1 MiB.
     options.HistoryRetentionHighWatermark = 0.85;
     options.HistoryRetentionLowWatermark = 0.70;
     options.AddAIAgent(agent);
@@ -65,11 +64,12 @@ This is durable entity **pressure retention**, not Microsoft Agent Framework sta
 compaction or `FollowCompaction`. It does not summarize old messages. It removes old transcript
 from later model input while durable execution and delivery evidence remains available.
 
-Public `KeepAll` remains the default and performs no proactive transcript deletion. Explicit Auto
-requires a positive byte budget; optional watermarks must satisfy `0 < low < high <= 1`.
-Do not switch active schema-2 sessions to default KeepAll expecting continued execution: it revokes
-writer authorization, not the persisted schema. Raising Auto's budget can reduce pressure only within
-verified backend limits. No public in-place legacy migration or receipt-deleting TTL is enabled.
+Public Legacy and KeepAll remain the defaults. IsolatedV2 also supports KeepAll without proactive
+transcript deletion. Auto requires isolated deployment acknowledgement and defaults to exactly 1 MiB;
+this demonstration overrides it to 32 KiB. Explicit null uses the default; optional watermarks satisfy
+`0 < low < high <= 1`. To stop proactive pruning, retain IsolatedV2 and choose KeepAll: existing budget
+and watermark settings become inert without needing to clear them. Returning to Legacy does not downgrade schema-2 state or
+authorize new work. No public in-place migration or receipt-deleting TTL is enabled.
 
 `Auto` cannot make every payload fit. A single oversized protected newest inline `DataContent`,
 tool result, terminal result, or other protected state can still exceed the high watermark. The
@@ -122,7 +122,7 @@ Set the model configuration in your own shell, using an identity authorized for 
 $env:FOUNDRY_PROJECT_ENDPOINT = "https://YOUR-ENDPOINT/api/projects/YOUR-PROJECT"
 $env:FOUNDRY_MODEL = "YOUR-MODEL-DEPLOYMENT"
 $env:DURABLE_TASK_SCHEDULER_CONNECTION_STRING = "Endpoint=http://localhost:8080;TaskHub=retention-isolated-demo;Authentication=None"
-$env:DURABLE_AGENTS_ISOLATED_HUB = "true"
+$env:DURABLE_AGENTS_DEPLOYMENT_MODE = "isolated_v2"
 Set-Location dotnet\samples\DurableAgents\ConsoleApps\10_AutoHistoryRetention
 dotnet restore --source https://packagefeedproxy.microsoft.io/nuget/v3/index.json
 dotnet run --framework net10.0 --no-restore

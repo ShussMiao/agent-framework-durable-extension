@@ -21,8 +21,8 @@ public enum DurableAgentHistoryRetentionMode
     /// binding, provider continuation, TTL, and other execution-control state are protected. The newest
     /// transcript exchange and system messages are never evicted; if protected state cannot fit below the
     /// safe write threshold, the operation fails instead of persisting oversized state.
-    /// This mode explicitly enables schema 2 persistence for new durable sessions; it does not migrate
-    /// existing legacy sessions or delete history owned by an external provider or model service.
+    /// Requires a separately acknowledged isolated schema 2 deployment. The pressure budget defaults to 1 MiB.
+    /// It does not activate a schema writer, migrate legacy sessions or delete externally owned history.
     /// </remarks>
     Auto,
 }

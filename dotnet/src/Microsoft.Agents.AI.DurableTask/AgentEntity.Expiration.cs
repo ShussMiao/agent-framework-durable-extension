@@ -16,19 +16,34 @@ internal partial class AgentEntity
 
     private bool ShouldPreserveLegacyCleanupState(TaskEntityOperation operation)
     {
-        if (this._options.HistoryRetentionMode != DurableAgentHistoryRetentionMode.Auto ||
-            operation.HasInput ||
-            (!string.Equals(operation.Name, nameof(CheckAndExpireResults), StringComparison.OrdinalIgnoreCase) &&
-             !string.Equals(operation.Name, nameof(CheckAndDeleteIfExpired), StringComparison.OrdinalIgnoreCase)))
+        bool resultCleanup = string.Equals(operation.Name, nameof(CheckAndExpireResults), StringComparison.OrdinalIgnoreCase);
+        if (!resultCleanup &&
+            !string.Equals(operation.Name, nameof(CheckAndDeleteIfExpired), StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
         DurableAgentState? persistedState =
             (DurableAgentState?)operation.State.GetState(typeof(DurableAgentState));
-        if (persistedState is null ||
-            persistedState.SchemaVersion == DurableAgentState.RevisedSchemaVersion ||
-            persistedState.Data.ExpirationTimeUtc.HasValue)
+        if (persistedState is null)
+        {
+            return false;
+        }
+
+        if (persistedState.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
+        {
+            // Idle deletion is disabled for the public mailbox contract, including read-only rollback workers.
+            if (!resultCleanup && !this._options.EnableMailboxEntityDeletion)
+            {
+                ValidateForCommit(persistedState);
+                return true;
+            }
+
+            return false;
+        }
+
+        if (this._deploymentMode != DurableAgentDeploymentMode.IsolatedV2 &&
+            !resultCleanup && persistedState.Data.ExpirationTimeUtc.HasValue)
         {
             return false;
         }
@@ -155,10 +170,10 @@ internal partial class AgentEntity
                 return;
             }
 
-            if (!this._options.EnablePersistentRequestOutcomes)
+            if (!this._persistentRequestOutcomesEnabled)
             {
                 throw new InvalidOperationException(
-                    "Schema 2 result expiration requires explicit automatic history retention with a valid state budget.");
+                    "Schema 2 result expiration requires IsolatedV2 deployment acknowledgement.");
             }
 
             // Unlike a new run, cleanup must not assign history identities or promote legacy state.
@@ -218,16 +233,16 @@ internal partial class AgentEntity
             {
                 logger.LogTTLExpirationTimeCleared(sessionId);
                 bool migrateLegacy =
-                    this._options.EnablePersistentRequestOutcomes &&
-                    this._options.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto &&
+                    this._persistentRequestOutcomesEnabled &&
+                    this._deploymentMode == DurableAgentDeploymentMode.IsolatedV2 &&
                     this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
                     this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
-                if (this._options.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto &&
+                if (this._deploymentMode == DurableAgentDeploymentMode.IsolatedV2 &&
                     this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
                     !migrateLegacy)
                 {
                     throw new DurableAgentStateCorruptionException(
-                        "Automatic history retention requires schema 2 mailbox state. Legacy terminal transcript " +
+                        "IsolatedV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
                         "entries must be converted from independently authoritative complete history before TTL mutation.");
                 }
 
@@ -236,7 +251,7 @@ internal partial class AgentEntity
                         this.State,
                         hasAuthoritativeLegacyHistory: true)
                     : this.State.Clone();
-                if (this._options.EnablePersistentRequestOutcomes &&
+                if (this._persistentRequestOutcomesEnabled &&
                     workingState.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
                 {
                     workingState.PersistentRequestOutcomesAuthorized = true;

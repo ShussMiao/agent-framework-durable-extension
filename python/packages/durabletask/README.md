@@ -19,6 +19,10 @@ The durable task integration lets you host Microsoft Agent Framework agents usin
 This README describes the current unreleased schema-v2 runtime, not a released compatibility
 promise. It is the common runtime contract for both Python hosts. See the
 [Azure Functions guide](../azurefunctions/README.md) for host-specific routes and settings.
+For application deployment and recovery, follow the shared
+[C# and Python schema-v2 migration guide](../../../docs/features/durable-agents/schema-v2-migration.md).
+It distinguishes this runtime's mandatory isolated acknowledgement from C#'s reader-first Legacy default;
+reader-first Python Legacy defaults are not implemented by the current runtime described here.
 
 The public mutable state model is now canonical `DurableAgentState` schema `2.0.0`.
 `read_agent_state(raw)` remains explicitly backward compatible with legacy `1.x` payloads.
@@ -57,12 +61,10 @@ the versioned `_durable_value_policy` marker so the matching loader can preserve
 after JSON transport. It does not prove execution authority, duplicate the value, or identify a
 runtime-native class by itself.
 
-Host construction now requires an explicit isolated v2 acknowledgement. Pass
-`deployment_mode="isolated_v2"` or set `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`.
-There is no automatic probe and no other deployment mode is accepted. This is an operator
-acknowledgement that the task hub is isolated and the clients are upgraded. It is not runtime
-proof of isolation and it cannot detect peer workers. A new isolated hub with matching upgraded
-workers and clients is the recommended way to keep old workers and histories off this deployment.
+Host construction requires `deployment_mode="isolated_v2"` or
+`DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`; no Legacy mode is currently accepted. The explicit
+argument takes precedence over the environment in this runtime. See the shared migration guide
+for deployment acknowledgement, routing and preservation requirements.
 
 **Start fresh workflow instances after this update, including upgrades from earlier v2 builds.**
 Workflow protocol `2` is unchanged, but start admission is stricter and checkpointed HITL admission
@@ -74,6 +76,10 @@ If old runs must finish, keep them on their original workers and hub, including 
 with concatenated child IDs. Do not resume them here.
 
 #### Migration
+
+For the operator decision tree and deployment checklist, use the
+[shared migration guide](../../../docs/features/durable-agents/schema-v2-migration.md).
+The following documents the optional Python API contract, not automatic schema activation.
 
 The current layer includes canonical transaction state, session capture, the workflow
 protocol boundary, and a privileged manual migration path. Migration is a backend entity

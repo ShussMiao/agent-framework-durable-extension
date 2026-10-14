@@ -2659,6 +2659,7 @@ public sealed class AgentEntityHistoryTests
             new RunRequest(new string('n', 500)) { CorrelationId = "new" },
             configureOptions: options =>
             {
+                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 9_000;
             });
@@ -2729,6 +2730,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
+                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 9_000;
             });
@@ -2861,6 +2863,7 @@ public sealed class AgentEntityHistoryTests
 
             static void ConfigureDraftSampleRetention(DurableAgentsOptions options)
             {
+                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = HistoryRetentionDemo.MaxStateBytes;
                 options.HistoryRetentionHighWatermark = HistoryRetentionDemo.HighWatermark;
@@ -2971,6 +2974,7 @@ public sealed class AgentEntityHistoryTests
             new RunRequest("first new request") { CorrelationId = "first-new" },
             configureOptions: options =>
             {
+                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 7_000;
             });
@@ -3000,7 +3004,7 @@ public sealed class AgentEntityHistoryTests
     }
 
     [Fact]
-    public async Task KeepAllRejectsInapplicableBudgetBeforeModelExecutionAsync()
+    public async Task KeepAllBudgetDoesNotPruneOrBlockModelExecutionAsync()
     {
         RecordingChatClient client = new();
         DurableAgentState initialState = CreateLargeState();
@@ -3009,14 +3013,12 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options => options.MaxStateBytes = 500);
 
-        InvalidOperationException exception =
-            await Assert.ThrowsAsync<InvalidOperationException>(
-                () => harness.RunAsync(
-                    new RunRequest("new request") { CorrelationId = "new" }));
-
-        Assert.Contains("only valid", exception.Message, StringComparison.Ordinal);
-        Assert.Equal(0, client.InvocationCount);
-        Assert.False(harness.StateWasPersisted);
+        await harness.RunAsync(new RunRequest("new request") { CorrelationId = "new" });
+        DurableAgentState written = Assert.IsType<DurableAgentState>(harness.PersistedState);
+        Assert.Equal(initialState.Data.ConversationHistory.Count + 2, written.Data.ConversationHistory.Count);
+        Assert.Null(written.Data.Truncation);
+        Assert.Equal(1, client.InvocationCount);
+        Assert.True(harness.StateWasPersisted);
     }
 
     [Fact]
@@ -3030,6 +3032,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
+                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 500;
                 options.AuthorizeLegacyMigration = null;
@@ -3062,6 +3065,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
+                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 500;
             });
@@ -3086,6 +3090,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
+                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 10_000;
                 options.AuthorizeLegacyMigration = null;
@@ -3110,6 +3115,7 @@ public sealed class AgentEntityHistoryTests
         DurableAgentsOptions options = new()
         {
             EnablePersistentRequestOutcomes = false,
+            DeploymentMode = DurableAgentDeploymentMode.IsolatedV2,
             HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto,
             MaxStateBytes = 32 * 1024,
         };
@@ -3143,6 +3149,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
+                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 500;
             });

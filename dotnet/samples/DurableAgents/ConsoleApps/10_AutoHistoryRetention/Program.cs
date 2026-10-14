@@ -12,12 +12,12 @@ using Microsoft.Extensions.Logging;
 using OpenAI.Chat;
 
 if (!string.Equals(
-    Environment.GetEnvironmentVariable("DURABLE_AGENTS_ISOLATED_HUB"),
-    "true",
-    StringComparison.OrdinalIgnoreCase))
+    Environment.GetEnvironmentVariable("DURABLE_AGENTS_DEPLOYMENT_MODE"),
+    "isolated_v2",
+    StringComparison.Ordinal))
 {
     Console.Error.WriteLine(
-        "Set DURABLE_AGENTS_ISOLATED_HUB=true only after creating a fresh, isolated task hub with " +
+        "Set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2 only after creating a fresh, isolated task hub with " +
         "mailbox-aware workers, pollers and tools. This acknowledgement is not a compatibility check.");
     return 2;
 }
@@ -31,7 +31,7 @@ string deploymentName = Environment.GetEnvironmentVariable("FOUNDRY_MODEL")
     ?? throw new InvalidOperationException("FOUNDRY_MODEL is not set.");
 string endpoint = new Uri(projectEndpoint).GetLeftPart(UriPartial.Authority);
 
-Console.WriteLine("KeepAll is the default. This sample explicitly opts into Auto and schema 2 for a new session.");
+Console.WriteLine("Legacy and KeepAll are the defaults. This sample separately acknowledges IsolatedV2 and opts into Auto.");
 Console.WriteLine("This is durable transcript pressure retention, not model-context compaction or FollowCompaction.");
 Console.WriteLine("External history stores are never pruned; mailbox, receipts, binding and session remain protected.");
 Console.WriteLine("The 32 KiB demo budget is not universal: oversized protected state fails atomically.");

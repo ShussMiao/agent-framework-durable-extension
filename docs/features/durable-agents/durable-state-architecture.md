@@ -4,7 +4,11 @@ Each durable agent session is represented by one Durable Entity. The entity coor
 
 Schema 2 separates request completion from conversation history. A completed request remains completed when its transcript is removed or its result expires, and a resumed session uses exactly one source of conversation history.
 
-Schema `2.0.0` is an explicit .NET producer opt-in through automatic history retention for new isolated sessions. Readers accept supported 1.x and 2.0; default KeepAll writes remain `1.2.0`. Existing legacy entities are not automatically migrated. See the [public API, reader floor and ordered upgrade/rollback guide](automatic-history-retention.md); Python's shared reader is read-only, not an interchangeable mutable worker.
+Schema `2.0.0` is an explicit .NET deployment acknowledgement through IsolatedV2, supplied by code
+or the exact shared environment value. KeepAll and Auto independently select retention within that deployment.
+Readers accept supported 1.x and 2.0; default Legacy writes remain 1.2. Existing entities are not automatically
+migrated. Follow the shared [C# and Python migration guide](schema-v2-migration.md); compatible wire state is not
+permission to interchange mutable provider sessions or workflow engines.
 
 The [schema 2 contract](../../../schemas/README.md) defines the wire fields and cross-runtime invariants.
 
@@ -131,7 +135,10 @@ The application or external provider remains responsible for availability, autho
 
 ## History configuration
 
-Closed public replay choices are represented by `DurableAgentHistoryReplayMode`, with `PreloadEntityHistory` and `CurrentRequestOnly`. Public `DurableAgentHistoryRetentionMode` offers default KeepAll and explicit Auto; Auto requires a positive storage-envelope budget and enables schema-2 writes for SDK-proven absent entity generations. Loaded legacy state still requires independent migration authority and has no public attestation surface. History ownership remains a closed internal enum after resolution.
+Closed public replay choices are represented by `DurableAgentHistoryReplayMode`, with `PreloadEntityHistory` and `CurrentRequestOnly`.
+Resolved `DurableAgentDeploymentMode.IsolatedV2` enables schema-2 writes for SDK-proven absent generations.
+KeepAll and Auto independently select retention; Auto defaults to a 1 MiB envelope budget with positive overrides. Loaded legacy
+state is not publicly migrated. History ownership remains a closed internal enum after resolution.
 
 Agent names and logical provider identities are open sets, so an enum is not appropriate for them. History policy is attached to `AddAIAgent` or `AddAIAgentFactory` through `DurableAgentHistoryOptions`; callers do not repeat the agent name. `DurableAgentHistoryProviderKey` validates the logical provider identity before registration. It crosses the JSON wire as a string for interoperability, but applications can define it once as a static typed value.
 
@@ -144,7 +151,7 @@ These are independent mechanisms:
 | Mechanism | Trigger | Removes | Preserves |
 | --- | --- | --- | --- |
 | Result expiry | `ResultRetentionPeriod` (60 seconds by default) and `CheckAndExpireResults` | `terminalResults[correlationId]` payload | Completion receipt with unavailable state |
-| Pressure retention | Public opt-in `Auto`, explicit positive storage-envelope budget, and configured high watermark | Oldest eligible transcript groups | Mailbox, receipts, binding, session, TTL, bookkeeping, system groups, newest exchange and its tool pairs |
+| Pressure retention | Public opt-in `Auto`, default 1 MiB or positive override, and high watermark | Oldest eligible transcript groups | Mailbox, receipts, binding, session, TTL, bookkeeping, system groups, newest exchange and its tool pairs |
 | Whole-entity TTL | `expirationTimeUtc` and `CheckAndDeleteIfExpired` | Entire entity | Nothing in that session |
 
 `AgentEntity.ApplyRetentionAndCommit` performs due result expiry, writes the next generation-aware expiry schedule, invokes staged retention, validates serialization, schedules required self-signals, and finally replaces entity state. Automatic retention measures the converter output as an escaped JSON-string storage envelope. Its default 0.85 high and 0.70 low watermarks are publicly configurable with `0 < low < high <= 1`; there is no implicit portable budget. A protected-floor failure leaves the input state unchanged and fails before model/provider effects when the floor is deterministically knowable.

@@ -27,35 +27,57 @@ public sealed class RetentionProbeTests
         });
 
         Assert.NotNull(configured);
+        Assert.Equal(DurableAgentDeploymentMode.IsolatedV2, configured.DeploymentMode);
         Assert.Equal(DurableAgentHistoryRetentionMode.Auto, configured.HistoryRetentionMode);
         Assert.Equal(HistoryRetentionDemo.MaxStateBytes, configured.MaxStateBytes);
         Assert.Equal(HistoryRetentionDemo.HighWatermark, configured.HistoryRetentionHighWatermark);
         Assert.Equal(HistoryRetentionDemo.LowWatermark, configured.HistoryRetentionLowWatermark);
     }
 
+    [Fact]
+    public void PublicAutoDefaultsToOneMiBAndKeepAllAcceptsInertOverrides()
+    {
+        DurableAgentsOptions? captured = null;
+        new ServiceCollection().ConfigureDurableAgents(options =>
+        {
+            options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+            options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+            captured = options;
+        });
+        Assert.Equal(1_048_576, captured!.MaxStateBytes);
+        new ServiceCollection().ConfigureDurableAgents(options =>
+        {
+            options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+            options.MaxStateBytes = 1;
+            options.HistoryRetentionHighWatermark = 0.2;
+            options.HistoryRetentionLowWatermark = 0.9;
+        });
+    }
+
     [Theory]
-    [InlineData("missingBudget")]
-    [InlineData("keepAllBudget")]
+    [InlineData("unacknowledged")]
+    [InlineData("invalidMode")]
     [InlineData("reversedWatermarks")]
     public void InvalidPublicSettingsRejectBeforeFactoryOrTransportCallbacks(string kind)
     {
         int callbacks = 0;
         ServiceCollection services = new();
-        Assert.Throws<InvalidOperationException>(() => services.ConfigureDurableAgents(
+        Exception? error = Record.Exception(() => services.ConfigureDurableAgents(
             options =>
             {
+                if (kind != "unacknowledged")
+                {
+                    options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                }
                 options.AddAIAgentFactory("agent", _ =>
                 {
                     callbacks++;
                     return new RecordingAgent("agent");
                 });
-                if (kind != "keepAllBudget")
+                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+                if (kind == "invalidMode")
                 {
-                    options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-                }
-                if (kind != "missingBudget")
-                {
-                    options.MaxStateBytes = 32 * 1024;
+                    options.HistoryRetentionMode = (DurableAgentHistoryRetentionMode)42;
                 }
                 if (kind == "reversedWatermarks")
                 {
@@ -66,6 +88,14 @@ public sealed class RetentionProbeTests
             workerBuilder: _ => callbacks++,
             clientBuilder: _ => callbacks++));
 
+        if (kind == "invalidMode")
+        {
+            Assert.IsType<ArgumentOutOfRangeException>(error);
+        }
+        else
+        {
+            Assert.IsType<InvalidOperationException>(error);
+        }
         Assert.Equal(0, callbacks);
     }
 
