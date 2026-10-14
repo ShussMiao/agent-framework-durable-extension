@@ -359,7 +359,7 @@ internal static class DurableAgentStateRetention
             throw new ArgumentOutOfRangeException(
                 nameof(maxStateBytes),
                 maxStateBytes,
-                "Automatic durable history retention requires a resolved positive state byte budget.");
+                "Automatic durable history retention requires a positive state byte budget.");
         }
 
         if (!double.IsFinite(highWatermark) ||

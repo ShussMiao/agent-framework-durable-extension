@@ -20,6 +20,35 @@ public sealed partial class AgentEntityPublicRetentionTests
         }
     }
 
+    [Fact]
+    public async Task AgentCallbackCannotChangeCurrentOperationWriterOrRetentionPolicyAsync()
+    {
+        DurableAgentsOptions? configured = null;
+        ProbeClient client = new()
+        {
+            BeforeResponse = () =>
+            {
+                Assert.NotNull(configured);
+                configured.DeploymentMode = DurableAgentDeploymentMode.Legacy;
+                configured.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+                configured.MaxStateBytes = 1;
+                Assert.False(configured.EnablePersistentRequestOutcomes);
+            },
+        };
+        EntityBatchResult run = await DispatchAsync(new ChatClientAgent(client, name: "agent"), null, "new",
+            mailbox: false, configureOptions: options =>
+            {
+                configured = options;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
+            });
+
+        Assert.Null(Result(run).FailureDetails);
+        Assert.Equal(DurableAgentState.RevisedSchemaVersion, ReadState(run).SchemaVersion);
+        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome, ReadState(run).Data.CompletionReceipts!["new"].Outcome);
+        Assert.Null(ReadState(run).Data.Truncation);
+        Assert.Equal(1, client.Count);
+    }
+
     [Theory]
     [InlineData(false, DurableAgentHistoryReplayMode.PreloadEntityHistory)]
     [InlineData(true, DurableAgentHistoryReplayMode.PreloadEntityHistory)]
@@ -465,6 +494,9 @@ public sealed partial class AgentEntityPublicRetentionTests
         Assert.Empty(Actions(duplicate));
         EntityBatchResult next = await DispatchAsync(agent, raw, "new", mailbox: false);
         Assert.Equal(typeof(InvalidOperationException).FullName, Failure(next).ErrorType);
+        Assert.Contains("DurableAgentsOptions.DeploymentMode", Failure(next).ErrorMessage, StringComparison.Ordinal);
+        Assert.Contains("DurableAgentDeploymentMode.SchemaV2", Failure(next).ErrorMessage, StringComparison.Ordinal);
+        Assert.Contains("DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2", Failure(next).ErrorMessage, StringComparison.Ordinal);
         Assert.Equal(raw, next.EntityState);
         Assert.Empty(Actions(next));
         Assert.Equal(0, client.Count);

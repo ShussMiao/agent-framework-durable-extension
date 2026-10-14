@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text.Json;
 using AutoHistoryRetention;
@@ -16,19 +17,31 @@ namespace AutoHistoryRetentionTests;
 public sealed class RetentionProbeTests
 {
     [Fact]
-    public void PublicDeploymentEnumHasOnlySchemaNamesAndUnchangedNumericValues()
+    public async Task SampleEntryRequiresEnvironmentAcknowledgementBeforeServiceConfigurationAsync()
     {
-        Assert.Equal(["Legacy", "SchemaV2"], Enum.GetNames<DurableAgentDeploymentMode>());
-        Assert.Equal(
-            [DurableAgentDeploymentMode.Legacy, DurableAgentDeploymentMode.SchemaV2],
-            Enum.GetValues<DurableAgentDeploymentMode>());
-        Assert.Equal(0, (int)DurableAgentDeploymentMode.Legacy);
-        Assert.Equal(1, (int)DurableAgentDeploymentMode.SchemaV2);
-        Assert.Equal("1", JsonSerializer.Serialize(DurableAgentDeploymentMode.SchemaV2));
+        ProcessStartInfo start = new("dotnet")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        start.ArgumentList.Add(typeof(HistoryRetentionDemo).Assembly.Location);
+        start.Environment.Remove("DURABLE_AGENTS_DEPLOYMENT_MODE");
+        using Process sample = Process.Start(start)!;
+        Task<string> output = sample.StandardOutput.ReadToEndAsync();
+        Task<string> error = sample.StandardError.ReadToEndAsync();
+        await sample.WaitForExitAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, sample.ExitCode);
+        Assert.Empty(await output);
+        string message = await error;
+        Assert.Contains("Sample 10 uses environment configuration", message, StringComparison.Ordinal);
+        Assert.Contains("DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2", message, StringComparison.Ordinal);
+        Assert.Contains("DurableAgentsOptions.DeploymentMode", message, StringComparison.Ordinal);
+        Assert.Contains("DurableAgentDeploymentMode.SchemaV2", message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ExternalConsumerConfiguresPublicAutoWithoutTestHooks()
+    public void SampleConfigurationUsesSchemaV2AndDemoRetentionBudget()
     {
         DurableAgentsOptions? configured = null;
         ServiceCollection services = new();
@@ -44,71 +57,6 @@ public sealed class RetentionProbeTests
         Assert.Equal(HistoryRetentionDemo.MaxStateBytes, configured.MaxStateBytes);
         Assert.Equal(HistoryRetentionDemo.HighWatermark, configured.HistoryRetentionHighWatermark);
         Assert.Equal(HistoryRetentionDemo.LowWatermark, configured.HistoryRetentionLowWatermark);
-    }
-
-    [Fact]
-    public void PublicAutoDefaultsToOneMiBAndKeepAllAcceptsInertOverrides()
-    {
-        DurableAgentsOptions? captured = null;
-        new ServiceCollection().ConfigureDurableAgents(options =>
-        {
-            options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
-            options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-            captured = options;
-        });
-        Assert.Equal(1_048_576, captured!.MaxStateBytes);
-        new ServiceCollection().ConfigureDurableAgents(options =>
-        {
-            options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
-            options.MaxStateBytes = 1;
-            options.HistoryRetentionHighWatermark = 0.2;
-            options.HistoryRetentionLowWatermark = 0.9;
-        });
-    }
-
-    [Theory]
-    [InlineData("unacknowledged")]
-    [InlineData("invalidMode")]
-    [InlineData("reversedWatermarks")]
-    public void InvalidPublicSettingsRejectBeforeFactoryOrTransportCallbacks(string kind)
-    {
-        int callbacks = 0;
-        ServiceCollection services = new();
-        Exception? error = Record.Exception(() => services.ConfigureDurableAgents(
-            options =>
-            {
-                if (kind != "unacknowledged")
-                {
-                    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
-                }
-                options.AddAIAgentFactory("agent", _ =>
-                {
-                    callbacks++;
-                    return new RecordingAgent("agent");
-                });
-                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-                if (kind == "invalidMode")
-                {
-                    options.HistoryRetentionMode = (DurableAgentHistoryRetentionMode)42;
-                }
-                if (kind == "reversedWatermarks")
-                {
-                    options.HistoryRetentionLowWatermark = 0.9;
-                    options.HistoryRetentionHighWatermark = 0.8;
-                }
-            },
-            workerBuilder: _ => callbacks++,
-            clientBuilder: _ => callbacks++));
-
-        if (kind == "invalidMode")
-        {
-            Assert.IsType<ArgumentOutOfRangeException>(error);
-        }
-        else
-        {
-            Assert.IsType<InvalidOperationException>(error);
-        }
-        Assert.Equal(0, callbacks);
     }
 
     [Theory]

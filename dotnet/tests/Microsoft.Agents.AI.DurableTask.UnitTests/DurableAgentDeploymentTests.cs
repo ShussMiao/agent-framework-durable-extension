@@ -10,6 +10,69 @@ public sealed class DurableAgentDeploymentTests
 {
     private const string ProbeVariable = "DURABLE_AGENTS_DEPLOYMENT_TEST_PROBE";
 
+    [Fact]
+    public void PublicDeploymentEnumHasOnlySchemaNamesAndUnchangedNumericValues()
+    {
+        Assert.Equal(["Legacy", "SchemaV2"], Enum.GetNames<DurableAgentDeploymentMode>());
+        Assert.Equal(
+            [DurableAgentDeploymentMode.Legacy, DurableAgentDeploymentMode.SchemaV2],
+            Enum.GetValues<DurableAgentDeploymentMode>());
+        Assert.Equal(0, (int)DurableAgentDeploymentMode.Legacy);
+        Assert.Equal(1, (int)DurableAgentDeploymentMode.SchemaV2);
+        Assert.Equal("1", JsonSerializer.Serialize(DurableAgentDeploymentMode.SchemaV2));
+    }
+
+    [Theory]
+    [InlineData("unacknowledged")]
+    [InlineData("invalidMode")]
+    [InlineData("reversedWatermarks")]
+    public void InvalidPublicSettingsRejectBeforeFactoryOrTransportCallbacks(string kind)
+    {
+        int callbacks = 0;
+        ServiceCollection services = new();
+        Exception? error = Record.Exception(() => services.ConfigureDurableAgents(
+            options =>
+            {
+                if (kind != "unacknowledged")
+                {
+                    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
+                }
+                options.AddAIAgentFactory("agent", _ =>
+                {
+                    callbacks++;
+                    throw new InvalidOperationException("Factory must not be invoked.");
+                });
+                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+                if (kind == "invalidMode")
+                {
+                    options.HistoryRetentionMode = (DurableAgentHistoryRetentionMode)42;
+                }
+                if (kind == "reversedWatermarks")
+                {
+                    options.HistoryRetentionLowWatermark = 0.9;
+                    options.HistoryRetentionHighWatermark = 0.8;
+                }
+            },
+            workerBuilder: _ => callbacks++,
+            clientBuilder: _ => callbacks++));
+
+        if (kind == "invalidMode")
+        {
+            Assert.IsType<ArgumentOutOfRangeException>(error);
+        }
+        else
+        {
+            Assert.IsType<InvalidOperationException>(error);
+        }
+        Assert.Equal(0, callbacks);
+        if (kind == "unacknowledged")
+        {
+            Assert.Contains("DurableAgentsOptions.DeploymentMode", error!.Message, StringComparison.Ordinal);
+            Assert.Contains("DurableAgentDeploymentMode.SchemaV2", error.Message, StringComparison.Ordinal);
+            Assert.Contains("DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2", error.Message, StringComparison.Ordinal);
+        }
+    }
+
     public static IEnumerable<object?[]> DeploymentCases()
     {
         foreach (int? code in new int?[] { null, 0, 1 })

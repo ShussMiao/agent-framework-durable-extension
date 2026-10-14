@@ -34,7 +34,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         : services.GetService<IHostApplicationLifetime>()?.ApplicationStopping ?? CancellationToken.None;
     private DurableAgentState? _initializedEntityGeneration;
     private DurableAgentDeploymentMode _deploymentMode;
-    private bool _persistentRequestOutcomesEnabled;
+    private bool _schemaV2WritesEnabled;
     private DurableAgentRetentionSettings _retentionSettings;
 
     /// <summary>
@@ -76,10 +76,11 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
 
     protected override DurableAgentState InitializeState(TaskEntityOperation entityOperation)
     {
+        // Direct initialization can bypass the interface dispatcher, so capture configuration here too.
         this.CaptureOperationConfiguration();
         // Only an absent entity generation can initialize a new mailbox without legacy completion evidence.
         bool shouldInitializePersistentRequestOutcomes =
-            this._persistentRequestOutcomesEnabled && IsAgentRunOperation(entityOperation);
+            this._schemaV2WritesEnabled && IsAgentRunOperation(entityOperation);
         if (!shouldInitializePersistentRequestOutcomes)
         {
             this._initializedEntityGeneration = base.InitializeState(entityOperation);
@@ -94,15 +95,16 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
 
     private void CaptureOperationConfiguration()
     {
+        // Shared options may change in user callbacks; keep this operation's writer and retention policy fixed.
         this._retentionSettings = this._options.GetRetentionSettings();
         this._deploymentMode = this._options.DeploymentMode;
-        this._persistentRequestOutcomesEnabled = this._options.EnablePersistentRequestOutcomes;
+        this._schemaV2WritesEnabled = this._options.EnablePersistentRequestOutcomes;
     }
 
     private bool TryReadRollbackDuplicate(TaskEntityOperation operation, out object? response)
     {
         response = null;
-        if (this._persistentRequestOutcomesEnabled || !IsAgentRunOperation(operation))
+        if (this._schemaV2WritesEnabled || !IsAgentRunOperation(operation))
         {
             return false;
         }
@@ -131,7 +133,9 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         if (outcome.Kind == DurableAgentRunOutcomeKind.Pending)
         {
             throw new InvalidOperationException(
-                "New schema 2 work requires SchemaV2 deployment acknowledgement. Legacy mode permits read-only duplicates only.");
+                "New schema-v2 work is disabled because schema-v2 deployment mode is not enabled. " +
+                "Set DurableAgentsOptions.DeploymentMode to DurableAgentDeploymentMode.SchemaV2, " +
+                "or set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2 before startup. Legacy mode can only read completed results.");
         }
 
         // Returning before the SDK dispatcher avoids republishing schema 2 through an unauthorized legacy writer.
@@ -230,7 +234,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             // Surface failures before optional migration so failed delivery never writes state.
             AgentResponse committedResponse = resolvedOutcome.GetResponse(correlationId);
             bool legacyMailboxMigrationRequested =
-                this._persistentRequestOutcomesEnabled &&
+                this._schemaV2WritesEnabled &&
                 this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion;
             bool migrationAuthorized =
                 legacyMailboxMigrationRequested &&
@@ -240,10 +244,8 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
                 !migrationAuthorized)
             {
                 throw new DurableAgentStateCorruptionException(
-                    "SchemaV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
-                    "entries must be converted from independently authoritative complete history before delivery. " +
-                    "Public deployment acknowledgement does not authorize legacy migration; preserve this session on its original " +
-                    "deployment and start a new isolated session.");
+                    "A schema-v2 deployment cannot deliver results from an existing legacy session. " +
+                    "Keep that session on its original deployment and start a new isolated session.");
             }
             if (legacyMailboxMigrationRequested &&
                 migrationAuthorized &&
@@ -269,25 +271,26 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
                 nameof(request));
         }
 
-        if (this._persistentRequestOutcomesEnabled)
+        if (this._schemaV2WritesEnabled)
         {
             DurableAgentStateContract.ValidateIdentifier(
                 value: correlationId,
                 diagnosticPath: nameof(RunRequest.CorrelationId));
         }
 
-        if (!this._persistentRequestOutcomesEnabled &&
+        if (!this._schemaV2WritesEnabled &&
             this.State.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
         {
             throw new InvalidOperationException(
-                "New schema 2 work requires SchemaV2 deployment acknowledgement. " +
-                "Legacy deployment mode does not downgrade existing state.");
+                "New schema-v2 work is disabled because schema-v2 deployment mode is not enabled. " +
+                "Set DurableAgentsOptions.DeploymentMode to DurableAgentDeploymentMode.SchemaV2, " +
+                "or set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2 before startup. Existing state is not downgraded.");
         }
 
         this._cancellationToken.ThrowIfCancellationRequested();
         // TaskEntity hydrates State with the backend-owned object. Mutate an independent copy so
         // an exception leaves the hydrated state unchanged.
-        bool migrateLegacy = this._persistentRequestOutcomesEnabled &&
+        bool migrateLegacy = this._schemaV2WritesEnabled &&
             this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
             this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
         if (this._deploymentMode == DurableAgentDeploymentMode.SchemaV2 &&
@@ -295,10 +298,8 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             !migrateLegacy)
         {
             throw new DurableAgentStateCorruptionException(
-                "SchemaV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
-                "entries must be converted from independently authoritative complete history before execution. " +
-                "Public deployment acknowledgement does not authorize legacy migration; preserve this session on its original " +
-                "deployment and start a new isolated session.");
+                "A schema-v2 deployment cannot run an existing legacy session. " +
+                "Keep that session on its original deployment and start a new isolated session.");
         }
 
         DurableAgentState workingState = migrateLegacy
@@ -306,7 +307,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             : this.State.Clone();
         bool fixedOwnershipContractActive =
             workingState.SchemaVersion == DurableAgentState.RevisedSchemaVersion;
-        if (this._persistentRequestOutcomesEnabled &&
+        if (this._schemaV2WritesEnabled &&
             fixedOwnershipContractActive)
         {
             workingState.PersistentRequestOutcomesAuthorized = true;
@@ -804,7 +805,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         AgentSessionId sessionId,
         ILogger logger)
     {
-        if (!this._persistentRequestOutcomesEnabled ||
+        if (!this._schemaV2WritesEnabled ||
             !this._options.EnableProviderFailureFinalization ||
             workingState.SchemaVersion != DurableAgentState.RevisedSchemaVersion ||
             exception is OperationCanceledException ||

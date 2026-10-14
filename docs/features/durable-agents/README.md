@@ -16,8 +16,10 @@ Durable agents extend the standard Microsoft Agent Framework with **durable stat
 > [!NOTE]
 > For a step-by-step tutorial and deployment guidance, see [Azure Functions (Durable)](https://learn.microsoft.com/agent-framework/integrations/azure-functions) on Microsoft Learn.
 
-.NET defaults to the Legacy/schema-1.2 writer and KeepAll. SchemaV2 deployment acknowledgement
-authorizes new canonical sessions independently of [automatic history retention](automatic-history-retention.md).
+.NET defaults to the Legacy/schema-1.2 writer and KeepAll. Set
+`options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;` in code, or
+`DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` before startup to authorize new canonical sessions
+independently of [automatic history retention](automatic-history-retention.md).
 The shared [C# and Python schema-v2 migration guide](schema-v2-migration.md) explains the actual language/host
 defaults, reader-first deployment, old-work preservation, exact activation rules and rollback limits.
 

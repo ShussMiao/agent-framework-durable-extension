@@ -179,6 +179,7 @@ public sealed partial class AgentEntityPublicRetentionTests
         public List<ChatMessage> LastMessages { get; private set; } = [];
         public Exception? Failure { get; init; }
         public string? ResponseConversationId { get; init; }
+        public Action? BeforeResponse { get; init; }
         public object? GetService(Type serviceType, object? serviceKey = null) => null;
         public void Dispose() { }
         public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
@@ -190,6 +191,7 @@ public sealed partial class AgentEntityPublicRetentionTests
         {
             this.Count++;
             this.LastMessages = messages.ToList();
+            this.BeforeResponse?.Invoke();
             await Task.Yield();
             if (this.Failure is not null)
             {

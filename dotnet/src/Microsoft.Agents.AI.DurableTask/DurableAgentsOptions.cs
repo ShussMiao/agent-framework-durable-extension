@@ -254,8 +254,9 @@ public sealed class DurableAgentsOptions
             this._resolvedDeploymentMode != DurableAgentDeploymentMode.SchemaV2)
         {
             throw new InvalidOperationException(
-                "Automatic durable history retention requires SchemaV2 deployment acknowledgement. " +
-                "Set DeploymentMode to SchemaV2 or DURABLE_AGENTS_DEPLOYMENT_MODE exactly to 'isolated_v2'.");
+                "Automatic durable history retention requires schema-v2 deployment acknowledgement. " +
+                "Set DurableAgentsOptions.DeploymentMode to DurableAgentDeploymentMode.SchemaV2, " +
+                "or set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2 before startup.");
         }
 
         if (this.HistoryRetentionMode == DurableAgentHistoryRetentionMode.KeepAll)

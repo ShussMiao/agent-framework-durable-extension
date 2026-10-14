@@ -23,7 +23,8 @@ internal static class DurableAgentDeploymentConfiguration
         {
             throw new InvalidOperationException(
                 "Explicit Legacy deployment mode conflicts with DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2. " +
-                "Remove the environment setting or explicitly acknowledge SchemaV2 in code.");
+                "Remove the environment setting to keep Legacy, or set DurableAgentsOptions.DeploymentMode " +
+                "to DurableAgentDeploymentMode.SchemaV2.");
         }
 
         return configuredMode ?? (environmentValue is null

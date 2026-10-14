@@ -14,6 +14,9 @@ internal partial class AgentEntity
 {
     private static readonly TimeSpan s_minimumResultExpirationSignalDelay = TimeSpan.FromMinutes(1);
 
+    /// <summary>
+    /// Keeps loaded legacy state from being deleted and mistaken for a fresh schema-v2 generation on the next run.
+    /// </summary>
     private bool ShouldPreserveLegacyCleanupState(TaskEntityOperation operation)
     {
         bool resultCleanup = string.Equals(operation.Name, nameof(CheckAndExpireResults), StringComparison.OrdinalIgnoreCase);
@@ -32,7 +35,7 @@ internal partial class AgentEntity
 
         if (persistedState.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
         {
-            // Idle deletion is disabled for the public mailbox contract, including read-only rollback workers.
+            // Idle deletion must not erase completion receipts, including on read-only rollback workers.
             if (!resultCleanup && !this._options.EnableMailboxEntityDeletion)
             {
                 ValidateForCommit(persistedState);
@@ -50,7 +53,7 @@ internal partial class AgentEntity
 
         this._cancellationToken.ThrowIfCancellationRequested();
         ValidateForCommit(persistedState);
-        // These legacy operations are no-ops. Bypass SDK write-back to preserve even noncanonical JSON bytes.
+        // Even a successful no-op triggers SDK write-back. Bypass dispatch to preserve the original JSON bytes.
         return true;
     }
 
@@ -170,10 +173,12 @@ internal partial class AgentEntity
                 return;
             }
 
-            if (!this._persistentRequestOutcomesEnabled)
+            if (!this._schemaV2WritesEnabled)
             {
                 throw new InvalidOperationException(
-                    "Schema 2 result expiration requires SchemaV2 deployment acknowledgement.");
+                    "Schema 2 result expiration is disabled because schema-v2 deployment mode is not enabled. " +
+                    "Set DurableAgentsOptions.DeploymentMode to DurableAgentDeploymentMode.SchemaV2, " +
+                    "or set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2 before startup.");
             }
 
             // Unlike a new run, cleanup must not assign history identities or promote legacy state.
@@ -233,7 +238,7 @@ internal partial class AgentEntity
             {
                 logger.LogTTLExpirationTimeCleared(sessionId);
                 bool migrateLegacy =
-                    this._persistentRequestOutcomesEnabled &&
+                    this._schemaV2WritesEnabled &&
                     this._deploymentMode == DurableAgentDeploymentMode.SchemaV2 &&
                     this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
                     this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
@@ -242,8 +247,8 @@ internal partial class AgentEntity
                     !migrateLegacy)
                 {
                     throw new DurableAgentStateCorruptionException(
-                        "SchemaV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
-                        "entries must be converted from independently authoritative complete history before TTL mutation.");
+                        "A schema-v2 deployment cannot change expiration for an existing legacy session. " +
+                        "Keep that session on its original deployment.");
                 }
 
                 DurableAgentState workingState = migrateLegacy
@@ -251,7 +256,7 @@ internal partial class AgentEntity
                         this.State,
                         hasAuthoritativeLegacyHistory: true)
                     : this.State.Clone();
-                if (this._persistentRequestOutcomesEnabled &&
+                if (this._schemaV2WritesEnabled &&
                     workingState.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
                 {
                     workingState.PersistentRequestOutcomesAuthorized = true;
@@ -293,7 +298,7 @@ internal partial class AgentEntity
     /// </summary>
     private bool IsMissingEntityPlaceholder(DurableAgentState state)
     {
-        // SDK 1.18 initializes only absent state. Shape alone cannot distinguish persisted empty legacy state.
+        // Only this operation's SDK-created object proves absence; an equally empty loaded state is not disposable.
         return ReferenceEquals(state, this._initializedEntityGeneration) &&
             state.Data.ConversationHistory.Count == 0 &&
             state.Data.TerminalResults is null &&

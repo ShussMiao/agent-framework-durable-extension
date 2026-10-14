@@ -211,9 +211,15 @@ Applications own idempotency and reconciliation. Provider-failure finalization i
 - **Entity TTL** deletes a session and its deduplication evidence. C# Legacy retains its historical TTL; public C# schema-2 idle deletion is disabled. Result cleanup does not delete receipts. Treat any explicit reset supported by a runtime as destructive—not routine retention.
 - **Restart** reloads binding, continuation and receipts. JSON compatibility alone does not authorize another language, provider pipeline or workflow engine to continue the session.
 
-An isolated C# worker rejects loaded 1.0/1.1/1.2 state, even an empty-looking snapshot. Cleanup must preserve it, not erase it and authorize the same identity as fresh. Only actual SDK absence can initialize a new generation. Do not change schema headers, manufacture empty receipt maps or infer complete history from absent truncation metadata.
+An isolated C# worker rejects loaded 1.0/1.1/1.2 state, even an empty-looking snapshot. Cleanup preserves
+that state without rewriting it or making the same identity eligible for schema-v2 work.
+Keep the original deployment for those sessions and use genuinely new identities for new schema-v2 sessions.
+Do not change schema headers or remove completion evidence to make an existing session appear new.
 
-Where a Python version offers a separate privileged migration API, it is not automatic activation: use that API's complete evidence, ownership-transfer and separate-empty-destination requirements. There is no public C# in-place migration callback. If authoritative evidence is unavailable, preserve the old deployment and start genuinely new work separately.
+Where a Python version offers a separate privileged migration API, it is not automatic activation:
+use that API's complete evidence, ownership-transfer and separate-empty-destination requirements.
+C# deployment acknowledgement does not convert existing state in place. Preserve the old deployment
+and start genuinely new work separately.
 
 ## Validation and monitoring checklist
 

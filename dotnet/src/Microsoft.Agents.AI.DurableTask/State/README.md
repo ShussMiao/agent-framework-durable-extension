@@ -83,15 +83,13 @@ other revised semantic checks consistently on read and write.
 The mailbox contract and optional opaque history profile use schema `2.0.0`. This is intentionally a fail-closed major
 version: a 1.x worker preserves unknown fields but does not understand completion receipts, so allowing it to
 process revised state could rerun work whose transcript result was already removed. The .NET reader now
-supports mailbox-aware 2.0 lookup, while new state continues to default to `1.2.0`.
-Producer activation requires resolved `DurableAgentDeploymentMode.SchemaV2`, independently of retention.
+supports schema-2 results and receipts, while new state continues to default to `1.2.0`.
+Enable new schema-2 sessions with `options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;`
+in code, or set `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` before startup. Retention is configured separately.
 Use the shared [C# and Python migration guide](../../../../docs/features/durable-agents/schema-v2-migration.md).
 Compatible routing is an operator requirement, not a capability detected by options. Existing 2.0 state
 is preserved rather than downgraded, and committed duplicates remain readable with writes disabled.
 New requests against existing 2.0 state fail before agent execution when writer authorization is disabled.
-The internal passive contract path remains available for serializer/fixture tests without authorizing new
-production writes.
-
 In revised state, `terminalResults` stores immutable result envelopes by correlation ID outside
 `conversationHistory`, while `completionReceipts` retains completion evidence after a result payload expires.
 An `available` receipt requires a matching result; an `unavailable` receipt proves completion without a result
@@ -182,11 +180,9 @@ implements the mailbox/binding contract or explicitly rejects the new major vers
 fail-closed for unsupported versions and defaults new writes to 1.2. Other runtimes require coordinated version
 gating before a 2.0 producer is enabled; preserving unknown fields alone is not sufficient because an
 unaware worker could ignore completion receipts and rerun completed work.
-Public activation does not certify backend atomicity or the deployment's routing floor. An actual isolated
-backend/worker run proving state-and-outbox rollback, restart and duplicate dispatch is a mandatory
-**merge and release gate**, not a claim established by mock-only coverage or a skipped integration test.
-A clearly documented gated skip permits draft readiness only: do not merge or release this correction
-until the actual isolated-backend test passes. See the
+Public activation does not verify backend atomicity or routing compatibility. Before deployment, validate
+state-and-outbox rollback, restart and duplicate dispatch against an actual isolated backend and worker.
+Mock-only coverage or a skipped integration test is insufficient. See the
 [integration safety and execution instructions](../../../tests/Microsoft.Agents.AI.DurableTask.IntegrationTests/README.md).
 
 ## State Examples
@@ -332,8 +328,8 @@ highest-seen position for one producer, not an array or proof that every earlier
 
 ### Schema 2.0
 
-This example is for contract review and contributor guidance only. Production runtimes must not emit schema 2
-until the activation requirements above are met. An `available` receipt has a matching terminal result; an
+SchemaV2 deployments use this state shape once the compatibility and isolation requirements above are met.
+An `available` receipt has a matching terminal result; an
 `unavailable` receipt remains after its result payload has been removed.
 
 ```json

@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Agents.AI.DurableTask.State;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Microsoft.Agents.AI.DurableTask.Tests.Unit;
@@ -37,6 +38,26 @@ public sealed class DurableAgentStateRetentionTests
             DurableAgentHistoryRetentionMode.KeepAll,
             options.HistoryRetentionMode);
         Assert.Equal(1_048_576, options.MaxStateBytes);
+    }
+
+    [Fact]
+    public void PublicAutoDefaultsToOneMiBAndKeepAllAcceptsInertOverrides()
+    {
+        DurableAgentsOptions? captured = null;
+        new ServiceCollection().ConfigureDurableAgents(options =>
+        {
+            options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
+            options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+            captured = options;
+        });
+        Assert.Equal(1_048_576, captured!.MaxStateBytes);
+        new ServiceCollection().ConfigureDurableAgents(options =>
+        {
+            options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
+            options.MaxStateBytes = 1;
+            options.HistoryRetentionHighWatermark = 0.2;
+            options.HistoryRetentionLowWatermark = 0.9;
+        });
     }
 
     [Theory]

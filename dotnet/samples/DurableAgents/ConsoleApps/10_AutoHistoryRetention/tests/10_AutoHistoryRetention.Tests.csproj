@@ -23,11 +23,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Include="..\..\..\..\..\eng\verify-samples\DurableAgentSamples.cs" Link="Verifier\DurableAgentSamples.cs" />
-    <Compile Include="..\..\..\..\..\eng\verify-samples\SampleDefinition.cs" Link="Verifier\SampleDefinition.cs" />
-  </ItemGroup>
-
-  <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>
 </Project>

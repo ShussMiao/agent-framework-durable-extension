@@ -17,8 +17,10 @@ if (!string.Equals(
     StringComparison.Ordinal))
 {
     Console.Error.WriteLine(
-        "Set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2 only after creating a fresh, isolated task hub with " +
-        "mailbox-aware workers, pollers and tools. This acknowledgement is not a compatibility check.");
+        "Sample 10 uses environment configuration. Set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2 before startup, " +
+        "after creating a fresh, isolated task hub with schema-v2-compatible workers, clients and readers. " +
+        "Applications can instead set DurableAgentsOptions.DeploymentMode to DurableAgentDeploymentMode.SchemaV2. " +
+        "This acknowledgement is not a compatibility check.");
     return 2;
 }
 
@@ -33,7 +35,7 @@ string endpoint = new Uri(projectEndpoint).GetLeftPart(UriPartial.Authority);
 
 Console.WriteLine("Legacy and KeepAll are the defaults. This sample separately acknowledges SchemaV2 and opts into Auto.");
 Console.WriteLine("This is durable transcript pressure retention, not model-context compaction or FollowCompaction.");
-Console.WriteLine("External history stores are never pruned; mailbox, receipts, binding and session remain protected.");
+Console.WriteLine("External history stores are never pruned; results, completion receipts and session state remain protected.");
 Console.WriteLine("The 32 KiB demo budget is not universal: oversized protected state fails atomically.");
 Console.WriteLine("OpenTelemetry metrics describe attempts, not confirmed durable commits.");
 Console.Write("Project topic (up to 80 characters): ");

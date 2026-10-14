@@ -41,7 +41,8 @@ For a comprehensive tour of all the functionality, concepts, and APIs, check out
 
 `DurableAgentsOptions.DeploymentMode` independently selects the state writer: Legacy/schema 1.2 is the
 default; SchemaV2 acknowledges a compatible isolated deployment for new schema-2 sessions.
-The exact environment value `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` can supply that acknowledgement.
+Set `options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;` in code, or set
+`DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` before startup. Both paths supply the same acknowledgement.
 Both KeepAll and Auto work with SchemaV2. Auto uses a 1 MiB budget by default, permits a positive
 `MaxStateBytes` override, and validates watermarks; it never activates a writer or migrates 1.x state.
 Budget/watermark settings are inert under KeepAll.
@@ -133,7 +134,7 @@ to the shared 60-second delivery window and accepts another positive duration or
 expiry. Result-payload retention and whole-entity TTL are separate policies. Deleting the entity also deletes its
 idempotency evidence. SchemaV2 is the explicit schema-2 deployment acknowledgement for new entity generations,
 independently of KeepAll or Auto.
-Every participating reader/worker must be mailbox-aware or reject and be isolated from the new major version.
+Every participating worker, client and reader must support schema v2 or reject it and remain isolated from it.
 Applications must enforce this routing; options cannot certify a distributed fleet.
 Receipt-deleting entity TTL and independently attested legacy conversion remain internal test capabilities,
 disabled by default. There is no public migration callback or receipt-deletion switch.
@@ -184,8 +185,8 @@ can be retried with the same input, or recovered without input once its persiste
 A later successful **new** run also performs this recovery. A host
 requiring a cleanup-time bound for otherwise idle imported entities must enqueue that operation as part
 of import/recovery and monitor failed operations. Read-only polling and terminal duplicate calls do not
-provide durable cleanup. Cleanup never migrates legacy state and rejects mailbox writes while the gate
-is off.
+provide durable cleanup. Cleanup never migrates legacy state and rejects schema-v2 writes without deployment
+acknowledgement.
 
 Malformed/unsupported scheduling profiles fail closed before a new model invocation or cleanup.
 Other extensions and unknown fields in a supported profile are preserved. This is a .NET-local profile,
@@ -193,15 +194,12 @@ not a shared-schema requirement: foreign runtimes preserve it opaquely but need 
 .NET writers honor its scheduling contract; preserving unknown JSON alone does not make another scheduler
 safe to deploy alongside this writer.
 
-**Merge and release gate:** this feature must not merge or release until the actual real-backend atomicity
-test passes in an explicitly isolated environment. A clearly documented gated skip is acceptable only
-for draft readiness, not for merge or release. SchemaV2 explicitly enables schema-2 writing for
-new sessions; neither Auto nor `ResultRetentionPeriod` activates it. Deployment requires coordinated reader/writer/rollback compatibility,
-late-duplicate/deletion policy agreement, and an executed real-backend atomicity test in an explicitly
-isolated environment. The [gated integration test](../../tests/Microsoft.Agents.AI.DurableTask.IntegrationTests/README.md)
-checks state plus outgoing delayed signals, worker restart, duplicate delivery and a failure after
-state/outbox staging. A skipped test or passing mock tests **does not verify backend atomicity** and
-does not satisfy either the merge gate or the release gate.
+SchemaV2 enables schema-2 writing for new sessions; neither Auto nor `ResultRetentionPeriod` activates it.
+Before deployment, verify compatible workers, clients, readers and rollback tools, and validate the
+late-duplicate/deletion policy. The [integration test](../../tests/Microsoft.Agents.AI.DurableTask.IntegrationTests/README.md)
+must pass against an actual isolated backend: it checks state and outgoing delayed signals, worker restart,
+duplicate delivery and rollback after state/outbox staging. Passing mock tests or skipping that test does
+not verify backend atomicity.
 
 `response.GetDurableResult()` returns the canonical retained terminal-response JSON for a durable
 delivery, including optional `value` and unknown metadata that the native `AgentResponse` cannot

@@ -9,6 +9,12 @@
 The entry point uses the supported public options, a bounded model response, an illustrative marker
 diagnostic and OpenTelemetry metrics. KeepAll remains the default outside this opt-in:
 
+**Sample 10 uses environment configuration:** its entry point requires
+`DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` before reading service settings.
+Applications can instead assign `options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;`
+in code. These are equivalent activation paths in the SDK; the environment requirement belongs to this
+sample, not to all applications. A present invalid environment value is rejected even with a valid code option.
+
 ```csharp
 services.ConfigureDurableAgents(options =>
 {
@@ -134,10 +140,10 @@ No wall-clock expiry wait is required. The default provider owns the entity tran
 conversation is imported. `DefaultAzureCredential` is used for development; prefer a specific credential
 for production.
 
-Without the isolation acknowledgement, the entry point exits with code 2 before accessing model
+Without its environment acknowledgement, this sample's entry point exits with code 2 before accessing model
 configuration or services. Missing/default task-hub configuration fails explicitly with no fallback.
-For an external NuGet consumer, replace the local product ProjectReference with a PackageReference to
-the actual feature-introducing evaluation package/build; AF dependency versions alone do not supply Auto.
+For a NuGet consumer, use a package version that includes these durable-agent APIs;
+Agent Framework dependency versions alone do not supply them.
 Backend/model execution requires your configured services; offline tests do not certify the hosted backend.
 
 ## Tests
@@ -146,17 +152,13 @@ Backend/model execution requires your configured services; offline tests do not 
 dotnet test --project tests\10_AutoHistoryRetention.Tests.csproj -c Release -f net10.0
 ```
 
-The sample-local tests have no friend access and use only public APIs. They compile/configure Auto
-without internal switches, reject invalid options before factory/transport callbacks, validate explicit
-non-default hub selection, and cover bounded agent options, prompt construction,
+The sample tests cover its environment-only entry guard, retention configuration, explicit non-default hub selection,
+bounded agent options, prompt construction,
 the no-wait marker diagnostic, conservative result classification, invalid-marker rejection before
 agent/model calls or output/session mutation, and real OpenTelemetry meter registration/export.
-The offline verifier-manifest regression compiles the actual verifier definitions and checks the
-four documented environment keys, including `DURABLE_AGENTS_DEPLOYMENT_MODE`, without the obsolete
-acknowledgement. It does not run the verifier, sample host, backend or model.
 
-The white-box retention regression lives in the real package unit-test project, which legitimately
-has friend access:
+The product unit tests cover public deployment and retention settings, early validation,
+and state/retention behavior through the SDK dispatcher:
 
 ```powershell
 dotnet test --project ..\..\..\..\tests\Microsoft.Agents.AI.DurableTask.UnitTests\Microsoft.Agents.AI.DurableTask.UnitTests.csproj `
@@ -164,8 +166,7 @@ dotnet test --project ..\..\..\..\tests\Microsoft.Agents.AI.DurableTask.UnitTest
     --filter-class "*AgentEntityPublicRetentionTests"
 ```
 
-Those regressions exercise public Auto without internal writer/migration authorization through the SDK
-transactional dispatcher, including cold reload, mailbox/receipt preservation, duplicates, expiry,
+Those tests cover cold reload, result/receipt preservation, duplicates, expiry,
 legacy rejection, provider/service boundaries, protected capacity and commit/outbox rollback. Existing
 history tests additionally cover connected tool/system grouping and attempt-level telemetry.
 Validate actual isolated-backend atomicity before deploying to production.
