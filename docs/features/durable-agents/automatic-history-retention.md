@@ -1,13 +1,13 @@
 # Automatic durable-history retention in .NET
 
-Deployment acknowledgement and retention are independent. `Legacy` and `KeepAll` remain the .NET defaults: new state is schema 1.2 and no transcript is proactively removed. An acknowledged `IsolatedV2` deployment writes canonical 2.0 with either KeepAll or Auto.
+Deployment acknowledgement and retention are independent. `Legacy` and `KeepAll` remain the .NET defaults: new state is schema 1.2 and no transcript is proactively removed. An acknowledged `SchemaV2` deployment writes canonical 2.0 with either KeepAll or Auto.
 
 Before activation, follow the shared [C# and Python schema-v2 migration guide](schema-v2-migration.md). It is the single operator guide for reader/fleet preparation, exact code/environment resolution, legacy preservation, routing, validation and rollback.
 
 ```csharp
 services.ConfigureDurableAgents(options =>
 {
-    options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
     options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
     // Optional override; omitted or null uses 1,048,576 bytes (1 MiB).
     options.MaxStateBytes = 32 * 1024;

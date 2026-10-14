@@ -40,9 +40,9 @@ For a comprehensive tour of all the functionality, concepts, and APIs, check out
 ## Durable completion and delivery
 
 `DurableAgentsOptions.DeploymentMode` independently selects the state writer: Legacy/schema 1.2 is the
-default; IsolatedV2 acknowledges a compatible isolated deployment for new schema-2 sessions.
+default; SchemaV2 acknowledges a compatible isolated deployment for new schema-2 sessions.
 The exact environment value `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` can supply that acknowledgement.
-Both KeepAll and Auto work with IsolatedV2. Auto uses a 1 MiB budget by default, permits a positive
+Both KeepAll and Auto work with SchemaV2. Auto uses a 1 MiB budget by default, permits a positive
 `MaxStateBytes` override, and validates watermarks; it never activates a writer or migrates 1.x state.
 Budget/watermark settings are inert under KeepAll.
 See the shared [C# and Python migration guide](../../../docs/features/durable-agents/schema-v2-migration.md),
@@ -131,7 +131,7 @@ before this layer can implement that retry safely.
 Completion receipts last until entity deletion. `DurableAgentsOptions.ResultRetentionPeriod` defaults
 to the shared 60-second delivery window and accepts another positive duration or `null` for no payload
 expiry. Result-payload retention and whole-entity TTL are separate policies. Deleting the entity also deletes its
-idempotency evidence. IsolatedV2 is the explicit schema-2 deployment acknowledgement for new entity generations,
+idempotency evidence. SchemaV2 is the explicit schema-2 deployment acknowledgement for new entity generations,
 independently of KeepAll or Auto.
 Every participating reader/worker must be mailbox-aware or reject and be isolated from the new major version.
 Applications must enforce this routing; options cannot certify a distributed fleet.
@@ -139,7 +139,7 @@ Receipt-deleting entity TTL and independently attested legacy conversion remain 
 disabled by default. There is no public migration callback or receipt-deletion switch.
 Existing legacy sessions are rejected by either isolated retention policy before execution; retain them on their original deployment
 and start a new isolated namespace/session rather than infer complete evidence from a retained or empty transcript.
-Changing Auto to KeepAll retains schema-2 writer authorization when IsolatedV2 remains acknowledged.
+Changing Auto to KeepAll retains schema-2 writer authorization when SchemaV2 remains acknowledged.
 Returning to Legacy leaves revised state readable for committed duplicates but rejects new schema-2 work
 and mutating result cleanup. Raising Auto's budget can reduce eviction only within verified backend limits.
 Legacy TTL behavior is preserved, but old deadlines cannot delete schema-2 receipts without a separately agreed
@@ -195,7 +195,7 @@ safe to deploy alongside this writer.
 
 **Merge and release gate:** this feature must not merge or release until the actual real-backend atomicity
 test passes in an explicitly isolated environment. A clearly documented gated skip is acceptable only
-for draft readiness, not for merge or release. IsolatedV2 explicitly enables schema-2 writing for
+for draft readiness, not for merge or release. SchemaV2 explicitly enables schema-2 writing for
 new sessions; neither Auto nor `ResultRetentionPeriod` activates it. Deployment requires coordinated reader/writer/rollback compatibility,
 late-duplicate/deletion policy agreement, and an executed real-backend atomicity test in an explicitly
 isolated environment. The [gated integration test](../../tests/Microsoft.Agents.AI.DurableTask.IntegrationTests/README.md)
@@ -264,7 +264,7 @@ kind, and a stable non-secret provider key.
 Later C# turns must restore the same continuation and resolve the same identity; mismatches fail instead
 of silently resetting, migrating, or starting another logical conversation.
 
-Schema 2 production writes remain default-off; resolved IsolatedV2 explicitly enables them for new sessions,
+Schema 2 production writes remain default-off; resolved SchemaV2 explicitly enables them for new sessions,
 with either KeepAll or Auto.
 Under the public defaults, schema 1 operations preserve the existing Agent Framework behavior:
 custom history providers, explicit in-memory providers, and model-service conversation IDs can execute,
@@ -362,7 +362,7 @@ the budget, in which case retention fails atomically without committing the work
 > In long client-side tool or approval flows, transitive
 > correlation and tool links can connect most or all of the transcript to the protected newest component.
 > If the protected floor reaches the configured budget, later writes fail atomically without corrupting the
-> session. Retain IsolatedV2 and select KeepAll to stop proactive pruning, or raise Auto's
+> session. Retain SchemaV2 and select KeepAll to stop proactive pruning, or raise Auto's
 > budget only within verified backend limits. Neither choice removes backend limits or receipt growth.
 > The public default is unaffected. Linked-flow support remains tracked under
 > [#4](https://github.com/microsoft/agent-framework-durable-extension/issues/4); the release deferral is recorded
@@ -370,7 +370,7 @@ the budget, in which case retention fails atomically without committing the work
 
 Schema 2 mailbox results remain authoritative after their transcript copies are removed, so duplicate execution
 and polling return the same retained result. History ownership alone cannot certify complete legacy
-completion evidence; either public IsolatedV2 retention policy rejects existing 1.x sessions without conversion. Retention itself fails closed if legacy transcript terminals are still the
+completion evidence; either public SchemaV2 retention policy rejects existing 1.x sessions without conversion. Retention itself fails closed if legacy transcript terminals are still the
 only completion evidence.
 
 If all eligible transcript is removed and the protected floor still reaches the high watermark,

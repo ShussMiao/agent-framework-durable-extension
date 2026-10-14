@@ -147,7 +147,7 @@ internal static class DurableAgentSamples
             Inputs = ["automatic retention sample"],
             ExpectedOutputDescription =
             [
-                "The output should explain that Legacy and KeepAll are the defaults and this sample separately acknowledges IsolatedV2 and opts into public Auto transcript pressure retention for a new isolated session.",
+                "The output should explain that Legacy and KeepAll are the defaults and this sample separately acknowledges SchemaV2 and opts into public Auto transcript pressure retention for a new isolated session.",
                 "The output should print the original random marker, the diagnostic question, the model response, and an honest observation.",
                 "The output should explain that old model transcript can be removed while durable mailbox, completion, binding, session, and bookkeeping evidence stays protected.",
                 "The output should explain that OpenTelemetry metrics are attempt-level operational evidence rather than durable committed truth.",

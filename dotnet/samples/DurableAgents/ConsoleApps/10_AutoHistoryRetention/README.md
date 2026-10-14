@@ -1,7 +1,7 @@
 # Opt-in Pressure Retention Sample
 
 > [!IMPORTANT]
-> This sample separately acknowledges IsolatedV2 and enables public Auto retention for a new session.
+> This sample separately acknowledges SchemaV2 and enables public Auto retention for a new session.
 > Use versions documented as schema-v2-compatible in a fresh isolated hub with compatible workers,
 > clients and readers. Existing 1.x sessions are rejected, not migrated. Follow the shared
 > [C# and Python migration guide](../../../../../docs/features/durable-agents/schema-v2-migration.md).
@@ -12,7 +12,7 @@ diagnostic and OpenTelemetry metrics. KeepAll remains the default outside this o
 ```csharp
 services.ConfigureDurableAgents(options =>
 {
-    options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
     options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
     options.MaxStateBytes = 32 * 1024; // Demo override; Auto otherwise defaults to 1 MiB.
     options.HistoryRetentionHighWatermark = 0.85;
@@ -64,10 +64,10 @@ This is durable entity **pressure retention**, not Microsoft Agent Framework sta
 compaction or `FollowCompaction`. It does not summarize old messages. It removes old transcript
 from later model input while durable execution and delivery evidence remains available.
 
-Public Legacy and KeepAll remain the defaults. IsolatedV2 also supports KeepAll without proactive
+Public Legacy and KeepAll remain the defaults. SchemaV2 also supports KeepAll without proactive
 transcript deletion. Auto requires isolated deployment acknowledgement and defaults to exactly 1 MiB;
 this demonstration overrides it to 32 KiB. Explicit null uses the default; optional watermarks satisfy
-`0 < low < high <= 1`. To stop proactive pruning, retain IsolatedV2 and choose KeepAll: existing budget
+`0 < low < high <= 1`. To stop proactive pruning, retain SchemaV2 and choose KeepAll: existing budget
 and watermark settings become inert without needing to clear them. Returning to Legacy does not downgrade schema-2 state or
 authorize new work. No public in-place migration or receipt-deleting TTL is enabled.
 

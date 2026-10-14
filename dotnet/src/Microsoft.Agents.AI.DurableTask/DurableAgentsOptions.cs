@@ -38,7 +38,7 @@ public sealed class DurableAgentsOptions
     /// an isolated schema 2 deployment. Explicit Legacy conflicts with that environment value; all other
     /// present values are rejected, including empty, case-varied and whitespace-bearing values.
     /// The environment is captured once at completed configuration validation, not by this getter or setter.
-    /// After validation the getter reports the resolved mode. IsolatedV2 is an acknowledgement, not proof
+    /// After validation the getter reports the resolved mode. SchemaV2 is an acknowledgement, not proof
     /// of isolation, and supports both KeepAll and Auto without migrating existing legacy sessions.
     /// </remarks>
     public DurableAgentDeploymentMode DeploymentMode
@@ -83,7 +83,7 @@ public sealed class DurableAgentsOptions
     /// </remarks>
     internal bool EnablePersistentRequestOutcomes
     {
-        get => field || this.DeploymentMode == DurableAgentDeploymentMode.IsolatedV2;
+        get => field || this.DeploymentMode == DurableAgentDeploymentMode.SchemaV2;
         set;
     }
 
@@ -119,7 +119,7 @@ public sealed class DurableAgentsOptions
     /// When persistent request outcomes are enabled, committed runs schedule entity-local payload cleanup.
     /// Physical removal may lag expiry; polling reports unavailable without modifying state.
     /// Imported states without a scheduled check need an explicit cleanup operation or a successful new run.
-    /// This setting does not activate mailbox persistence by itself. IsolatedV2 deployment acknowledgement
+    /// This setting does not activate mailbox persistence by itself. SchemaV2 deployment acknowledgement
     /// activates schema 2 for new entity generations; existing legacy sessions are not migrated.
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">The retention period is not positive.</exception>
@@ -170,7 +170,7 @@ public sealed class DurableAgentsOptions
     /// <see cref="DurableAgentHistoryRetentionMode.KeepAll"/>.
     /// </summary>
     /// <remarks>
-    /// Auto requires <see cref="DurableAgentDeploymentMode.IsolatedV2"/> and uses a 1 MiB budget by default.
+    /// Auto requires <see cref="DurableAgentDeploymentMode.SchemaV2"/> and uses a 1 MiB budget by default.
     /// Deployment acknowledgement and retention are independent: isolated KeepAll also writes schema 2.
     /// Changing retention does not change the state schema or downgrade existing state.
     /// Receipt-bearing entities are not automatically deleted by the legacy idle TTL.
@@ -251,11 +251,11 @@ public sealed class DurableAgentsOptions
         this._resolvedDeploymentMode = DurableAgentDeploymentConfiguration.Resolve(
             this._configuredDeploymentMode, this._deploymentEnvironmentValue);
         if (this.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto &&
-            this._resolvedDeploymentMode != DurableAgentDeploymentMode.IsolatedV2)
+            this._resolvedDeploymentMode != DurableAgentDeploymentMode.SchemaV2)
         {
             throw new InvalidOperationException(
-                "Automatic durable history retention requires IsolatedV2 deployment acknowledgement. " +
-                "Set DeploymentMode to IsolatedV2 or DURABLE_AGENTS_DEPLOYMENT_MODE exactly to 'isolated_v2'.");
+                "Automatic durable history retention requires SchemaV2 deployment acknowledgement. " +
+                "Set DeploymentMode to SchemaV2 or DURABLE_AGENTS_DEPLOYMENT_MODE exactly to 'isolated_v2'.");
         }
 
         if (this.HistoryRetentionMode == DurableAgentHistoryRetentionMode.KeepAll)

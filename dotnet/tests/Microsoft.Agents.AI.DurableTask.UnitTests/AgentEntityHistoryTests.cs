@@ -2659,7 +2659,7 @@ public sealed class AgentEntityHistoryTests
             new RunRequest(new string('n', 500)) { CorrelationId = "new" },
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 9_000;
             });
@@ -2730,7 +2730,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 9_000;
             });
@@ -2863,7 +2863,7 @@ public sealed class AgentEntityHistoryTests
 
             static void ConfigureDraftSampleRetention(DurableAgentsOptions options)
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = HistoryRetentionDemo.MaxStateBytes;
                 options.HistoryRetentionHighWatermark = HistoryRetentionDemo.HighWatermark;
@@ -2974,7 +2974,7 @@ public sealed class AgentEntityHistoryTests
             new RunRequest("first new request") { CorrelationId = "first-new" },
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 7_000;
             });
@@ -3032,7 +3032,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 500;
                 options.AuthorizeLegacyMigration = null;
@@ -3065,7 +3065,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 500;
             });
@@ -3090,7 +3090,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 10_000;
                 options.AuthorizeLegacyMigration = null;
@@ -3115,7 +3115,7 @@ public sealed class AgentEntityHistoryTests
         DurableAgentsOptions options = new()
         {
             EnablePersistentRequestOutcomes = false,
-            DeploymentMode = DurableAgentDeploymentMode.IsolatedV2,
+            DeploymentMode = DurableAgentDeploymentMode.SchemaV2,
             HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto,
             MaxStateBytes = 32 * 1024,
         };
@@ -3149,7 +3149,7 @@ public sealed class AgentEntityHistoryTests
             initialState,
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 500;
             });

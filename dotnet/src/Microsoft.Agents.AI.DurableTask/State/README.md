@@ -77,14 +77,14 @@ other revised semantic checks consistently on read and write.
 
 > [!IMPORTANT]
 > Schema `2.0.0` is being adopted through a staged cross-runtime rollout. Production .NET readers and writers currently default to
-> schema `1.2.0`. Supported schema 2 is readable. IsolatedV2 explicitly authorizes new schema-2 sessions with
+> schema `1.2.0`. Supported schema 2 is readable. SchemaV2 explicitly authorizes new schema-2 sessions with
 > either KeepAll or Auto; it does not convert existing 1.x entities.
 
 The mailbox contract and optional opaque history profile use schema `2.0.0`. This is intentionally a fail-closed major
 version: a 1.x worker preserves unknown fields but does not understand completion receipts, so allowing it to
 process revised state could rerun work whose transcript result was already removed. The .NET reader now
 supports mailbox-aware 2.0 lookup, while new state continues to default to `1.2.0`.
-Producer activation requires resolved `DurableAgentDeploymentMode.IsolatedV2`, independently of retention.
+Producer activation requires resolved `DurableAgentDeploymentMode.SchemaV2`, independently of retention.
 Use the shared [C# and Python migration guide](../../../../docs/features/durable-agents/schema-v2-migration.md).
 Compatible routing is an operator requirement, not a capability detected by options. Existing 2.0 state
 is preserved rather than downgraded, and committed duplicates remain readable with writes disabled.
@@ -168,7 +168,7 @@ is permitted. Legacy conversion uses only retained authoritative
 terminal evidence, never calls the model/tools, and cannot invent receipts for already-evicted results.
 Previously persisted legacy state stays legacy unless independently authorized as complete history;
 retained transcript alone does not establish that authorization. Known truncation/compaction prevents
-conversion. Public IsolatedV2 initializes 2.0 only for SDK-proven missing-state Run generations.
+conversion. Public SchemaV2 initializes 2.0 only for SDK-proven missing-state Run generations.
 Whole-entity deletion of 2.0 state has a separate internal gate, disabled by default. Stored legacy
 deadlines cannot erase receipts, and there is no implicit schema-2 entity TTL.
 

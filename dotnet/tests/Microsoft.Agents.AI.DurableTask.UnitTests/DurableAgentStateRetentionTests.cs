@@ -55,7 +55,7 @@ public sealed class DurableAgentStateRetentionTests
     {
         DurableAgentsOptions options = new()
         {
-            DeploymentMode = DurableAgentDeploymentMode.IsolatedV2,
+            DeploymentMode = DurableAgentDeploymentMode.SchemaV2,
             HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto,
         };
 
@@ -97,7 +97,7 @@ public sealed class DurableAgentStateRetentionTests
     {
         DurableAgentsOptions options = new()
         {
-            DeploymentMode = DurableAgentDeploymentMode.IsolatedV2,
+            DeploymentMode = DurableAgentDeploymentMode.SchemaV2,
             MaxStateBytes = budget,
             HistoryRetentionHighWatermark = high,
             HistoryRetentionLowWatermark = low,
@@ -134,7 +134,7 @@ public sealed class DurableAgentStateRetentionTests
     {
         DurableAgentsOptions options = new()
         {
-            DeploymentMode = DurableAgentDeploymentMode.IsolatedV2,
+            DeploymentMode = DurableAgentDeploymentMode.SchemaV2,
             HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto,
             MaxStateBytes = 10_000,
             HistoryRetentionHighWatermark = 0.9,

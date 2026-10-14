@@ -19,5 +19,5 @@ public enum DurableAgentDeploymentMode
     /// Authorizes schema 2 for genuinely new sessions with either retention policy. This is an operator
     /// acknowledgement, not verification of routing or isolation, and never authorizes legacy migration.
     /// </remarks>
-    IsolatedV2 = 1,
+    SchemaV2 = 1,
 }

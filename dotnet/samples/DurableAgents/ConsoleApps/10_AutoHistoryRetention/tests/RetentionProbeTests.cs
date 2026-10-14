@@ -16,6 +16,18 @@ namespace AutoHistoryRetentionTests;
 public sealed class RetentionProbeTests
 {
     [Fact]
+    public void PublicDeploymentEnumHasOnlySchemaNamesAndUnchangedNumericValues()
+    {
+        Assert.Equal(["Legacy", "SchemaV2"], Enum.GetNames<DurableAgentDeploymentMode>());
+        Assert.Equal(
+            [DurableAgentDeploymentMode.Legacy, DurableAgentDeploymentMode.SchemaV2],
+            Enum.GetValues<DurableAgentDeploymentMode>());
+        Assert.Equal(0, (int)DurableAgentDeploymentMode.Legacy);
+        Assert.Equal(1, (int)DurableAgentDeploymentMode.SchemaV2);
+        Assert.Equal("1", JsonSerializer.Serialize(DurableAgentDeploymentMode.SchemaV2));
+    }
+
+    [Fact]
     public void ExternalConsumerConfiguresPublicAutoWithoutTestHooks()
     {
         DurableAgentsOptions? configured = null;
@@ -27,7 +39,7 @@ public sealed class RetentionProbeTests
         });
 
         Assert.NotNull(configured);
-        Assert.Equal(DurableAgentDeploymentMode.IsolatedV2, configured.DeploymentMode);
+        Assert.Equal(DurableAgentDeploymentMode.SchemaV2, configured.DeploymentMode);
         Assert.Equal(DurableAgentHistoryRetentionMode.Auto, configured.HistoryRetentionMode);
         Assert.Equal(HistoryRetentionDemo.MaxStateBytes, configured.MaxStateBytes);
         Assert.Equal(HistoryRetentionDemo.HighWatermark, configured.HistoryRetentionHighWatermark);
@@ -40,14 +52,14 @@ public sealed class RetentionProbeTests
         DurableAgentsOptions? captured = null;
         new ServiceCollection().ConfigureDurableAgents(options =>
         {
-            options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+            options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
             options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
             captured = options;
         });
         Assert.Equal(1_048_576, captured!.MaxStateBytes);
         new ServiceCollection().ConfigureDurableAgents(options =>
         {
-            options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+            options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
             options.MaxStateBytes = 1;
             options.HistoryRetentionHighWatermark = 0.2;
             options.HistoryRetentionLowWatermark = 0.9;
@@ -67,7 +79,7 @@ public sealed class RetentionProbeTests
             {
                 if (kind != "unacknowledged")
                 {
-                    options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 }
                 options.AddAIAgentFactory("agent", _ =>
                 {

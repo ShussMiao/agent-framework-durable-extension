@@ -42,7 +42,7 @@ internal partial class AgentEntity
             return false;
         }
 
-        if (this._deploymentMode != DurableAgentDeploymentMode.IsolatedV2 &&
+        if (this._deploymentMode != DurableAgentDeploymentMode.SchemaV2 &&
             !resultCleanup && persistedState.Data.ExpirationTimeUtc.HasValue)
         {
             return false;
@@ -173,7 +173,7 @@ internal partial class AgentEntity
             if (!this._persistentRequestOutcomesEnabled)
             {
                 throw new InvalidOperationException(
-                    "Schema 2 result expiration requires IsolatedV2 deployment acknowledgement.");
+                    "Schema 2 result expiration requires SchemaV2 deployment acknowledgement.");
             }
 
             // Unlike a new run, cleanup must not assign history identities or promote legacy state.
@@ -234,15 +234,15 @@ internal partial class AgentEntity
                 logger.LogTTLExpirationTimeCleared(sessionId);
                 bool migrateLegacy =
                     this._persistentRequestOutcomesEnabled &&
-                    this._deploymentMode == DurableAgentDeploymentMode.IsolatedV2 &&
+                    this._deploymentMode == DurableAgentDeploymentMode.SchemaV2 &&
                     this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
                     this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
-                if (this._deploymentMode == DurableAgentDeploymentMode.IsolatedV2 &&
+                if (this._deploymentMode == DurableAgentDeploymentMode.SchemaV2 &&
                     this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
                     !migrateLegacy)
                 {
                     throw new DurableAgentStateCorruptionException(
-                        "IsolatedV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
+                        "SchemaV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
                         "entries must be converted from independently authoritative complete history before TTL mutation.");
                 }
 

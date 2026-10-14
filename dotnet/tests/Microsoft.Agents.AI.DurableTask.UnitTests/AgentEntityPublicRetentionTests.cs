@@ -13,7 +13,7 @@ public sealed partial class AgentEntityPublicRetentionTests
 {
     private static void ConfigureIsolated(DurableAgentsOptions options, bool auto)
     {
-        options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+        options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
         if (auto)
         {
             HistoryRetentionDemo.ConfigureRetention(options);
@@ -265,7 +265,7 @@ public sealed partial class AgentEntityPublicRetentionTests
         EntityBatchResult run = await DispatchAsync(new ChatClientAgent(client, name: "agent"), null, "new",
             mailbox: false, configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 if (explicitNull)
                 {
@@ -822,7 +822,7 @@ public sealed partial class AgentEntityPublicRetentionTests
             mailbox: false, requestText: new string('x', 2_000),
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 500;
             });
@@ -921,7 +921,7 @@ public sealed partial class AgentEntityPublicRetentionTests
             CreateAgent(client, provider), original, "new", mailbox: false,
             configureOptions: options =>
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
                 options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
                 options.MaxStateBytes = 2_000;
             });

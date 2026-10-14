@@ -89,7 +89,7 @@ public static class HistoryRetentionDemo
     public static void ConfigureRetention(DurableAgentsOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+        options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
         options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
         options.MaxStateBytes = MaxStateBytes;
         options.HistoryRetentionHighWatermark = HighWatermark;

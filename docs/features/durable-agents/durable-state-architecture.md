@@ -4,7 +4,7 @@ Each durable agent session is represented by one Durable Entity. The entity coor
 
 Schema 2 separates request completion from conversation history. A completed request remains completed when its transcript is removed or its result expires, and a resumed session uses exactly one source of conversation history.
 
-Schema `2.0.0` is an explicit .NET deployment acknowledgement through IsolatedV2, supplied by code
+Schema `2.0.0` is an explicit .NET deployment acknowledgement through SchemaV2, supplied by code
 or the exact shared environment value. KeepAll and Auto independently select retention within that deployment.
 Readers accept supported 1.x and 2.0; default Legacy writes remain 1.2. Existing entities are not automatically
 migrated. Follow the shared [C# and Python migration guide](schema-v2-migration.md); compatible wire state is not
@@ -136,7 +136,7 @@ The application or external provider remains responsible for availability, autho
 ## History configuration
 
 Closed public replay choices are represented by `DurableAgentHistoryReplayMode`, with `PreloadEntityHistory` and `CurrentRequestOnly`.
-Resolved `DurableAgentDeploymentMode.IsolatedV2` enables schema-2 writes for SDK-proven absent generations.
+Resolved `DurableAgentDeploymentMode.SchemaV2` enables schema-2 writes for SDK-proven absent generations.
 KeepAll and Auto independently select retention; Auto defaults to a 1 MiB envelope budget with positive overrides. Loaded legacy
 state is not publicly migrated. History ownership remains a closed internal enum after resolution.
 

@@ -48,12 +48,15 @@ This is an **operator acknowledgement**, not a test of peer workers, routing, cl
 
 `DeploymentMode` is `Legacy` unless code or the exact environment value acknowledges v2.
 
+The C# member `SchemaV2` names the selected state schema. The environment value remains `isolated_v2`:
+it acknowledges the operator's responsibility to isolate compatible workers, clients and readers.
+
 | Code | Environment | Resolved deployment |
 | --- | --- | --- |
 | Unspecified | Unset | Legacy |
-| Unspecified | `isolated_v2` | IsolatedV2 |
+| Unspecified | `isolated_v2` | SchemaV2 |
 | Explicit Legacy | Unset | Legacy |
-| Explicit IsolatedV2 | Unset or `isolated_v2` | IsolatedV2 |
+| Explicit SchemaV2 | Unset or `isolated_v2` | SchemaV2 |
 | Explicit Legacy | `isolated_v2` | Reject conflicting configuration |
 | Any | Present empty, another value, different case or surrounding whitespace | Reject configuration |
 
@@ -83,20 +86,20 @@ services.ConfigureDurableAgents(options =>
 // A separate fresh deployment: schema 2, without proactive transcript pruning.
 services.ConfigureDurableAgents(options =>
 {
-    options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
     options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.KeepAll;
     options.AddAIAgent(agent);
 });
 ```
 
-These are alternatives for separately configured deployments, not successive calls switching a live host. You may omit the IsolatedV2 code assignment when the agreeing environment setting supplies it.
+These are alternatives for separately configured deployments, not successive calls switching a live host. You may omit the SchemaV2 code assignment when the agreeing environment setting supplies it.
 
 ### C#: isolated automatic pressure retention
 
 ```csharp
 services.ConfigureDurableAgents(options =>
 {
-    options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+    options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
     options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
     // Default is 1 MiB; optionally override for a measured deployment:
     // options.MaxStateBytes = 32 * 1024;
@@ -106,7 +109,7 @@ services.ConfigureDurableAgents(options =>
 });
 ```
 
-Auto without IsolatedV2 is invalid. Its default budget is exactly 1,048,576 bytes (1 MiB); a positive
+Auto without SchemaV2 is invalid. Its default budget is exactly 1,048,576 bytes (1 MiB); a positive
 `MaxStateBytes` overrides it. Explicit null also uses that default and never disables Auto. Watermarks
 default to high .85 / low .70, with `0 < low < high <= 1` under Auto.
 
@@ -235,7 +238,7 @@ Stop or keep admission fenced. Correct the code/environment conflict or invalid 
 
 1. Stop new admission; drain or preserve in-flight work. Export canonical state and required provider continuation/data.
 2. Roll back only to versions documented compatible with the actual mailbox, ownership, expiry and workflow contracts. Do not send v2 sessions to a transcript-only writer.
-3. In C#, retain IsolatedV2 and select KeepAll to stop proactive pruning while continuing canonical writes. Returning to Legacy permits read-only committed v2 duplicates/polling but rejects new v2 work and mutating result cleanup; it does not downgrade state.
+3. In C#, retain SchemaV2 and select KeepAll to stop proactive pruning while continuing canonical writes. Returning to Legacy permits read-only committed v2 duplicates/polling but rejects new v2 work and mutating result cleanup; it does not downgrade state.
 4. To restore a legacy-only application, use its preserved original sessions/deployment or a suitable pre-activation backup in a separately isolated namespace. Never rewrite a v2 header or drop receipts.
 5. Already-pruned context cannot be recovered from expired results. Replaying work may repeat external effects. Application-level recovery must account for those effects; no lossless in-place downgrade is promised.
 

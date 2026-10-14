@@ -7,7 +7,7 @@ namespace Microsoft.Agents.AI.DurableTask;
 /// </summary>
 /// <remarks>
 /// These settings participate in the fixed-owner schema 2 profile when
-/// <see cref="DurableAgentsOptions.DeploymentMode"/> is <see cref="DurableAgentDeploymentMode.IsolatedV2"/>,
+/// <see cref="DurableAgentsOptions.DeploymentMode"/> is <see cref="DurableAgentDeploymentMode.SchemaV2"/>,
 /// independently of whether history retention is KeepAll or Auto.
 /// Default Legacy schema 1 operations preserve the pre-profile Agent Framework behavior.
 /// </remarks>

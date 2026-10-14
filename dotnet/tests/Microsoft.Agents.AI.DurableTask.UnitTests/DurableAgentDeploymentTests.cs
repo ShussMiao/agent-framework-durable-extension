@@ -90,7 +90,7 @@ public sealed class DurableAgentDeploymentTests
                 {
                     options.DeploymentMode = (DurableAgentDeploymentMode)code;
                 }
-                Assert.Equal(test.Code == 1 ? DurableAgentDeploymentMode.IsolatedV2 : DurableAgentDeploymentMode.Legacy,
+                Assert.Equal(test.Code == 1 ? DurableAgentDeploymentMode.SchemaV2 : DurableAgentDeploymentMode.Legacy,
                     options.DeploymentMode);
                 options.AddAIAgentFactory("probe", _ => throw new InvalidOperationException("Factory must not be invoked."));
                 if (test.Auto)
@@ -112,14 +112,14 @@ public sealed class DurableAgentDeploymentTests
         Assert.Null(error);
         Assert.Equal(2, callbacks);
         Assert.NotNull(configured);
-        Assert.Equal(isolated ? DurableAgentDeploymentMode.IsolatedV2 : DurableAgentDeploymentMode.Legacy,
+        Assert.Equal(isolated ? DurableAgentDeploymentMode.SchemaV2 : DurableAgentDeploymentMode.Legacy,
             configured.DeploymentMode);
         Assert.Equal(isolated, configured.EnablePersistentRequestOutcomes);
 
         // This process executes only this probe, so no parallel tests observe these environment changes.
         Environment.SetEnvironmentVariable(DurableAgentDeploymentConfiguration.EnvironmentVariableName, "invalid-after-snapshot");
         services.ConfigureDurableAgents(_ => { });
-        Assert.Equal(isolated ? DurableAgentDeploymentMode.IsolatedV2 : DurableAgentDeploymentMode.Legacy,
+        Assert.Equal(isolated ? DurableAgentDeploymentMode.SchemaV2 : DurableAgentDeploymentMode.Legacy,
             configured.DeploymentMode);
         if (test.Environment == "isolated_v2")
         {

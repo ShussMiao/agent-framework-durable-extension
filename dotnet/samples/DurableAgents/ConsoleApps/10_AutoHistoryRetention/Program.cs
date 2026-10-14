@@ -31,7 +31,7 @@ string deploymentName = Environment.GetEnvironmentVariable("FOUNDRY_MODEL")
     ?? throw new InvalidOperationException("FOUNDRY_MODEL is not set.");
 string endpoint = new Uri(projectEndpoint).GetLeftPart(UriPartial.Authority);
 
-Console.WriteLine("Legacy and KeepAll are the defaults. This sample separately acknowledges IsolatedV2 and opts into Auto.");
+Console.WriteLine("Legacy and KeepAll are the defaults. This sample separately acknowledges SchemaV2 and opts into Auto.");
 Console.WriteLine("This is durable transcript pressure retention, not model-context compaction or FollowCompaction.");
 Console.WriteLine("External history stores are never pruned; mailbox, receipts, binding and session remain protected.");
 Console.WriteLine("The 32 KiB demo budget is not universal: oversized protected state fails atomically.");

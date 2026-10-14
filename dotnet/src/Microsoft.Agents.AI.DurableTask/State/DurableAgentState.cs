@@ -11,7 +11,7 @@ namespace Microsoft.Agents.AI.DurableTask.State;
 [JsonConverter(typeof(DurableAgentStateJsonConverter))]
 internal sealed class DurableAgentState
 {
-    // Reader support never advances the default writer. IsolatedV2 initializes absent entity generations
+    // Reader support never advances the default writer. SchemaV2 initializes absent entity generations
     // as 2.0.0 with either KeepAll or Auto; loaded legacy state stays legacy without independent migration authority.
     internal const string CurrentSchemaVersion = "1.2.0";
     internal const string RevisedSchemaVersion = "2.0.0";

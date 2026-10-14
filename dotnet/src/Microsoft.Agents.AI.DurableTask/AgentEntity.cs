@@ -131,7 +131,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         if (outcome.Kind == DurableAgentRunOutcomeKind.Pending)
         {
             throw new InvalidOperationException(
-                "New schema 2 work requires IsolatedV2 deployment acknowledgement. Legacy mode permits read-only duplicates only.");
+                "New schema 2 work requires SchemaV2 deployment acknowledgement. Legacy mode permits read-only duplicates only.");
         }
 
         // Returning before the SDK dispatcher avoids republishing schema 2 through an unauthorized legacy writer.
@@ -235,12 +235,12 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             bool migrationAuthorized =
                 legacyMailboxMigrationRequested &&
                 this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
-            if (this._deploymentMode == DurableAgentDeploymentMode.IsolatedV2 &&
+            if (this._deploymentMode == DurableAgentDeploymentMode.SchemaV2 &&
                 this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
                 !migrationAuthorized)
             {
                 throw new DurableAgentStateCorruptionException(
-                    "IsolatedV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
+                    "SchemaV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
                     "entries must be converted from independently authoritative complete history before delivery. " +
                     "Public deployment acknowledgement does not authorize legacy migration; preserve this session on its original " +
                     "deployment and start a new isolated session.");
@@ -280,7 +280,7 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
             this.State.SchemaVersion == DurableAgentState.RevisedSchemaVersion)
         {
             throw new InvalidOperationException(
-                "New schema 2 work requires IsolatedV2 deployment acknowledgement. " +
+                "New schema 2 work requires SchemaV2 deployment acknowledgement. " +
                 "Legacy deployment mode does not downgrade existing state.");
         }
 
@@ -290,12 +290,12 @@ internal partial class AgentEntity(IServiceProvider services, CancellationToken 
         bool migrateLegacy = this._persistentRequestOutcomesEnabled &&
             this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
             this._options.AuthorizeLegacyMigration?.Invoke(this.State) == true;
-        if (this._deploymentMode == DurableAgentDeploymentMode.IsolatedV2 &&
+        if (this._deploymentMode == DurableAgentDeploymentMode.SchemaV2 &&
             this.State.SchemaVersion != DurableAgentState.RevisedSchemaVersion &&
             !migrateLegacy)
         {
             throw new DurableAgentStateCorruptionException(
-                "IsolatedV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
+                "SchemaV2 deployment requires schema 2 mailbox state. Legacy terminal transcript " +
                 "entries must be converted from independently authoritative complete history before execution. " +
                 "Public deployment acknowledgement does not authorize legacy migration; preserve this session on its original " +
                 "deployment and start a new isolated session.");

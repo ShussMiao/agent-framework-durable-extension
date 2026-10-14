@@ -167,7 +167,7 @@ public sealed class AgentEntityTimeToLiveTests
             TimeSpan.FromMinutes(5),
             state,
             registerAgent: false);
-        harness.Options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+        harness.Options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
         harness.Options.AuthorizeLegacyMigration = null;
 
         await harness.CheckExpirationAsync(
@@ -193,7 +193,7 @@ public sealed class AgentEntityTimeToLiveTests
             TimeSpan.FromMinutes(5),
             state,
             registerAgent: false);
-        harness.Options.DeploymentMode = DurableAgentDeploymentMode.IsolatedV2;
+        harness.Options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
         harness.Options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
         harness.Options.MaxStateBytes = 500;
 
