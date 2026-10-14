@@ -4,11 +4,7 @@ Each durable agent session is represented by one Durable Entity. The entity coor
 
 Schema 2 separates request completion from conversation history. A completed request remains completed when its transcript is removed or its result expires, and a resumed session uses exactly one source of conversation history.
 
-Schema `2.0.0` is an explicit .NET deployment acknowledgement through SchemaV2, supplied by code
-or the exact shared environment value. KeepAll and Auto independently select retention within that deployment.
-Readers accept supported 1.x and 2.0; default Legacy writes remain 1.2. Existing entities are not automatically
-migrated. Follow the shared [C# and Python migration guide](schema-v2-migration.md); compatible wire state is not
-permission to interchange mutable provider sessions or workflow engines.
+Schema `2.0.0` is being introduced in stages so .NET, Python, and other state consumers can adopt the same contract safely. Production .NET readers and writers remain on schema `1.2.0`; schema 2 writes stay disabled until the cross-runtime rollout requirements are satisfied.
 
 The [schema 2 contract](../../../schemas/README.md) defines the wire fields and cross-runtime invariants.
 
@@ -121,7 +117,7 @@ History ownership controls where prior model context comes from; it does not con
 | `AgentSession` | Opaque restored session for a generic agent | Only the current request is passed |
 | `NoContextPipeline` | No discoverable Agent Framework context pipeline | `DurableAgentHistoryReplayMode` selects entity preload or current-request-only behavior |
 
-When the explicitly enabled schema 2 writer is active, each cold operation uses `DurableAgentSessionState.RestoreAsync` to reconstruct the session. `DurableAgentHistoryOwnershipResolver` inspects the public Agent Framework surface available from the agent and session, applies the configured replay policy, and produces the effective owner. `DurableAgentHistoryBinding` compares that owner with the persisted fixed binding and rejects a different owner or provider identity before model execution. Schema 1 remains the public default and preserves the pre-profile behavior without creating or enforcing a fixed binding.
+When the internal schema 2 writer is active, each cold operation uses `DurableAgentSessionState.RestoreAsync` to reconstruct the session. `DurableAgentHistoryOwnershipResolver` inspects the public Agent Framework surface available from the agent and session, applies the configured replay policy, and produces the effective owner. `DurableAgentHistoryBinding` compares that owner with the persisted fixed binding and rejects a different owner or provider identity before model execution. Schema 1 remains the public default and preserves the pre-profile behavior without creating or enforcing a fixed binding.
 
 In schema 1, explicitly configured in-memory providers retain their declared session state, including reducer and filter output, across cold restarts. Their state is not a disposable copy of the entity transcript. The implicit default provider retains the legacy entity-replay behavior, while schema 2 uses the operation-scoped durable adapter for entity-owned history; superseded default-provider transcript state is excluded without removing unrelated session state.
 
@@ -135,10 +131,7 @@ The application or external provider remains responsible for availability, autho
 
 ## History configuration
 
-Closed public replay choices are represented by `DurableAgentHistoryReplayMode`, with `PreloadEntityHistory` and `CurrentRequestOnly`.
-Resolved `DurableAgentDeploymentMode.SchemaV2` enables schema-2 writes for SDK-proven absent generations.
-KeepAll and Auto independently select retention; Auto defaults to a 1 MiB envelope budget with positive overrides. Loaded legacy
-state is not publicly migrated. History ownership remains a closed internal enum after resolution.
+Closed public replay choices are represented by `DurableAgentHistoryReplayMode`, with `PreloadEntityHistory` and `CurrentRequestOnly`. Pressure-retention choices remain an internal enum alongside the default-off schema-2 writer gate; applications are not offered an activation surface that the public rollout cannot yet support. History ownership is also a closed internal enum after resolution.
 
 Agent names and logical provider identities are open sets, so an enum is not appropriate for them. History policy is attached to `AddAIAgent` or `AddAIAgentFactory` through `DurableAgentHistoryOptions`; callers do not repeat the agent name. `DurableAgentHistoryProviderKey` validates the logical provider identity before registration. It crosses the JSON wire as a string for interoperability, but applications can define it once as a static typed value.
 
@@ -151,10 +144,10 @@ These are independent mechanisms:
 | Mechanism | Trigger | Removes | Preserves |
 | --- | --- | --- | --- |
 | Result expiry | `ResultRetentionPeriod` (60 seconds by default) and `CheckAndExpireResults` | `terminalResults[correlationId]` payload | Completion receipt with unavailable state |
-| Pressure retention | Public opt-in `Auto`, default 1 MiB or positive override, and high watermark | Oldest eligible transcript groups | Mailbox, receipts, binding, session, TTL, bookkeeping, system groups, newest exchange and its tool pairs |
+| Pressure retention | Internal `Auto`, explicit positive storage-envelope budget, and configured high watermark | Oldest eligible transcript groups | Mailbox, receipts, binding, session, TTL, bookkeeping, system groups, newest exchange and its tool pairs |
 | Whole-entity TTL | `expirationTimeUtc` and `CheckAndDeleteIfExpired` | Entire entity | Nothing in that session |
 
-`AgentEntity.ApplyRetentionAndCommit` performs due result expiry, writes the next generation-aware expiry schedule, invokes staged retention, validates serialization, schedules required self-signals, and finally replaces entity state. Automatic retention measures the converter output as an escaped JSON-string storage envelope. Its default 0.85 high and 0.70 low watermarks are publicly configurable with `0 < low < high <= 1`; there is no implicit portable budget. A protected-floor failure leaves the input state unchanged and fails before model/provider effects when the floor is deterministically knowable.
+`AgentEntity.ApplyRetentionAndCommit` performs due result expiry, writes the next generation-aware expiry schedule, invokes staged retention, validates serialization, schedules required self-signals, and finally replaces entity state. Automatic retention measures the converter output as an escaped JSON-string storage envelope. Its default 0.85 high and 0.70 low watermarks are internally configurable with `0 < low < high <= 1`; there is no implicit portable budget. A protected-floor failure leaves the input state unchanged and fails before model/provider effects when the floor is deterministically knowable.
 
 Protection is a fixed-point connected-component closure over correlation membership and tool-call/result links. The actual newest entry and every entry containing a system message seed protection. Every entry in any reached non-null correlation is protected, and every occurrence of a reached non-empty tool ID is protected; newly reached entries recursively expand protection through their own correlation and tool links until closure. Pressure eviction removes only an oldest prefix of atomic components that remain disconnected from that closure. A newest or system-message component may therefore connect to older history and raise the protected floor above the budget, in which case retention fails atomically without publishing the working state.
 
@@ -173,14 +166,6 @@ Only a successful outer entity operation publishes a new terminal result. The fo
 - Backend failure before the Durable Entity operation commits.
 
 An external service or provider may have observed a call even when the entity commit fails. Schema 2 prevents a committed completion from being forgotten; it cannot make external side effects atomic with the entity store.
-
-Public C# external load/store callback failures do not create framework failed receipts. Load failure
-before model invocation leaves the model uncalled in that path; store failure after model/tool effects
-or remote writes leaves acknowledgement ambiguous. Retry may execute again under the same correlation.
-KeepAll and Auto both allow external and service-managed history; the application owns idempotency and
-reconciliation, including cancellation, timeout and response-loss ambiguity. See
-[application retry safety](schema-v2-migration.md#make-retries-safe-in-your-application) and
-[the provider retry-risk limitation](https://github.com/microsoft/agent-framework-durable-extension/issues/143).
 
 ## Documentation authority
 
