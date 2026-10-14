@@ -11,22 +11,9 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using OpenAI.Chat;
 
-if (!string.Equals(
-    Environment.GetEnvironmentVariable("DURABLE_AGENTS_DEPLOYMENT_MODE"),
-    "isolated_v2",
-    StringComparison.Ordinal))
-{
-    Console.Error.WriteLine(
-        "Sample 10 uses environment configuration. Set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2 before startup, " +
-        "after creating a fresh, isolated task hub with schema-v2-compatible workers, clients and readers. " +
-        "Applications can instead set DurableAgentsOptions.DeploymentMode to DurableAgentDeploymentMode.SchemaV2. " +
-        "This acknowledgement is not a compatibility check.");
-    return 2;
-}
-
+// Use an isolated task hub with schema-v2-compatible workers, clients and readers in real deployments.
 string connectionString = Environment.GetEnvironmentVariable("DURABLE_TASK_SCHEDULER_CONNECTION_STRING")
-    ?? throw new InvalidOperationException("DURABLE_TASK_SCHEDULER_CONNECTION_STRING is required; there is no default hub fallback.");
-HistoryRetentionDemo.ValidateIsolatedConnection(connectionString);
+    ?? "Endpoint=http://localhost:8080;TaskHub=default;Authentication=None";
 string projectEndpoint = Environment.GetEnvironmentVariable("FOUNDRY_PROJECT_ENDPOINT")
     ?? throw new InvalidOperationException("FOUNDRY_PROJECT_ENDPOINT is not set.");
 string deploymentName = Environment.GetEnvironmentVariable("FOUNDRY_MODEL")

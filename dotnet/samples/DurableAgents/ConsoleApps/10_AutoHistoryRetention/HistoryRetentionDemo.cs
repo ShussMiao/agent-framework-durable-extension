@@ -1,6 +1,5 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
-using System.Data.Common;
 using Microsoft.Agents.AI;
 using Microsoft.Agents.AI.DurableTask;
 using Microsoft.Extensions.DependencyInjection;
@@ -89,26 +88,12 @@ public static class HistoryRetentionDemo
     public static void ConfigureRetention(DurableAgentsOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        // Applications can alternatively set DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2.
         options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
         options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
         options.MaxStateBytes = MaxStateBytes;
         options.HistoryRetentionHighWatermark = HighWatermark;
         options.HistoryRetentionLowWatermark = LowWatermark;
-    }
-
-    public static void ValidateIsolatedConnection(string connectionString)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
-        DbConnectionStringBuilder connection = new() { ConnectionString = connectionString };
-        if (!connection.TryGetValue("TaskHub", out object? value) ||
-            value is not string hub ||
-            string.IsNullOrWhiteSpace(hub) ||
-            string.Equals(hub.Trim(), "default", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new ArgumentException(
-                "Sample 10 requires an explicit non-default isolated TaskHub; create a fresh hub with compatible workers only.",
-                nameof(connectionString));
-        }
     }
 
     public static ChatClientAgentOptions CreateAgentOptions() =>
