@@ -4,6 +4,10 @@ This sample demonstrates hosting an agent whose conversation history is **persis
 **compacted as it grows**, using the same configuration you would write for in-process Agent
 Framework.
 
+For schema-v2 deployment, retention and upgrade guidance, see the shared
+[schema-v2 migration guide](../../../../docs/features/durable-agents/schema-v2-migration.md).
+The guide distinguishes current host and language behavior.
+
 > [!WARNING]
 > Use a new, empty, uniquely named task hub reserved for this deployment, with compatible
 > canonical `2.0.0` workers and upgraded clients. Do not use the `default` hub or share it with
