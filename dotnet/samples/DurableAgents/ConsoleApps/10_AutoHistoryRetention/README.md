@@ -1,19 +1,19 @@
 # Opt-in Pressure Retention Sample
 
 > [!IMPORTANT]
-> This sample separately acknowledges SchemaV2 and enables public Auto retention for a new session.
-> Use versions documented as schema-v2-compatible in a fresh isolated hub with compatible workers,
+> This sample selects SchemaV2 in code and enables public Auto retention for a new session.
+> For real deployments, use schema-v2-compatible versions in a fresh isolated hub with compatible workers,
 > clients and readers. Existing 1.x sessions are rejected, not migrated. Follow the shared
 > [C# and Python migration guide](../../../../../docs/features/durable-agents/schema-v2-migration.md).
 
 The entry point uses the supported public options, a bounded model response, an illustrative marker
 diagnostic and OpenTelemetry metrics. KeepAll remains the default outside this opt-in:
 
-**Sample 10 uses environment configuration:** its entry point requires
-`DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` before reading service settings.
-Applications can instead assign `options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;`
-in code. These are equivalent activation paths in the SDK; the environment requirement belongs to this
-sample, not to all applications. A present invalid environment value is rejected even with a valid code option.
+**Sample 10 selects `SchemaV2` in code:** `ConfigureRetention` sets
+`options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;`, so no deployment environment setting
+is required. Applications can alternatively set `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`.
+These are equivalent activation paths in the SDK. A present invalid environment value is rejected
+even with a valid code option.
 
 ```csharp
 services.ConfigureDurableAgents(options =>
@@ -120,15 +120,17 @@ behavior when correctness matters.
 
 ## Run the sample
 
-Install the .NET 10 SDK and configure Microsoft CFS for package restores. Create a fresh task hub with
-only compatible workers; a non-default name and acknowledgement do not themselves certify isolation.
-Set the model configuration in your own shell, using an identity authorized for that model:
+Install the .NET 10 SDK, configure Microsoft CFS for package restores and start the local Durable Task
+Scheduler emulator. Set the model configuration in your own shell, using an identity authorized for that model:
+
+`DURABLE_TASK_SCHEDULER_CONNECTION_STRING` is optional. When unset, the sample uses the standard local
+emulator connection `Endpoint=http://localhost:8080;TaskHub=default;Authentication=None`.
+Override it for another scheduler or task hub. For real deployments, use a fresh isolated hub with
+compatible workers, clients and readers; neither the connection string nor code-selected SchemaV2 proves isolation.
 
 ```powershell
 $env:FOUNDRY_PROJECT_ENDPOINT = "https://YOUR-ENDPOINT/api/projects/YOUR-PROJECT"
 $env:FOUNDRY_MODEL = "YOUR-MODEL-DEPLOYMENT"
-$env:DURABLE_TASK_SCHEDULER_CONNECTION_STRING = "Endpoint=http://localhost:8080;TaskHub=retention-isolated-demo;Authentication=None"
-$env:DURABLE_AGENTS_DEPLOYMENT_MODE = "isolated_v2"
 Set-Location dotnet\samples\DurableAgents\ConsoleApps\10_AutoHistoryRetention
 dotnet restore --source https://packagefeedproxy.microsoft.io/nuget/v3/index.json
 dotnet run --framework net10.0 --no-restore
@@ -140,8 +142,6 @@ No wall-clock expiry wait is required. The default provider owns the entity tran
 conversation is imported. `DefaultAzureCredential` is used for development; prefer a specific credential
 for production.
 
-Without its environment acknowledgement, this sample's entry point exits with code 2 before accessing model
-configuration or services. Missing/default task-hub configuration fails explicitly with no fallback.
 For a NuGet consumer, use a package version that includes these durable-agent APIs;
 Agent Framework dependency versions alone do not supply them.
 Backend/model execution requires your configured services; offline tests do not certify the hosted backend.
@@ -156,8 +156,8 @@ The sample tests cover bounded agent options, prompt construction,
 the no-wait marker diagnostic, conservative result classification, invalid-marker rejection before
 agent/model calls or output/session mutation, and real OpenTelemetry meter registration/export.
 
-The product unit tests cover public deployment and retention settings, the sample's environment-only entry guard,
-retention configuration and non-default hub selection, early validation, and state/retention behavior through the SDK dispatcher:
+The product unit tests cover public deployment and retention settings, the sample's code-selected SchemaV2
+configuration and optional local-emulator connection, early validation, and state/retention behavior through the SDK dispatcher:
 
 ```powershell
 dotnet test --project ..\..\..\..\tests\Microsoft.Agents.AI.DurableTask.UnitTests\Microsoft.Agents.AI.DurableTask.UnitTests.csproj `
