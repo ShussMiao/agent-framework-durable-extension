@@ -10,12 +10,13 @@ namespace Microsoft.Agents.AI.DurableTask;
 public sealed class DurableAgentsOptions
 {
     private const int DefaultMaxStateBytes = 1_048_576;
+    private const string DeploymentModeEnvironmentVariableName = "DURABLE_AGENTS_DEPLOYMENT_MODE";
+    private const string SchemaV2EnvironmentValue = "isolated_v2";
     // Agent names are case-insensitive
     private readonly Dictionary<string, Func<IServiceProvider, AIAgent>> _agentFactories = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TimeSpan?> _agentTimeToLive = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DurableAgentHistoryConfiguration> _historyConfigurations = new(StringComparer.OrdinalIgnoreCase);
     private bool _defaultTimeToLiveConfigured;
-    private readonly Dictionary<string, AIAgent> _directAgents = new(StringComparer.OrdinalIgnoreCase);
     private DurableAgentDeploymentMode? _configuredDeploymentMode;
     private DurableAgentDeploymentMode? _resolvedDeploymentMode;
     private bool _deploymentEnvironmentCaptured;
@@ -244,11 +245,11 @@ public sealed class DurableAgentsOptions
         if (!this._deploymentEnvironmentCaptured)
         {
             this._deploymentEnvironmentValue =
-                Environment.GetEnvironmentVariable(DurableAgentDeploymentConfiguration.EnvironmentVariableName);
+                Environment.GetEnvironmentVariable(DeploymentModeEnvironmentVariableName);
             this._deploymentEnvironmentCaptured = true;
         }
 
-        this._resolvedDeploymentMode = DurableAgentDeploymentConfiguration.Resolve(
+        this._resolvedDeploymentMode = ResolveDeploymentMode(
             this._configuredDeploymentMode, this._deploymentEnvironmentValue);
         if (this.HistoryRetentionMode == DurableAgentHistoryRetentionMode.Auto &&
             this._resolvedDeploymentMode != DurableAgentDeploymentMode.SchemaV2)
@@ -290,10 +291,31 @@ public sealed class DurableAgentsOptions
     internal void ValidateConfiguration()
     {
         _ = this.GetRetentionSettings();
-        foreach (AIAgent agent in this._directAgents.Values)
+    }
+
+    private static DurableAgentDeploymentMode ResolveDeploymentMode(
+        DurableAgentDeploymentMode? configuredMode,
+        string? environmentValue)
+    {
+        if (environmentValue is not null &&
+            !string.Equals(environmentValue, SchemaV2EnvironmentValue, StringComparison.Ordinal))
         {
-            DurableAgentHistoryOwnershipResolver.ValidateStaticConfiguration(agent, this.EnablePersistentRequestOutcomes);
+            throw new InvalidOperationException(
+                "DURABLE_AGENTS_DEPLOYMENT_MODE must be unset or exactly 'isolated_v2'; " +
+                "empty values, aliases, case changes and surrounding whitespace are not supported.");
         }
+
+        if (environmentValue is not null && configuredMode == DurableAgentDeploymentMode.Legacy)
+        {
+            throw new InvalidOperationException(
+                "Explicit Legacy deployment mode conflicts with DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2. " +
+                "Remove the environment setting to keep Legacy, or set DurableAgentsOptions.DeploymentMode " +
+                "to DurableAgentDeploymentMode.SchemaV2.");
+        }
+
+        return configuredMode ?? (environmentValue is null
+            ? DurableAgentDeploymentMode.Legacy
+            : DurableAgentDeploymentMode.SchemaV2);
     }
 
     private static void ValidateWatermark(double? value, string parameterName)
@@ -345,7 +367,6 @@ public sealed class DurableAgentsOptions
         ArgumentNullException.ThrowIfNull(factory);
         DurableAgentHistoryConfiguration historyConfiguration = CreateHistoryConfiguration(configureHistory);
         this.AddExplicitAgentFactory(name, factory, nameof(name));
-        this._directAgents.Remove(name);
         this._historyConfigurations[name] = historyConfiguration;
         if (timeToLive.HasValue)
         {
@@ -378,9 +399,6 @@ public sealed class DurableAgentsOptions
     /// <remarks>
     /// Registering an agent that a workflow already discovered is allowed: the explicit registration takes over,
     /// so an agent can be promoted to a standalone agent regardless of whether the workflow was configured first.
-    /// Static fixed-owner incompatibilities are rejected during this call when the schema 2 writer is
-    /// active. Validation that depends on the completed options composition or restored session remains at entity
-    /// execution time, before provider, session, or model side effects.
     /// </remarks>
     public DurableAgentsOptions AddAIAgent(
         AIAgent agent,
@@ -394,14 +412,8 @@ public sealed class DurableAgentsOptions
             throw new ArgumentException($"{nameof(agent.Name)} must not be null or whitespace.", nameof(agent));
         }
 
-        // Direct registrations expose the constructed pipeline, so reject static incompatibilities now.
-        // Factory registrations are validated after their single per-operation construction.
-        DurableAgentHistoryOwnershipResolver.ValidateStaticConfiguration(
-            agent,
-            this.EnablePersistentRequestOutcomes);
         DurableAgentHistoryConfiguration historyConfiguration = CreateHistoryConfiguration(configureHistory);
         this.AddExplicitAgentFactory(agent.Name, sp => agent, nameof(agent));
-        this._directAgents[agent.Name] = agent;
         this._historyConfigurations[agent.Name] = historyConfiguration;
         if (timeToLive.HasValue)
         {

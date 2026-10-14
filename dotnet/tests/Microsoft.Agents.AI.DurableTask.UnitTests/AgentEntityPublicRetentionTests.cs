@@ -1,357 +1,212 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using AutoHistoryRetention;
+using DurableTask.Core.Entities;
 using DurableTask.Core.Entities.OperationFormat;
 using Microsoft.Agents.AI.DurableTask.State;
-using Microsoft.DurableTask.Entities;
+using Microsoft.DurableTask;
+using Microsoft.DurableTask.Client;
+using Microsoft.DurableTask.Worker;
+using Microsoft.DurableTask.Worker.Shims;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 
 namespace Microsoft.Agents.AI.DurableTask.Tests.Unit;
 
-public sealed partial class AgentEntityPublicRetentionTests
+public sealed class AgentEntityPublicRetentionTests
 {
-    private static void ConfigureIsolated(DurableAgentsOptions options, bool auto)
+    private const string ModeEnvironment = "DURABLE_AGENTS_DEPLOYMENT_MODE";
+    private const string ProbeEnvironment = "PUBLIC_RETENTION_CONFIGURATION_PROBE";
+    private static readonly DateTimeOffset s_now = new(2026, 10, 14, 9, 0, 0, TimeSpan.Zero);
+    private static readonly EntityId s_id = new(AgentSessionId.ToEntityName("agent"), "session");
+    private static readonly DurableDataConverter s_converter = new();
+
+    [Theory]
+    [InlineData(null, null, false, true)]
+    [InlineData(1, null, false, true)]
+    [InlineData(1, null, true, true)]
+    [InlineData(null, "isolated_v2", false, true)]
+    [InlineData(null, "isolated_v2", true, true)]
+    [InlineData(0, "isolated_v2", false, false)]
+    [InlineData(1, "ISOLATED_V2", false, false)]
+    [InlineData(1, " isolated_v2", false, false)]
+    [InlineData(1, "isolated_v2 ", true, false)]
+    [InlineData(1, "", true, false)]
+    [InlineData(null, "legacy", false, false)]
+    [InlineData(null, null, true, false)]
+    public async Task ConfigurationIsValidatedAndCapturedBeforeCallbacksAsync(int? code, string? value, bool auto, bool valid)
     {
-        options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
-        if (auto)
+        ProcessStartInfo start = new("dotnet") { RedirectStandardOutput = true, RedirectStandardError = true };
+        start.ArgumentList.Add(typeof(AgentEntityPublicRetentionTests).Assembly.Location);
+        start.ArgumentList.Add("--filter-method");
+        start.ArgumentList.Add("*EnvironmentProbe");
+        start.ArgumentList.Add("--no-progress");
+        start.Environment.Remove(ModeEnvironment);
+        if (value is not null)
         {
-            HistoryRetentionDemo.ConfigureRetention(options);
+            start.Environment[ModeEnvironment] = value;
         }
+        start.Environment[ProbeEnvironment] = JsonSerializer.Serialize(new ConfigurationCase(code, value, auto, valid));
+        using Process child = Process.Start(start)!;
+        Task<string> output = child.StandardOutput.ReadToEndAsync();
+        Task<string> error = child.StandardError.ReadToEndAsync();
+        await child.WaitForExitAsync(TestContext.Current.CancellationToken);
+        Assert.True(child.ExitCode == 0, (await output) + (await error));
     }
 
     [Fact]
-    public async Task AgentCallbackCannotChangeCurrentOperationWriterOrRetentionPolicyAsync()
+    public void EnvironmentProbe()
     {
-        DurableAgentsOptions? configured = null;
-        ProbeClient client = new()
+        string? raw = Environment.GetEnvironmentVariable(ProbeEnvironment);
+        if (raw is null)
         {
-            BeforeResponse = () =>
-            {
-                Assert.NotNull(configured);
-                configured.DeploymentMode = DurableAgentDeploymentMode.Legacy;
-                configured.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-                configured.MaxStateBytes = 1;
-                Assert.False(configured.EnablePersistentRequestOutcomes);
-            },
-        };
-        EntityBatchResult run = await DispatchAsync(new ChatClientAgent(client, name: "agent"), null, "new",
-            mailbox: false, configureOptions: options =>
-            {
-                configured = options;
-                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
-            });
-
-        Assert.Null(Result(run).FailureDetails);
-        Assert.Equal(DurableAgentState.RevisedSchemaVersion, ReadState(run).SchemaVersion);
-        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome, ReadState(run).Data.CompletionReceipts!["new"].Outcome);
-        Assert.Null(ReadState(run).Data.Truncation);
-        Assert.Equal(1, client.Count);
-    }
-
-    [Theory]
-    [InlineData(false, DurableAgentHistoryReplayMode.PreloadEntityHistory)]
-    [InlineData(true, DurableAgentHistoryReplayMode.PreloadEntityHistory)]
-    [InlineData(false, DurableAgentHistoryReplayMode.CurrentRequestOnly)]
-    [InlineData(true, DurableAgentHistoryReplayMode.CurrentRequestOnly)]
-    public async Task PublicIsolatedGenericOwnersSurviveColdReloadAsync(bool auto, DurableAgentHistoryReplayMode replay)
-    {
-        ProbeGenericAgent first = new();
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-        EntityBatchResult seed = await DispatchAsync(first, null, "old", mailbox: false, replayMode: replay,
-            configureOptions: configure);
-        Assert.Null(Result(seed).FailureDetails);
-        ProbeGenericAgent cold = new();
-        EntityBatchResult next = await DispatchAsync(cold, seed.EntityState, "new", mailbox: false, replayMode: replay,
-            configureOptions: configure);
-        Assert.Null(Result(next).FailureDetails);
-        Assert.Equal(2, ReadState(next).Data.CompletionReceipts!.Count);
-        Assert.Equal(replay == DurableAgentHistoryReplayMode.PreloadEntityHistory ? 3 : 1, cold.LastMessages.Count);
-        if (replay == DurableAgentHistoryReplayMode.CurrentRequestOnly)
-        {
-            Assert.Empty(ReadState(next).Data.ConversationHistory);
+            return;
         }
-        Assert.NotNull(ReadState(next).Data.Session);
-    }
-
-    [Theory]
-    [InlineData(false, "owner")]
-    [InlineData(true, "owner")]
-    [InlineData(false, "missingKey")]
-    [InlineData(true, "missingKey")]
-    [InlineData(false, "changedKey")]
-    [InlineData(true, "changedKey")]
-    public async Task PublicIsolatedOwnerMismatchNeverFallsBackToModelAsync(bool auto, string mismatch)
-    {
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-        EntityBatchResult seed = await DispatchAsync(CreateAgent(new ProbeClient(), new ProbeProvider()), null, "old",
-            mailbox: false, configureOptions: configure);
-        ProbeClient client = new();
-        ProbeProvider provider = new();
-        AIAgent replacement = mismatch == "owner" ? new ChatClientAgent(client, name: "agent") : CreateAgent(client, provider);
-        string? before = mismatch == "missingKey" ? null : seed.EntityState;
-        EntityBatchResult rejected = await DispatchAsync(replacement, before, "next", mailbox: false,
-            configureOptions: configure, providerKey: mismatch == "missingKey" ? null : mismatch == "changedKey" ? "different.v1" : "probe.v1");
-        Assert.NotNull(Result(rejected).FailureDetails);
-        Assert.Equal(before, rejected.EntityState);
-        Assert.Empty(Actions(rejected));
-        Assert.Equal(0, client.Count);
-        Assert.Equal(0, provider.LoadCount);
-        Assert.Equal(0, provider.StoreCount);
-        EntityBatchResult retry = await DispatchAsync(CreateAgent(client, provider), rejected.EntityState, "next", mailbox: false,
-            configureOptions: configure);
-        Assert.Null(Result(retry).FailureDetails);
-        Assert.Equal(1, client.Count);
-        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome, ReadState(retry).Data.CompletionReceipts!["next"].Outcome);
-    }
-
-    [Theory]
-    [InlineData(false, "load", false)]
-    [InlineData(true, "load", false)]
-    [InlineData(false, "lazyLoad", false)]
-    [InlineData(true, "lazyLoad", false)]
-    [InlineData(false, "storeBefore", false)]
-    [InlineData(true, "storeBefore", false)]
-    [InlineData(false, "storeAfter", false)]
-    [InlineData(true, "storeAfter", false)]
-    [InlineData(false, "load", true)]
-    [InlineData(true, "load", true)]
-    [InlineData(false, "lazyLoad", true)]
-    [InlineData(true, "lazyLoad", true)]
-    [InlineData(false, "storeBefore", true)]
-    [InlineData(true, "storeBefore", true)]
-    [InlineData(false, "storeAfter", true)]
-    [InlineData(true, "storeAfter", true)]
-    public async Task ExternalCallbackFailureHasNoReceiptAndColdSameCorrelationRemainsExecutableAsync(
-        bool auto, string stage, bool first)
-    {
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-        string? original = first ? null : (await DispatchAsync(
-            CreateAgent(new ProbeClient(), new ProbeProvider()), null, "seed",
-            mailbox: false, configureOptions: configure)).EntityState;
-        ProbeProvider provider = new() { Stage = stage, Failure = new IOException(PrivateMarker) };
-        ProbeClient client = new();
-        ChatClientAgent agent = CreateAgent(client, provider);
-        EntityBatchResult failed = await DispatchAsync(agent, original, "retryable", mailbox: false,
-            configureOptions: configure);
-        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
-        Assert.Equal(original, failed.EntityState);
-        Assert.Empty(Actions(failed));
-        Assert.Same(provider, agent.ChatHistoryProvider);
-        Assert.Equal(stage is "load" or "lazyLoad" ? 0 : 1, client.Count);
-        Assert.Equal(stage == "storeAfter" ? 1 : 0, provider.RemoteMessages.Count);
-        Assert.Equal(first ? null : 1, provider.RestoredVersion);
-        if (!first)
+        ConfigurationCase test = JsonSerializer.Deserialize<ConfigurationCase>(raw)!;
+        int callbacks = 0;
+        DurableAgentsOptions? captured = null;
+        ServiceCollection services = new();
+        Exception? failure = Record.Exception(() => services.ConfigureDurableAgents(options =>
         {
-            DurableAgentState rolledBack = ReadState(failed);
-            Assert.False(rolledBack.Data.CompletionReceipts!.ContainsKey("retryable"));
-            Assert.False(rolledBack.Data.TerminalResults!.ContainsKey("retryable"));
-            Assert.DoesNotContain(PrivateMarker, failed.EntityState, StringComparison.Ordinal);
-        }
-
-        ProbeProvider coldProvider = new() { Stage = stage, Failure = new IOException(PrivateMarker) };
-        ProbeClient coldClient = new();
-        EntityBatchResult failedAgain = await DispatchAsync(CreateAgent(coldClient, coldProvider), failed.EntityState,
-            "retryable", mailbox: false, configureOptions: configure);
-        Assert.Equal(typeof(IOException).FullName, Failure(failedAgain).ErrorType);
-        Assert.Equal(original, failedAgain.EntityState);
-        Assert.Empty(Actions(failedAgain));
-        Assert.Equal(stage is "load" or "lazyLoad" ? 0 : 1, coldClient.Count);
-        Assert.Equal(first ? null : 1, coldProvider.RestoredVersion);
-
-        ProbeProvider recoveredProvider = new();
-        ProbeClient recoveredClient = new();
-        EntityBatchResult retry = await DispatchAsync(CreateAgent(recoveredClient, recoveredProvider),
-            failedAgain.EntityState, "retryable", mailbox: false, configureOptions: configure);
-        Assert.Null(Result(retry).FailureDetails);
-        Assert.Equal(1, recoveredClient.Count);
-        Assert.Equal(first ? null : 1, recoveredProvider.RestoredVersion);
-        Assert.Empty(ReadState(retry).Data.ConversationHistory);
-        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome,
-            ReadState(retry).Data.CompletionReceipts!["retryable"].Outcome);
-
-        EntityBatchResult duplicate = await DispatchAsync(CreateAgent(recoveredClient, recoveredProvider),
-            retry.EntityState, "retryable", mailbox: false, configureOptions: configure);
-        Assert.Null(Result(duplicate).FailureDetails);
-        Assert.Equal(retry.EntityState, duplicate.EntityState);
-        Assert.Equal(1, recoveredClient.Count);
-        Assert.Equal(1, recoveredProvider.LoadCount);
-        Assert.Equal(1, recoveredProvider.StoreCount);
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task StoreFailureAfterActualToolEffectRollsBackSdkOutboxButColdRetryRepeatsEffectAsync(bool auto)
-    {
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-        EntityBatchResult seed = await DispatchAsync(CreateAgent(new ProbeClient(), new ProbeProvider()),
-            null, "seed", mailbox: false, configureOptions: configure);
-        int remoteEffects = 0;
-        AIFunction tool = AIFunctionFactory.Create(() =>
-        {
-            remoteEffects++;
-            _ = DurableAgentContext.Current.ScheduleNewOrchestration("tool-work");
-            return "accepted externally";
-        }, name: "perform_operation");
-        ChatClientAgent create(IChatClient client, ProbeProvider provider) => new(client, new ChatClientAgentOptions
-        {
-            Name = "agent",
-            ChatHistoryProvider = provider,
-            ChatOptions = new ChatOptions { Tools = [tool] },
-        });
-        ProbeProvider failingProvider = new() { Stage = "storeAfter", Failure = new IOException(PrivateMarker) };
-        ToolLoopClient failingClient = new(tool.Name);
-        EntityBatchResult failed = await DispatchAsync(create(failingClient, failingProvider),
-            seed.EntityState, "retryable", mailbox: false, configureOptions: configure);
-        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
-        Assert.Equal(seed.EntityState, failed.EntityState);
-        Assert.Empty(Actions(failed));
-        Assert.Equal(1, remoteEffects);
-        Assert.Equal(2, failingClient.Count);
-        Assert.Single(failingProvider.RemoteMessages);
-        Assert.False(ReadState(failed).Data.CompletionReceipts!.ContainsKey("retryable"));
-
-        ProbeProvider recoveredProvider = new() { RemoteMessages = failingProvider.RemoteMessages };
-        ToolLoopClient coldClient = new(tool.Name);
-        EntityBatchResult retry = await DispatchAsync(create(coldClient, recoveredProvider),
-            failed.EntityState, "retryable", mailbox: false, configureOptions: configure);
-        Assert.Null(Result(retry).FailureDetails);
-        Assert.Equal(2, remoteEffects);
-        Assert.Equal(2, coldClient.Count);
-        Assert.Equal(2, recoveredProvider.RemoteMessages.Count);
-        Assert.Equal(1, recoveredProvider.RestoredVersion);
-        Assert.Equal("tool-work", Assert.IsType<StartNewOrchestrationOperationAction>(Assert.Single(Actions(retry))).Name);
-        EntityBatchResult duplicate = await DispatchAsync(create(coldClient, recoveredProvider),
-            retry.EntityState, "retryable", mailbox: false, configureOptions: configure);
-        Assert.Null(Result(duplicate).FailureDetails);
-        Assert.Equal(retry.EntityState, duplicate.EntityState);
-        Assert.Empty(Actions(duplicate));
-        Assert.Equal(2, remoteEffects);
-        Assert.Equal(2, coldClient.Count);
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task ServiceModelFailurePreservesContinuationWithoutFinalityAndColdRetryExecutesAsync(bool auto)
-    {
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-        EntityBatchResult seed = await DispatchAsync(
-            new ChatClientAgent(new ProbeClient { ResponseConversationId = "remote-conversation" }, name: "agent"),
-            null, "seed", mailbox: false, configureOptions: configure);
-        ProbeClient failing = new() { Failure = new IOException(PrivateMarker) };
-        EntityBatchResult failed = await DispatchAsync(new ChatClientAgent(failing, name: "agent"),
-            seed.EntityState, "retryable", mailbox: false, configureOptions: configure);
-        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
-        Assert.Equal(seed.EntityState, failed.EntityState);
-        Assert.Empty(Actions(failed));
-        Assert.Equal(1, failing.Count);
-        Assert.False(ReadState(failed).Data.CompletionReceipts!.ContainsKey("retryable"));
-
-        ProbeClient cold = new() { ResponseConversationId = "remote-conversation" };
-        EntityBatchResult retry = await DispatchAsync(new ChatClientAgent(cold, name: "agent"),
-            failed.EntityState, "retryable", mailbox: false, configureOptions: configure);
-        Assert.Null(Result(retry).FailureDetails);
-        Assert.Equal(1, cold.Count);
-        Assert.Single(cold.LastMessages);
-        Assert.Empty(ReadState(retry).Data.ConversationHistory);
-        Assert.Equal("remote-conversation", ReadState(retry).Data.Session!.Value.GetProperty("conversationId").GetString());
-    }
-
-    [Fact]
-    public async Task PublicIsolatedKeepAllDoesNotPruneTranscriptEvenBeyondAutoDemoBudgetAsync()
-    {
-        string? state = null;
-        ProbeClient client = new();
-        for (int turn = 0; turn < HistoryRetentionDemo.ScenarioTurns; turn++)
-        {
-            EntityBatchResult next = await DispatchAsync(new ChatClientAgent(client, name: "agent"), state, $"turn-{turn}",
-                mailbox: false, requestText: new string('x', HistoryRetentionDemo.NotesPerTurn),
-                configureOptions: options =>
-                {
-                    ConfigureIsolated(options, auto: false);
-                    options.MaxStateBytes = 1;
-                    options.HistoryRetentionHighWatermark = 0.2;
-                    options.HistoryRetentionLowWatermark = 0.9;
-                });
-            Assert.Null(Result(next).FailureDetails);
-            state = next.EntityState;
-        }
-        DurableAgentState retained = Assert.IsType<DurableAgentState>(s_converter.Deserialize(state, typeof(DurableAgentState)));
-        Assert.True(DurableAgentStateRetention.GetSerializedSize(retained) > HistoryRetentionDemo.MaxStateBytes);
-        Assert.Null(retained.Data.Truncation);
-        Assert.Equal(HistoryRetentionDemo.ScenarioTurns * 2, retained.Data.ConversationHistory.Count);
-        Assert.Equal(HistoryRetentionDemo.ScenarioTurns, retained.Data.CompletionReceipts!.Count);
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task PublicAutoDefaultAndNullBudgetInitializeCanonicalStateAsync(bool explicitNull)
-    {
-        ProbeClient client = new();
-        EntityBatchResult run = await DispatchAsync(new ChatClientAgent(client, name: "agent"), null, "new",
-            mailbox: false, configureOptions: options =>
+            captured = options;
+            if (test.Code is int code)
             {
-                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
-                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-                if (explicitNull)
-                {
-                    options.MaxStateBytes = null;
-                }
-                Assert.Equal(1_048_576, options.GetRetentionSettings().MaxStateBytes);
-            });
-        Assert.Null(Result(run).FailureDetails);
-        Assert.Equal(DurableAgentState.RevisedSchemaVersion, ReadState(run).SchemaVersion);
-        Assert.Null(ReadState(run).Data.Truncation);
-        Assert.Single(ReadState(run).Data.CompletionReceipts!);
-        Assert.Equal(1, client.Count);
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task ColdKeepAllWriterIgnoresDefaultOrOverriddenBudgetAboveOneMiBAsync(bool overrideBudget)
-    {
-        void configure(DurableAgentsOptions options)
-        {
-            ConfigureIsolated(options, auto: false);
-            if (overrideBudget)
-            {
-                options.MaxStateBytes = 1;
-                options.HistoryRetentionHighWatermark = 0.2;
-                options.HistoryRetentionLowWatermark = 0.9;
+                options.DeploymentMode = (DurableAgentDeploymentMode)code;
             }
+            options.HistoryRetentionMode = test.Auto ? DurableAgentHistoryRetentionMode.Auto : DurableAgentHistoryRetentionMode.KeepAll;
+            options.AddAIAgentFactory("agent", _ => throw new InvalidOperationException("Factory must not run."));
+        }, workerBuilder: _ => callbacks++, clientBuilder: _ => callbacks++));
+        if (!test.Valid)
+        {
+            Assert.IsType<InvalidOperationException>(failure);
+            Assert.Equal(0, callbacks);
+            return;
         }
-        EntityBatchResult seed = await DispatchAsync(new ChatClientAgent(new ProbeClient(), name: "agent"), null, "old",
-            mailbox: false, configureOptions: configure);
-        ProbeClient cold = new();
-        EntityBatchResult next = await DispatchAsync(new ChatClientAgent(cold, name: "agent"), seed.EntityState, "new",
-            mailbox: false, configureOptions: configure, requestText: new string('x', 1_048_576 + 1_024));
-        Assert.Null(Result(next).FailureDetails);
-        DurableAgentState retained = ReadState(next);
-        Assert.True(DurableAgentStateRetention.GetSerializedSize(retained) > 1_048_576);
-        Assert.Null(retained.Data.Truncation);
-        Assert.Equal(4, retained.Data.ConversationHistory.Count);
-        Assert.Equal(2, retained.Data.CompletionReceipts!.Count);
-        Assert.Equal(1, cold.Count);
+        Assert.Null(failure);
+        Assert.Equal(2, callbacks);
+        DurableAgentDeploymentMode expected = test.Code == 1 || test.Value is not null
+            ? DurableAgentDeploymentMode.SchemaV2 : DurableAgentDeploymentMode.Legacy;
+        Assert.Equal(expected, captured!.DeploymentMode);
+        Environment.SetEnvironmentVariable(ModeEnvironment, "invalid-after-capture");
+        services.ConfigureDurableAgents(_ => { });
+        Assert.Equal(expected, captured.DeploymentMode);
+    }
+
+    [Fact]
+    public void PublicOptionsAndSampleConfigurationKeepTheirContracts()
+    {
+        Assert.Equal(["Legacy", "SchemaV2"], Enum.GetNames<DurableAgentDeploymentMode>());
+        Assert.Equal([0, 1], Enum.GetValues<DurableAgentDeploymentMode>().Select(mode => (int)mode));
+        DurableAgentsOptions options = new();
+        Assert.Equal(DurableAgentDeploymentMode.Legacy, options.DeploymentMode);
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.DeploymentMode = (DurableAgentDeploymentMode)42);
+        HistoryRetentionDemo.ConfigureRetention(options);
+        Assert.Equal(DurableAgentDeploymentMode.SchemaV2, options.DeploymentMode);
+        Assert.Equal(32 * 1024, options.GetRetentionSettings().MaxStateBytes);
+        int callbacks = 0;
+        Assert.Throws<InvalidOperationException>(() => new ServiceCollection().ConfigureDurableAgents(config =>
+        {
+            config.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+            config.AddAIAgentFactory("never", _ => throw new InvalidOperationException("Factory must not run."));
+        }, workerBuilder: _ => callbacks++, clientBuilder: _ => callbacks++));
+        Assert.Equal(0, callbacks);
     }
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task SwitchingRetentionKeepsIsolatedCanonicalWriterAuthorityAsync(bool firstAuto)
+    public async Task RetentionPreservesReceiptsAcrossColdDuplicatesExpiryAndRollbackAsync(bool auto)
     {
-        EntityBatchResult seed = await DispatchAsync(new ChatClientAgent(new ProbeClient(), name: "agent"), null, "old",
-            mailbox: false, configureOptions: options => ConfigureIsolated(options, firstAuto));
-        ProbeClient cold = new();
-        EntityBatchResult next = await DispatchAsync(new ChatClientAgent(cold, name: "agent"), seed.EntityState, "new",
-            mailbox: false, configureOptions: options => ConfigureIsolated(options, !firstAuto));
-        Assert.Null(Result(next).FailureDetails);
-        Assert.Equal(DurableAgentState.RevisedSchemaVersion, ReadState(next).SchemaVersion);
-        Assert.Equal(2, ReadState(next).Data.CompletionReceipts!.Count);
-        Assert.Equal(1, cold.Count);
+        Client client = new();
+        EntityBatchResult legacy = await DispatchAsync(Agent(client), null, schema: false);
+        Assert.Equal("1.2.0", State(legacy).SchemaVersion);
+        Assert.Null(State(legacy).Data.CompletionReceipts);
+        string? json = null;
+        for (int turn = 1; turn <= HistoryRetentionDemo.ScenarioTurns; turn++)
+        {
+            EntityBatchResult run = await DispatchAsync(Agent(client), json, $"turn-{turn}", auto,
+                text: turn == 1 ? "MARKER-" + new string('x', 4_096) : new string('x', 4_096),
+                configure: options =>
+                {
+                    if (auto)
+                    {
+                        HistoryRetentionDemo.ConfigureRetention(options);
+                    }
+                    else
+                    {
+                        options.MaxStateBytes = 1;
+                        options.HistoryRetentionHighWatermark = .2;
+                        options.HistoryRetentionLowWatermark = .9;
+                    }
+                });
+            Assert.Null(Result(run).FailureDetails);
+            json = run.EntityState;
+        }
+        DurableAgentState state = StateJson(json);
+        Assert.Equal("2.0.0", state.SchemaVersion);
+        Assert.Equal(7, state.Data.CompletionReceipts!.Count);
+        Assert.Equal(auto, state.Data.Truncation is not null);
+        Assert.Null(state.Data.ExpirationTimeUtc);
+        Client cold = new();
+        EntityBatchResult duplicate = await DispatchAsync(Agent(cold), " \n" + json, "turn-1", schema: false);
+        Assert.Null(Result(duplicate).FailureDetails);
+        Assert.Equal(" \n" + json, duplicate.EntityState);
+        EntityBatchResult denied = await DispatchAsync(Agent(cold), json, "new", schema: false);
+        Assert.Equal(typeof(InvalidOperationException).FullName, Result(denied).FailureDetails!.ErrorType);
+        Assert.Equal(json, denied.EntityState);
+        Assert.Equal(0, cold.Calls);
+        EntityBatchResult next = await DispatchAsync(Agent(cold), json, "diagnostic", auto);
+        Assert.DoesNotContain(cold.Messages, message => auto && message.Text?.Contains("MARKER-", StringComparison.Ordinal) is true);
+        EntityBatchResult cleanup = await DispatchAsync(Agent(cold), next.EntityState, auto: auto,
+            operation: nameof(AgentEntity.CheckAndExpireResults), now: s_now.AddMinutes(2));
+        Assert.Empty(State(cleanup).Data.TerminalResults!);
+        int calls = cold.Calls;
+        EntityBatchResult expired = await DispatchAsync(Agent(cold), cleanup.EntityState, "turn-1", auto, now: s_now.AddMinutes(2));
+        Assert.Equal(typeof(DurableAgentResultUnavailableException).FullName, Result(expired).FailureDetails!.ErrorType);
+        Assert.Equal(cleanup.EntityState, expired.EntityState);
+        Assert.Equal(calls, cold.Calls);
+    }
+
+    [Theory]
+    [InlineData("1.0.0")]
+    [InlineData("1.1.0")]
+    [InlineData("1.2.0")]
+    public async Task LegacyCleanupCannotAuthorizeEmptyExpiredOrUsedStateAsync(string version)
+    {
+        string raw = $$$""" {"schemaVersion":"{{{version}}}","data":{"conversationHistory":[],"expirationTimeUtc":"2020-01-01T00:00:00Z"}} """;
+        Client client = new();
+        foreach (string cleanup in new[] { nameof(AgentEntity.CheckAndDeleteIfExpired), nameof(AgentEntity.CheckAndExpireResults) })
+        {
+            EntityBatchResult batch = await DispatchAsync(Agent(client), raw, operations:
+            [
+                Request(cleanup), Request(nameof(AgentEntity.Run), "work"),
+            ]);
+            Assert.Equal(raw, batch.EntityState);
+            Assert.Null(batch.Results![0].FailureDetails);
+            Assert.NotNull(batch.Results[1].FailureDetails);
+            Assert.Empty(batch.Actions!);
+            EntityBatchResult fresh = await DispatchAsync(Agent(client), null, operations:
+            [
+                Request(cleanup), Request(nameof(AgentEntity.Run), "work"),
+            ]);
+            Assert.Null(fresh.Results![1].FailureDetails);
+            Assert.Single(State(fresh).Data.CompletionReceipts!);
+        }
+        DurableAgentState used = new() { SchemaVersion = version };
+        used.Data.ConversationHistory.Add(DurableAgentStateResponse.FromResponse("old", new AgentResponse([new ChatMessage(ChatRole.Assistant, "old")])));
+        string original = s_converter.Serialize(used);
+        int calls = client.Calls;
+        EntityBatchResult rejected = await DispatchAsync(Agent(client), original, "old");
+        Assert.NotNull(Result(rejected).FailureDetails);
+        Assert.Equal(original, rejected.EntityState);
+        Assert.Equal(calls, client.Calls);
     }
 
     [Theory]
@@ -361,661 +216,280 @@ public sealed partial class AgentEntityPublicRetentionTests
     [InlineData(true, "external")]
     [InlineData(false, "service")]
     [InlineData(true, "service")]
-    public async Task PublicIsolatedPoliciesWriteSameMailboxAndRestoreFixedOwnersAsync(bool auto, string owner)
+    public async Task OwnersRestoreWithoutMirroringOrFallbackAsync(bool auto, string owner)
     {
-        ProbeProvider provider = new();
-        ProbeClient client = new() { ResponseConversationId = owner == "service" ? "remote-conversation" : null };
-        ChatClientAgent agent = owner == "external" ? CreateAgent(client, provider) : new(client, name: "agent");
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-        EntityBatchResult seed = await DispatchAsync(agent, null, "old", mailbox: false, configureOptions: configure);
+        Provider? provider = owner == "external" ? new() : null;
+        Client client = new() { Conversation = owner == "service" ? "remote" : null };
+        EntityBatchResult seed = await DispatchAsync(Agent(client, provider), null, "old", auto);
         Assert.Null(Result(seed).FailureDetails);
-        DurableAgentState state = ReadState(seed);
-        Assert.Equal(DurableAgentState.RevisedSchemaVersion, state.SchemaVersion);
-        Assert.Single(state.Data.CompletionReceipts!);
-        Assert.Null(state.Data.ExpirationTimeUtc);
-        Assert.Null(state.Data.Truncation);
         if (owner != "entity")
         {
-            Assert.Empty(state.Data.ConversationHistory);
+            Assert.Empty(State(seed).Data.ConversationHistory);
         }
-
-        ProbeClient coldClient = new() { ResponseConversationId = owner == "service" ? "remote-conversation" : null };
-        ProbeProvider coldProvider = new();
-        ChatClientAgent cold = owner == "external" ? CreateAgent(coldClient, coldProvider) : new(coldClient, name: "agent");
-        EntityBatchResult duplicate = await DispatchAsync(cold, seed.EntityState, "old", mailbox: false,
-            emptyInput: true, configureOptions: configure);
-        Assert.Null(Result(duplicate).FailureDetails);
-        Assert.Equal(0, coldClient.Count);
-        Assert.Equal(0, coldProvider.LoadCount);
-        Assert.Equal(seed.EntityState, duplicate.EntityState);
-        EntityBatchResult next = await DispatchAsync(cold, duplicate.EntityState, "next", mailbox: false,
-            configureOptions: configure);
-        Assert.Null(Result(next).FailureDetails);
-        Assert.Equal(2, ReadState(next).Data.CompletionReceipts!.Count);
-        Assert.Equal(1, coldClient.Count);
-        if (owner == "external")
-        {
-            Assert.Equal(1, coldProvider.RestoredVersion);
-            Assert.Empty(ReadState(next).Data.ConversationHistory);
-        }
+        Client cold = new() { Conversation = client.Conversation };
+        Provider? restored = provider is null ? null : new();
         if (owner == "service")
         {
-            Assert.Single(coldClient.LastMessages);
-            Assert.Empty(ReadState(next).Data.ConversationHistory);
+            EntityBatchResult failed = await DispatchAsync(Agent(new Client { Fail = true }), seed.EntityState, "next", auto);
+            Assert.Equal(typeof(IOException).FullName, Result(failed).FailureDetails!.ErrorType);
+            Assert.Equal(seed.EntityState, failed.EntityState);
+            Assert.Empty(failed.Actions!);
         }
+        EntityBatchResult next = await DispatchAsync(Agent(cold, restored), seed.EntityState, "next", auto);
+        Assert.Null(Result(next).FailureDetails);
+        Assert.Equal(1, cold.Calls);
+        Assert.Equal(owner == "entity" ? 3 : 1, cold.Messages.Count);
+        if (restored is not null)
+        {
+            Assert.Equal(1, restored.Restored);
+            EntityBatchResult mismatch = await DispatchAsync(Agent(cold, restored), next.EntityState, "retry", auto, key: "wrong");
+            Assert.NotNull(Result(mismatch).FailureDetails);
+            Assert.Equal(next.EntityState, mismatch.EntityState);
+            Assert.Equal(1, cold.Calls);
+            EntityBatchResult retry = await DispatchAsync(Agent(cold, new Provider()), mismatch.EntityState, "retry", auto);
+            Assert.Null(Result(retry).FailureDetails);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, "load")]
+    [InlineData(true, "load")]
+    [InlineData(false, "lazy")]
+    [InlineData(true, "lazy")]
+    [InlineData(false, "store")]
+    [InlineData(true, "store")]
+    public async Task CallbackFailuresRollBackLocallyButColdRetriesCanRepeatEffectsAsync(bool auto, string phase)
+    {
+        EntityBatchResult seed = await DispatchAsync(Agent(new Client(), new Provider()), null, "seed", auto);
+        foreach (string? original in new[] { null, seed.EntityState })
+        {
+            int effects = 0;
+            AIFunction tool = AIFunctionFactory.Create(() =>
+            {
+                effects++;
+                return DurableAgentContext.Current.ScheduleNewOrchestration("effect");
+            }, name: "effect");
+            Client client = new() { Tool = phase == "store" };
+            Provider provider = new() { Failure = phase };
+            ChatClientAgent agent = Agent(client, provider, tool);
+            EntityBatchResult failed = await DispatchAsync(agent, original, "attempt", auto);
+            Assert.NotNull(Result(failed).FailureDetails);
+            Assert.Equal(original, failed.EntityState);
+            Assert.Empty(failed.Actions!);
+            Assert.Same(provider, agent.ChatHistoryProvider);
+            Assert.Equal(phase == "store" ? 2 : 0, client.Calls);
+            Assert.Equal(phase == "store" ? 1 : 0, effects);
+            Assert.Equal(phase == "store" ? 1 : 0, provider.Writes);
+            Provider retryProvider = new();
+            Client cold = new() { Tool = phase == "store" };
+            EntityBatchResult retry = await DispatchAsync(Agent(cold, retryProvider, tool), failed.EntityState, "attempt", auto);
+            Assert.Null(Result(retry).FailureDetails);
+            Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome, State(retry).Data.CompletionReceipts!["attempt"].Outcome);
+            if (phase == "store")
+            {
+                Assert.Contains(retry.Actions!, action => action is StartNewOrchestrationOperationAction);
+            }
+            Assert.Equal(original is null ? null : 1, retryProvider.Restored);
+            Assert.Equal(phase == "store" ? 2 : 0, effects);
+            int calls = cold.Calls;
+            EntityBatchResult duplicate = await DispatchAsync(Agent(cold, retryProvider, tool), retry.EntityState, "attempt", auto);
+            Assert.Null(Result(duplicate).FailureDetails);
+            Assert.Equal(retry.EntityState, duplicate.EntityState);
+            Assert.Equal(calls, cold.Calls);
+        }
+    }
+
+    [Fact]
+    public async Task OwnerShapeValidationHappensBeforeExecutionEffectsAsync()
+    {
+        Client client = new();
+        ChatClientAgent agent = new(client, new ChatClientAgentOptions
+        {
+            Name = "agent",
+            ChatHistoryProvider = new InMemoryChatHistoryProvider(new InMemoryChatHistoryProviderOptions
+            {
+                ProvideOutputMessageFilter = messages => messages,
+            }),
+        });
+        EntityBatchResult rejected = await DispatchAsync(agent, null);
+        Assert.NotNull(Result(rejected).FailureDetails);
+        Assert.Null(rejected.EntityState);
+        Assert.Empty(rejected.Actions!);
+        Assert.Equal(0, client.Calls);
     }
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task PublicIsolatedExternalStoreFailureRollsBackAndColdRetryRepeatsModelAsync(bool auto)
+    public async Task ProtectedCapacityAndSdkCommitFailureDoNotPublishPartialStateAsync(bool afterModel)
     {
-        ProbeProvider provider = new();
-        ProbeClient client = new();
-        ChatClientAgent agent = CreateAgent(client, provider);
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-        EntityBatchResult seed = await DispatchAsync(agent, null, "old", mailbox: false, configureOptions: configure);
-        provider.Stage = "storeAfter";
-        provider.Failure = new IOException(PrivateMarker);
-        EntityBatchResult failed = await DispatchAsync(agent, seed.EntityState, "failed", mailbox: false,
-            configureOptions: configure);
-        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
+        Client client = new() { Response = afterModel ? new string('x', 6_000) : "answer" };
+        EntityBatchResult capacity = await DispatchAsync(Agent(client), null, auto: true,
+            text: afterModel ? "request" : new string('x', 6_000), configure: options => options.MaxStateBytes = afterModel ? 2_000 : 500);
+        Assert.NotNull(Result(capacity).FailureDetails);
+        Assert.Null(capacity.EntityState);
+        Assert.Empty(capacity.Actions!);
+        Assert.Equal(afterModel ? 1 : 0, client.Calls);
+        EntityBatchResult seed = await DispatchAsync(Agent(new Client()), null, "seed");
+        EntityBatchResult failed = await DispatchAsync(Agent(new Client()), seed.EntityState, "new", failCommit: true);
+        Assert.NotNull(failed.FailureDetails ?? Result(failed).FailureDetails);
         Assert.Equal(seed.EntityState, failed.EntityState);
-        Assert.Empty(Actions(failed));
-        DurableAgentState state = ReadState(failed);
-        Assert.False(state.Data.CompletionReceipts!.ContainsKey("failed"));
-        Assert.False(state.Data.TerminalResults!.ContainsKey("failed"));
-        Assert.Equal(ReadState(seed).Data.Session!.Value.GetRawText(), state.Data.Session!.Value.GetRawText());
-        Assert.Empty(state.Data.ConversationHistory);
-        Assert.DoesNotContain(PrivateMarker, failed.EntityState, StringComparison.Ordinal);
-        Assert.Equal(2, client.Count);
-        Assert.Equal(2, provider.StoreCount);
-        ProbeClient retryClient = new();
-        ProbeProvider retryProvider = new();
-        EntityBatchResult retry = await DispatchAsync(CreateAgent(retryClient, retryProvider), failed.EntityState, "failed", mailbox: false,
-            configureOptions: configure);
-        Assert.Null(Result(retry).FailureDetails);
-        Assert.Equal(1, retryClient.Count);
-        Assert.Equal(1, retryProvider.RestoredVersion);
-        Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome, ReadState(retry).Data.CompletionReceipts!["failed"].Outcome);
-        EntityBatchResult duplicate = await DispatchAsync(CreateAgent(retryClient, retryProvider), retry.EntityState, "failed", mailbox: false,
-            configureOptions: configure);
-        Assert.Null(Result(duplicate).FailureDetails);
-        Assert.Equal(1, retryClient.Count);
-        Assert.Equal(1, retryProvider.StoreCount);
-        Assert.Equal(retry.EntityState, duplicate.EntityState);
+        Assert.Empty(failed.Actions!);
+        Assert.False(State(failed).Data.CompletionReceipts!.ContainsKey("new"));
     }
 
-    [Theory]
-    [InlineData(false, "1.0.0")]
-    [InlineData(true, "1.0.0")]
-    [InlineData(false, "1.1.0")]
-    [InlineData(true, "1.1.0")]
-    [InlineData(false, "1.2.0")]
-    [InlineData(true, "1.2.0")]
-    public async Task IsolatedPoliciesPreserveEmptyLegacyAcrossExpiredCleanupAndFollowingRunAsync(bool auto, string version)
+    [Fact]
+    public async Task SharedOptionChangesCannotChangeTheCurrentOperationPolicyAsync()
     {
-        string original = $$$""" {"schemaVersion":"{{{version}}}", "data":{"conversationHistory":[], "expirationTimeUtc":"2020-01-01T00:00:00Z"}} """;
-        ProbeClient client = new();
-        ProbeProvider provider = new();
-        ChatClientAgent agent = CreateAgent(client, provider);
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-        EntityBatchResult direct = await DispatchAsync(agent, original, "old", mailbox: false, configureOptions: configure);
-        Assert.Equal(typeof(DurableAgentStateCorruptionException).FullName, Failure(direct).ErrorType);
-        foreach (string operation in new[] { nameof(AgentEntity.CheckAndDeleteIfExpired), nameof(AgentEntity.CheckAndExpireResults) })
+        DurableAgentsOptions? options = null;
+        Client client = new()
         {
-            EntityBatchResult cleanup = await DispatchAsync(agent, original, "unused", mailbox: false,
-                operationName: operation, configureOptions: configure);
-            Assert.Null(Result(cleanup).FailureDetails);
-            Assert.Equal(original, cleanup.EntityState);
-            Assert.Empty(Actions(cleanup));
-            EntityBatchResult following = await DispatchAsync(agent, cleanup.EntityState, "old", mailbox: false,
-                configureOptions: configure);
-            Assert.Equal(typeof(DurableAgentStateCorruptionException).FullName, Failure(following).ErrorType);
-            Assert.Equal(original, following.EntityState);
-            Assert.Empty(Actions(following));
+            BeforeCall = () =>
+        {
+            options!.DeploymentMode = DurableAgentDeploymentMode.Legacy;
+            options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+            options.MaxStateBytes = 1;
         }
-        Assert.Equal(0, client.Count);
-        Assert.Equal(0, provider.LoadCount);
-        Assert.Equal(0, provider.StoreCount);
-    }
-
-    [Fact]
-    public async Task LegacyRollbackReadsSchema2WithoutWriteBackAndRejectsNewWorkAsync()
-    {
-        EntityBatchResult seed = await DispatchAsync(new ChatClientAgent(new ProbeClient(), name: "agent"), null, "old",
-            mailbox: false, configureOptions: options => ConfigureIsolated(options, auto: false));
-        string raw = " \n" + seed.EntityState + "\n ";
-        ProbeClient client = new();
-        ChatClientAgent agent = new(client, name: "agent");
-        EntityBatchResult duplicate = await DispatchAsync(agent, raw, "old", mailbox: false, emptyInput: true);
-        Assert.Null(Result(duplicate).FailureDetails);
-        Assert.Equal(raw, duplicate.EntityState);
-        Assert.Empty(Actions(duplicate));
-        EntityBatchResult next = await DispatchAsync(agent, raw, "new", mailbox: false);
-        Assert.Equal(typeof(InvalidOperationException).FullName, Failure(next).ErrorType);
-        Assert.Contains("DurableAgentsOptions.DeploymentMode", Failure(next).ErrorMessage, StringComparison.Ordinal);
-        Assert.Contains("DurableAgentDeploymentMode.SchemaV2", Failure(next).ErrorMessage, StringComparison.Ordinal);
-        Assert.Contains("DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2", Failure(next).ErrorMessage, StringComparison.Ordinal);
-        Assert.Equal(raw, next.EntityState);
-        Assert.Empty(Actions(next));
-        Assert.Equal(0, client.Count);
-    }
-
-    [Fact]
-    public async Task UnacknowledgedAutoFailsBeforeSdkInitializationOrCallbacksAsync()
-    {
-        ProbeClient client = new();
-        ProbeProvider provider = new();
-        EntityBatchResult rejected = await DispatchAsync(CreateAgent(client, provider), null, "new", mailbox: false,
-            configureOptions: options =>
-            {
-                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-                options.MaxStateBytes = 32 * 1024;
-            });
-        Assert.Equal(typeof(InvalidOperationException).FullName, Failure(rejected).ErrorType);
-        Assert.Null(rejected.EntityState);
-        Assert.Empty(Actions(rejected));
-        Assert.Equal(0, client.Count);
-        Assert.Equal(0, provider.LoadCount);
-        Assert.Equal(0, provider.StoreCount);
-    }
-
-    [Fact]
-    public async Task PublicAutoEvictsRealSdkStateAndColdModelInputWithoutInternalAuthorizationAsync()
-    {
-        const string Marker = "ORIGINAL-PUBLIC-MARKER";
-        ProbeClient client = new();
-        string? state = null;
-        for (int turn = 1; turn <= HistoryRetentionDemo.ScenarioTurns; turn++)
-        {
-            EntityBatchResult batch = await DispatchAsync(
-                new ChatClientAgent(client, name: "agent"),
-                state,
-                $"turn-{turn}",
-                mailbox: false,
-                configureOptions: HistoryRetentionDemo.ConfigureRetention,
-                requestText: turn == 1
-                    ? HistoryRetentionDemo.CreateFirstNote("sample", Marker, new string('a', HistoryRetentionDemo.NotesPerTurn))
-                    : HistoryRetentionDemo.CreateLaterNote("sample", turn, new string('b', HistoryRetentionDemo.NotesPerTurn)));
-            Assert.Null(batch.FailureDetails);
-            Assert.Null(Result(batch).FailureDetails);
-            Assert.True(DurableAgentStateRetention.GetSerializedSize(ReadState(batch)) < HistoryRetentionDemo.HighWatermarkBytes);
-            state = batch.EntityState;
-        }
-
-        DurableAgentState committed = Assert.IsType<DurableAgentState>(
-            s_converter.Deserialize(state, typeof(DurableAgentState)));
-        Assert.Equal(DurableAgentState.RevisedSchemaVersion, committed.SchemaVersion);
-        Assert.NotNull(committed.Data.Truncation);
-        Assert.True(committed.Data.Truncation.EvictedMessageCount.GetInt64() > 0);
-        Assert.DoesNotContain(committed.Data.ConversationHistory, entry => entry.CorrelationId == "turn-1");
-        Assert.Equal(HistoryRetentionDemo.ScenarioTurns, committed.Data.CompletionReceipts!.Count);
-        Assert.Equal(HistoryRetentionDemo.ScenarioTurns, committed.Data.TerminalResults!.Count);
-        Assert.Null(committed.Data.ExpirationTimeUtc);
-
-        ProbeClient coldClient = new();
-        EntityBatchResult duplicate = await DispatchAsync(
-            new ChatClientAgent(coldClient, name: "agent"), state, "turn-1",
-            mailbox: false, emptyInput: true, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        Assert.Null(Result(duplicate).FailureDetails);
-        Assert.Equal("response", Assert.IsType<AgentResponse>(
-            s_converter.Deserialize(Result(duplicate).Result, typeof(AgentResponse))).Text);
-        Assert.Equal(0, coldClient.Count);
-
-        EntityBatchResult next = await DispatchAsync(
-            new ChatClientAgent(coldClient, name: "agent"), duplicate.EntityState, "diagnostic",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention,
-            requestText: HistoryRetentionDemo.DiagnosticQuestion);
-        Assert.Null(Result(next).FailureDetails);
-        Assert.Equal(1, coldClient.Count);
-        Assert.DoesNotContain(coldClient.LastMessages, message => message.Text?.Contains(Marker, StringComparison.Ordinal) is true);
-        Assert.Equal(HistoryRetentionDemo.ScenarioTurns + 1, ReadState(next).Data.CompletionReceipts!.Count);
-    }
-
-    [Theory]
-    [InlineData("1.0.0")]
-    [InlineData("1.1.0")]
-    [InlineData("1.2.0")]
-    public async Task DefaultPublicConfigurationKeepsLegacyWriterAcrossSkippedVersionsAsync(string version)
-    {
-        DurableAgentState legacy = new()
-        {
-            SchemaVersion = version,
-            Data = new()
-            {
-                ExtensionData = new Dictionary<string, JsonElement>
-                {
-                    ["preserved"] = JsonSerializer.SerializeToElement(new { value = false }),
-                },
-            },
         };
-        ProbeClient client = new();
-        EntityBatchResult batch = await DispatchAsync(
-            new ChatClientAgent(client, name: "agent"), s_converter.Serialize(legacy), "new", mailbox: false);
-
-        Assert.Null(Result(batch).FailureDetails);
-        DurableAgentState written = ReadState(batch);
-        Assert.Equal(DurableAgentState.CurrentSchemaVersion, written.SchemaVersion);
-        Assert.Null(written.Data.CompletionReceipts);
-        Assert.Null(written.Data.TerminalResults);
-        Assert.False(written.Data.ExtensionData!["preserved"].GetProperty("value").GetBoolean());
-        Assert.Equal(1, client.Count);
+        EntityBatchResult run = await DispatchAsync(Agent(client), null, configure: value => options = value);
+        Assert.Null(Result(run).FailureDetails);
+        Assert.Equal("2.0.0", State(run).SchemaVersion);
+        Assert.Single(State(run).Data.CompletionReceipts!);
     }
 
-    [Theory]
-    [InlineData("empty")]
-    [InlineData("used")]
-    [InlineData("truncated")]
-    [InlineData("compacted")]
-    [InlineData("session")]
-    [InlineData("opaque")]
-    public async Task PublicAutoNeverCertifiesPersistedLegacyStateFromItsAppearanceAsync(string kind)
-    {
-        DurableAgentState legacy = new();
-        if (kind == "used")
+    private static ChatClientAgent Agent(Client client, Provider? provider = null, AIFunction? tool = null) =>
+        new(client, new ChatClientAgentOptions
         {
-            legacy.Data.ConversationHistory.Add(DurableAgentStateResponse.FromResponse(
-                "old", new AgentResponse([new ChatMessage(ChatRole.Assistant, "original result")])));
-        }
-        if (kind == "truncated")
+            Name = "agent",
+            ChatHistoryProvider = provider,
+            ChatOptions = new ChatOptions { Tools = tool is null ? null : [tool] },
+        });
+
+    private static async Task<EntityBatchResult> DispatchAsync(AIAgent agent, string? json, string id = "work",
+        bool auto = false, bool schema = true, string text = "request", string operation = nameof(AgentEntity.Run),
+        DateTimeOffset? now = null, Action<DurableAgentsOptions>? configure = null,
+        List<OperationRequest>? operations = null, bool failCommit = false, string key = "history.v1")
+    {
+        DurableAgentsOptions options = new()
         {
-            legacy.Data.Truncation = new()
-            {
-                EvictedMessageCount = JsonSerializer.SerializeToElement(1),
-                FirstEvictedAt = s_now,
-                LastEvictedAt = s_now,
-            };
-        }
-        if (kind == "compacted")
-        {
-            legacy.Data.ConversationHistory.Add(new DurableAgentStateCompaction());
-        }
-        if (kind == "session")
-        {
-            legacy.Data.Session = JsonSerializer.SerializeToElement(new { stateBag = new { continuation = "original" } });
-        }
-        if (kind == "opaque")
-        {
-            legacy.UnknownProperties = new Dictionary<string, JsonElement>
-            {
-                ["priorState"] = JsonSerializer.SerializeToElement(new { complete = false }),
-            };
-        }
-        string original = s_converter.Serialize(legacy);
-        ProbeClient client = new();
-
-        EntityBatchResult rejected = await DispatchAsync(
-            new ChatClientAgent(client, name: "agent"), original, kind == "used" ? "old" : "new",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-
-        Assert.Equal(typeof(DurableAgentStateCorruptionException).FullName, Failure(rejected).ErrorType);
-        Assert.Equal(original, rejected.EntityState);
-        Assert.Empty(Actions(rejected));
-        Assert.Equal(0, client.Count);
-    }
-
-    [Fact]
-    public async Task PublicAutoResultsExpireWithoutReopeningColdCorrelationAsync()
-    {
-        EntityBatchResult seed = await DispatchAsync(
-            new ChatClientAgent(new ProbeClient(), name: "agent"), null, "old",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        EntityBatchResult cleaned = await DispatchAsync(
-            new ChatClientAgent(new ProbeClient(), name: "agent"), seed.EntityState, "unused",
-            mailbox: false, operationName: nameof(AgentEntity.CheckAndExpireResults),
-            now: s_now.AddMinutes(2), configureOptions: HistoryRetentionDemo.ConfigureRetention);
-
-        Assert.Null(Result(cleaned).FailureDetails);
-        DurableAgentState state = ReadState(cleaned);
-        Assert.Empty(state.Data.TerminalResults!);
-        Assert.Equal(DurableAgentStateCompletionReceipt.UnavailableResult, state.Data.CompletionReceipts!["old"].ResultState);
-        ProbeClient coldClient = new();
-        EntityBatchResult duplicate = await DispatchAsync(
-            new ChatClientAgent(coldClient, name: "agent"), cleaned.EntityState, "old",
-            mailbox: false, now: s_now.AddMinutes(2), configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        Assert.Equal(typeof(DurableAgentResultUnavailableException).FullName, Failure(duplicate).ErrorType);
-        Assert.Equal(cleaned.EntityState, duplicate.EntityState);
-        Assert.Equal(0, coldClient.Count);
-    }
-
-    [Theory]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), "1.0.0", false)]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), "1.1.0", false)]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), "1.2.0", false)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), "1.0.0", false)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), "1.1.0", false)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), "1.2.0", false)]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), "1.0.0", true)]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), "1.1.0", true)]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), "1.2.0", true)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), "1.0.0", true)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), "1.1.0", true)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), "1.2.0", true)]
-    public async Task PublicAutoCleanupPreservesPersistedEmptyLegacyAndCannotAuthorizeFollowingRunAsync(
-        string operationName, string version, bool auto)
-    {
-        string original = $$$"""{"schemaVersion":"{{{version}}}","data":{"conversationHistory":[]}}""";
-        const string Correlation = "unproven-old-correlation";
-        ProbeClient client = new();
-        ProbeProvider provider = new();
-        ChatClientAgent agent = CreateAgent(client, provider);
-        void configure(DurableAgentsOptions options) => ConfigureIsolated(options, auto);
-
-        EntityBatchResult direct = await DispatchAsync(
-            agent, original, Correlation, mailbox: false, configureOptions: configure);
-        Assert.Equal(typeof(DurableAgentStateCorruptionException).FullName, Failure(direct).ErrorType);
-        Assert.Equal(original, direct.EntityState);
-        Assert.Empty(Actions(direct));
-
-        EntityBatchResult cleanup = await DispatchAsync(
-            agent, original, Correlation, mailbox: false, operationName: operationName,
-            configureOptions: configure);
-        Assert.Null(Result(cleanup).FailureDetails);
-        Assert.Equal(original, cleanup.EntityState);
-        Assert.Empty(Actions(cleanup));
-        Assert.Null(ReadState(cleanup).Data.CompletionReceipts);
-
-        EntityBatchResult following = await DispatchAsync(
-            agent, cleanup.EntityState, Correlation, mailbox: false,
-            configureOptions: configure);
-        Assert.Equal(typeof(DurableAgentStateCorruptionException).FullName, Failure(following).ErrorType);
-        Assert.Equal(original, following.EntityState);
-        Assert.Empty(Actions(following));
-        Assert.Null(ReadState(following).Data.CompletionReceipts);
-
-        string noncanonical = " \n" + original.Replace("\":", "\" : ", StringComparison.Ordinal) + "\n ";
-        EntityBatchResult batched = await DispatchAsync(
-            agent, noncanonical, Correlation, mailbox: false,
-            configureOptions: configure,
-            operations:
-            [
-                new OperationRequest { Id = Guid.NewGuid(), Operation = operationName },
-                new OperationRequest
-                {
-                    Id = Guid.NewGuid(),
-                    Operation = nameof(AgentEntity.Run),
-                    Input = s_converter.Serialize(new RunRequest("request") { CorrelationId = Correlation }),
-                },
-            ]);
-        List<OperationResult> results = Assert.IsType<List<OperationResult>>(batched.Results);
-        Assert.Equal(2, results.Count);
-        Assert.Null(results[0].FailureDetails);
-        Assert.Equal(typeof(DurableAgentStateCorruptionException).FullName, results[1].FailureDetails?.ErrorType);
-        Assert.Equal(noncanonical, batched.EntityState);
-        Assert.Empty(Actions(batched));
-        Assert.Null(ReadState(batched).Data.CompletionReceipts);
-        Assert.Equal(0, client.Count);
-        Assert.Equal(0, provider.LoadCount);
-        Assert.Equal(0, provider.StoreCount);
-    }
-
-    [Theory]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), false, false)]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), false, true)]
-    [InlineData(nameof(AgentEntity.CheckAndExpireResults), true, true)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), false, false)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), false, true)]
-    [InlineData(nameof(AgentEntity.CheckAndDeleteIfExpired), true, true)]
-    public async Task MissingCleanupLeavesNoGhostAndFollowingSdkBatchRunOwnsItsGenerationAsync(
-        string operationName, bool auto, bool isolated)
-    {
-        ProbeClient client = new();
-        ChatClientAgent agent = new(client, name: "agent");
-        Action<DurableAgentsOptions>? configure = isolated ? options => ConfigureIsolated(options, auto) : null;
-        EntityBatchResult missing = await DispatchAsync(
-            agent, null, "fresh", mailbox: false, operationName: operationName, configureOptions: configure);
-        Assert.Null(Result(missing).FailureDetails);
-        Assert.Null(missing.EntityState);
-        Assert.Empty(Actions(missing));
-        Assert.Equal(0, client.Count);
-
-        EntityBatchResult batch = await DispatchAsync(
-            agent, null, "fresh", mailbox: false, configureOptions: configure,
-            operations:
-            [
-                new OperationRequest { Id = Guid.NewGuid(), Operation = operationName },
-                new OperationRequest
-                {
-                    Id = Guid.NewGuid(),
-                    Operation = nameof(AgentEntity.Run),
-                    Input = s_converter.Serialize(new RunRequest("request") { CorrelationId = "fresh" }),
-                },
-                new OperationRequest { Id = Guid.NewGuid(), Operation = operationName },
-            ]);
-        Assert.Null(batch.FailureDetails);
-        List<OperationResult> results = Assert.IsType<List<OperationResult>>(batch.Results);
-        Assert.Equal(3, results.Count);
-        Assert.All(results, result => Assert.Null(result.FailureDetails));
-        DurableAgentState committed = ReadState(batch);
-        Assert.Equal(isolated ? DurableAgentState.RevisedSchemaVersion : DurableAgentState.CurrentSchemaVersion,
-            committed.SchemaVersion);
-        Assert.Equal(1, client.Count);
-        if (isolated)
-        {
-            Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome,
-                committed.Data.CompletionReceipts!["fresh"].Outcome);
-        }
-        else
-        {
-            Assert.Null(committed.Data.CompletionReceipts);
-            Assert.NotEmpty(committed.Data.ConversationHistory);
-        }
-    }
-
-    [Theory]
-    [InlineData("1.0.0")]
-    [InlineData("1.1.0")]
-    [InlineData("1.2.0")]
-    public async Task KeepAllSdkCleanupStillDeletesExpiredLegacyGenerationAsync(string version)
-    {
-        DurableAgentState legacy = new() { SchemaVersion = version };
-        legacy.Data.ExpirationTimeUtc = s_now.AddMinutes(-1).UtcDateTime;
-        ProbeClient client = new();
-        ProbeProvider provider = new();
-        EntityBatchResult expired = await DispatchAsync(
-            CreateAgent(client, provider), s_converter.Serialize(legacy), "unused", mailbox: false,
-            operationName: nameof(AgentEntity.CheckAndDeleteIfExpired),
-            configureOptions: options => options.DefaultTimeToLive = TimeSpan.FromMinutes(5));
-
-        Assert.Null(Result(expired).FailureDetails);
-        Assert.Null(expired.EntityState);
-        Assert.Empty(Actions(expired));
-        Assert.Equal(0, client.Count);
-        Assert.Equal(0, provider.LoadCount);
-        Assert.Equal(0, provider.StoreCount);
-    }
-
-    [Fact]
-    public async Task TurningAutoOffPreservesReadOnlyDuplicatesButRejectsNewSchema2WorkAsync()
-    {
-        EntityBatchResult seed = await DispatchAsync(
-            new ChatClientAgent(new ProbeClient(), name: "agent"), null, "old",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        ProbeClient client = new();
-        ChatClientAgent agent = new(client, name: "agent");
-        EntityBatchResult duplicate = await DispatchAsync(agent, seed.EntityState, "old", mailbox: false);
-        Assert.Null(Result(duplicate).FailureDetails);
-        Assert.Equal(seed.EntityState, duplicate.EntityState);
-
-        EntityBatchResult rejected = await DispatchAsync(agent, duplicate.EntityState, "new", mailbox: false);
-        Assert.Equal(typeof(InvalidOperationException).FullName, Failure(rejected).ErrorType);
-        Assert.Equal(seed.EntityState, rejected.EntityState);
-        Assert.Empty(Actions(rejected));
-        Assert.Equal(0, client.Count);
-    }
-
-    [Fact]
-    public async Task PublicAutoProtectedFloorRejectsBeforeInvocationAndSdkOutboxCommitAsync()
-    {
-        ProbeClient client = new();
-        EntityBatchResult rejected = await DispatchAsync(
-            new ChatClientAgent(client, name: "agent"), null, "new",
-            mailbox: false, requestText: new string('x', 2_000),
-            configureOptions: options =>
-            {
-                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
-                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-                options.MaxStateBytes = 500;
-            });
-
-        Assert.Equal(typeof(DurableAgentStateSizeLimitExceededException).FullName, Failure(rejected).ErrorType);
-        Assert.Null(rejected.EntityState);
-        Assert.Empty(Actions(rejected));
-        Assert.Equal(0, client.Count);
-    }
-
-    [Theory]
-    [InlineData("response")]
-    [InlineData("state")]
-    [InlineData("afterSuccessfulDispatch")]
-    public async Task PublicAutoSdkCommitFailureRollsBackStateAndSignalsAsync(string boundary)
-    {
-        EntityBatchResult seed = await DispatchAsync(
-            new ChatClientAgent(new ProbeClient(), name: "agent"), null, "old",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        ProbeClient client = new();
-        EntityBatchResult rejected = await DispatchAsync(
-            new ChatClientAgent(client, name: "agent"), seed.EntityState, "new",
-            mailbox: false, failBoundary: boundary, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-
-        Assert.NotNull(Result(rejected).FailureDetails ?? rejected.FailureDetails);
-        Assert.Equal(seed.EntityState, rejected.EntityState);
-        Assert.Empty(Actions(rejected));
-        Assert.Equal(1, client.Count);
-        Assert.False(ReadState(rejected).Data.CompletionReceipts!.ContainsKey("new"));
-    }
-
-    [Fact]
-    public async Task PublicAutoExternalOwnerPreservesStoreAndFailureContinuationAsync()
-    {
-        ProbeProvider provider = new();
-        ProbeClient client = new();
-        EntityBatchResult seed = await DispatchAsync(
-            CreateAgent(client, provider), null, "old",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        DurableAgentState original = ReadState(seed);
-        Assert.Empty(original.Data.ConversationHistory);
-        provider.Stage = "storeAfter";
-        provider.Failure = new IOException(PrivateMarker);
-
-        EntityBatchResult failed = await DispatchAsync(
-            CreateAgent(client, provider), seed.EntityState, "failed",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        Assert.Equal(typeof(IOException).FullName, Failure(failed).ErrorType);
-        Assert.Equal(seed.EntityState, failed.EntityState);
-        Assert.Empty(Actions(failed));
-        DurableAgentState written = ReadState(failed);
-        Assert.Empty(written.Data.ConversationHistory);
-        Assert.Equal(original.Data.Session!.Value.GetRawText(), written.Data.Session!.Value.GetRawText());
-        Assert.Equal(original.Data.HistoryBinding.GetRawText(), written.Data.HistoryBinding.GetRawText());
-        Assert.False(written.Data.CompletionReceipts!.ContainsKey("failed"));
-        Assert.False(written.Data.TerminalResults!.ContainsKey("failed"));
-        Assert.Equal(2, provider.StoreCount);
-        Assert.DoesNotContain(PrivateMarker, failed.EntityState, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public async Task PublicAutoServiceOwnerRestoresOnlyRemoteContinuationAsync()
-    {
-        ProbeClient firstClient = new() { ResponseConversationId = "service-conversation" };
-        EntityBatchResult seed = await DispatchAsync(
-            new ChatClientAgent(firstClient, name: "agent"), null, "old",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        Assert.Empty(ReadState(seed).Data.ConversationHistory);
-        Assert.Equal("service-conversation", ReadState(seed).Data.Session!.Value.GetProperty("conversationId").GetString());
-
-        ProbeClient coldClient = new() { ResponseConversationId = "service-conversation" };
-        EntityBatchResult next = await DispatchAsync(
-            new ChatClientAgent(coldClient, name: "agent"), seed.EntityState, "new",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        Assert.Null(Result(next).FailureDetails);
-        Assert.Single(coldClient.LastMessages);
-        Assert.Empty(ReadState(next).Data.ConversationHistory);
-        Assert.Equal(2, ReadState(next).Data.CompletionReceipts!.Count);
-    }
-
-    [Fact]
-    public async Task PublicAutoProtectsOpaqueExternalStateInsteadOfDeletingProviderEvidenceAsync()
-    {
-        EntityBatchResult seed = await DispatchAsync(
-            CreateAgent(new ProbeClient(), new ProbeProvider()), null, "old",
-            mailbox: false, configureOptions: HistoryRetentionDemo.ConfigureRetention);
-        DurableAgentState existing = ReadState(seed);
-        existing.UnknownProperties = new Dictionary<string, JsonElement>
-        {
-            ["opaqueProtectedMetadata"] = JsonSerializer.SerializeToElement(new string('x', 5_000)),
+            DeploymentMode = schema ? DurableAgentDeploymentMode.SchemaV2 : DurableAgentDeploymentMode.Legacy,
+            HistoryRetentionMode = auto ? DurableAgentHistoryRetentionMode.Auto : DurableAgentHistoryRetentionMode.KeepAll,
+            ResultRetentionPeriod = TimeSpan.FromMinutes(1),
         };
-        string original = s_converter.Serialize(existing);
-        ProbeClient client = new();
-        ProbeProvider provider = new();
-        EntityBatchResult rejected = await DispatchAsync(
-            CreateAgent(client, provider), original, "new", mailbox: false,
-            configureOptions: options =>
-            {
-                options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;
-                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
-                options.MaxStateBytes = 2_000;
-            });
-
-        Assert.Equal(typeof(DurableAgentStateSizeLimitExceededException).FullName, Failure(rejected).ErrorType);
-        Assert.Equal(original, rejected.EntityState);
-        Assert.Empty(Actions(rejected));
-        Assert.Equal(0, client.Count);
-        Assert.Equal(0, provider.LoadCount);
-        Assert.Equal(0, provider.StoreCount);
-    }
-
-    [Fact]
-    public async Task PublicAutoDoesNotApplyLegacyDefaultIdleDeletionAsync()
-    {
-        EntityBatchResult seed = await DispatchAsync(
-            new ChatClientAgent(new ProbeClient(), name: "agent"), null, "old", mailbox: false,
-            configureOptions: options =>
-            {
-                HistoryRetentionDemo.ConfigureRetention(options);
-                options.DefaultTimeToLive = TimeSpan.FromDays(14);
-            });
-        Assert.Null(ReadState(seed).Data.ExpirationTimeUtc);
-        Assert.Single(ReadState(seed).Data.CompletionReceipts!);
-    }
-
-    private sealed class FailAfterPublicDispatch(ITaskEntity inner, string correlationId) : ITaskEntity
-    {
-        public async ValueTask<object?> RunAsync(TaskEntityOperation operation)
+        configure?.Invoke(options);
+        options.AddAIAgent(agent, timeToLive: null, configureHistory: history => history.ProviderKey = new(key));
+        using ServiceProvider services = new ServiceCollection()
+            .AddSingleton(options)
+            .AddSingleton(options.GetAgentFactories())
+            .AddSingleton(new Mock<DurableTaskClient>("test").Object)
+            .AddSingleton<ILoggerFactory>(NullLoggerFactory.Instance)
+            .AddSingleton<TimeProvider>(new Clock(now ?? s_now))
+            .AddSingleton(Mock.Of<IHostApplicationLifetime>())
+            .BuildServiceProvider();
+        DurableTaskShimFactory factory = new(
+            new DurableTaskWorkerOptions { DataConverter = new CommitConverter(failCommit) }, NullLoggerFactory.Instance);
+        var shim = factory.CreateEntity(new(s_id.Name), new AgentEntity(services), s_id);
+        return await shim.ExecuteOperationBatchAsync(new EntityBatchRequest
         {
-            _ = await inner.RunAsync(operation);
-            DurableAgentState staged = Assert.IsType<DurableAgentState>(
-                operation.State.GetState(typeof(DurableAgentState)));
-            Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome,
-                staged.Data.CompletionReceipts![correlationId].Outcome);
-            throw new CommitFailureException();
+            InstanceId = s_id.ToString(),
+            EntityState = json,
+            Operations = operations ?? [Request(operation, id, text)],
+        });
+    }
+
+    private static OperationRequest Request(string operation, string id = "work", string text = "request") =>
+        new()
+        {
+            Id = Guid.NewGuid(),
+            Operation = operation,
+            Input = operation == nameof(AgentEntity.Run) ? s_converter.Serialize(new RunRequest(text) { CorrelationId = id }) : null,
+        };
+    private static OperationResult Result(EntityBatchResult batch) => Assert.Single(batch.Results!);
+    private static DurableAgentState State(EntityBatchResult batch) => StateJson(batch.EntityState);
+    private static DurableAgentState StateJson(string? json) =>
+        Assert.IsType<DurableAgentState>(s_converter.Deserialize(json, typeof(DurableAgentState)));
+
+    private sealed record ConfigurationCase(int? Code, string? Value, bool Auto, bool Valid);
+    private sealed class Clock(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+    }
+    private sealed class CommitConverter(bool fail) : DataConverter
+    {
+        public override object? Deserialize(string? data, Type targetType) => s_converter.Deserialize(data, targetType);
+        [return: NotNullIfNotNull(nameof(value))]
+        public override string? Serialize(object? value) =>
+            fail && value is DurableAgentState ? throw new InvalidOperationException("commit failed") : s_converter.Serialize(value);
+    }
+
+    private sealed class Provider : ChatHistoryProvider
+    {
+        public override IReadOnlyList<string> StateKeys => ["continuation"];
+        public string? Failure { get; init; }
+        public int? Restored { get; private set; }
+        public int Writes { get; private set; }
+        protected override ValueTask<IEnumerable<ChatMessage>> ProvideChatHistoryAsync(
+            InvokingContext context, CancellationToken cancellationToken = default)
+        {
+            if (context.Session!.StateBag.TryGetValue("continuation", out string? version))
+            {
+                this.Restored = version == "1" ? 1 : null;
+            }
+            if (this.Failure == "load")
+            {
+                throw new IOException("load failed");
+            }
+            return new(this.Load());
+        }
+        private IEnumerable<ChatMessage> Load()
+        {
+            if (this.Failure == "lazy")
+            {
+                throw new IOException("enumeration failed");
+            }
+            yield break;
+        }
+        protected override ValueTask StoreChatHistoryAsync(InvokedContext context, CancellationToken cancellationToken = default)
+        {
+            this.Writes++;
+            context.Session!.StateBag.SetValue("continuation", "1");
+            if (this.Failure == "store")
+            {
+                context.Session.StateBag.SetValue("continuation", "999");
+                throw new IOException("store failed after remote write");
+            }
+            return default;
         }
     }
 
-    private sealed class ProbeGenericAgent : AIAgent
+    private sealed class Client : IChatClient
     {
-        public override string Name => "agent";
-        public List<ChatMessage> LastMessages { get; private set; } = [];
-        protected override ValueTask<AgentSession> CreateSessionCoreAsync(CancellationToken cancellationToken = default) =>
-            new(new ProbeSession());
-        protected override ValueTask<JsonElement> SerializeSessionCoreAsync(AgentSession session,
-            JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) =>
-            new(JsonSerializer.SerializeToElement(new { stateBag = session.StateBag.Serialize() }));
-        protected override ValueTask<AgentSession> DeserializeSessionCoreAsync(JsonElement serializedState,
-            JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) =>
-            new(new ProbeSession());
-        protected override Task<AgentResponse> RunCoreAsync(IEnumerable<ChatMessage> messages,
-            AgentSession? session = null, AgentRunOptions? options = null, CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException();
-        protected override async IAsyncEnumerable<AgentResponseUpdate> RunCoreStreamingAsync(IEnumerable<ChatMessage> messages,
-            AgentSession? session = null, AgentRunOptions? options = null,
+        public int Calls { get; private set; }
+        public List<ChatMessage> Messages { get; private set; } = [];
+        public string? Conversation { get; init; }
+        public string Response { get; init; } = "answer";
+        public bool Tool { get; init; }
+        public bool Fail { get; init; }
+        public Action? BeforeCall { get; init; }
+        public void Dispose() { }
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            this.LastMessages = messages.ToList();
+            this.Calls++;
+            this.Messages = messages.ToList();
+            this.BeforeCall?.Invoke();
             await Task.Yield();
-            yield return new AgentResponseUpdate(ChatRole.Assistant, "response");
+            if (this.Fail)
+            {
+                throw new IOException("service acknowledgement failed");
+            }
+            yield return this.Tool && this.Calls == 1
+                ? new ChatResponseUpdate(ChatRole.Assistant, [new FunctionCallContent("call", "effect")])
+                : new ChatResponseUpdate(ChatRole.Assistant, this.Response) { ConversationId = this.Conversation };
         }
-        private sealed class ProbeSession : AgentSession;
     }
 }
