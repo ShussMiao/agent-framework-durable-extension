@@ -6,8 +6,10 @@ namespace Microsoft.Agents.AI.DurableTask;
 /// Configures history persistence for one durable agent registration.
 /// </summary>
 /// <remarks>
-/// These settings participate in the fixed-owner schema 2 profile when automatic history retention
-/// explicitly enables that writer. Default schema 1 operations preserve the pre-profile Agent Framework behavior.
+/// These settings participate in the fixed-owner schema 2 profile when
+/// <see cref="DurableAgentsOptions.DeploymentMode"/> is <see cref="DurableAgentDeploymentMode.IsolatedV2"/>,
+/// independently of whether history retention is KeepAll or Auto.
+/// Default Legacy schema 1 operations preserve the pre-profile Agent Framework behavior.
 /// </remarks>
 public sealed class DurableAgentHistoryOptions
 {

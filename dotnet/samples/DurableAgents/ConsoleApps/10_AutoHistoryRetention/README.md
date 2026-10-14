@@ -151,6 +151,9 @@ without internal switches, reject invalid options before factory/transport callb
 non-default hub selection, and cover bounded agent options, prompt construction,
 the no-wait marker diagnostic, conservative result classification, invalid-marker rejection before
 agent/model calls or output/session mutation, and real OpenTelemetry meter registration/export.
+The offline verifier-manifest regression compiles the actual verifier definitions and checks the
+four documented environment keys, including `DURABLE_AGENTS_DEPLOYMENT_MODE`, without the obsolete
+acknowledgement. It does not run the verifier, sample host, backend or model.
 
 The white-box retention regression lives in the real package unit-test project, which legitimately
 has friend access:

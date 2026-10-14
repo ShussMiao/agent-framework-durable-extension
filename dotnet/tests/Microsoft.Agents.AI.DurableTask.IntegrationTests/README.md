@@ -79,6 +79,7 @@ An executed passing isolated run is mandatory before **either merge or release**
 gated skip is acceptable for **draft readiness only**; do not merge or release this correction until
 the real-backend test passes. Independent review acceptance does not waive this requirement.
 Shared schema/reader/writer/rollback agreement and late-duplicate/deletion policy remain additional
-rollout gates. Public Auto explicitly enables schema-2 writing for new isolated sessions; it does not
+rollout gates. Public IsolatedV2 explicitly enables schema-2 writing for new isolated sessions with
+either KeepAll or Auto retention; retention policy does not activate the writer. IsolatedV2 does not
 certify those gates or authorize legacy conversion. Receipt-deleting entity TTL remains internal
-and disabled. See the [public upgrade/rollback guide](../../../docs/features/durable-agents/automatic-history-retention.md).
+and disabled. See the [public upgrade/rollback guide](../../../docs/features/durable-agents/schema-v2-migration.md).
