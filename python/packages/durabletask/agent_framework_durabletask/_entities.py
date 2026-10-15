@@ -90,6 +90,9 @@ _MIGRATION_BINDING_FIELDS = (
     "destinationSessionId",
     "evidenceId",
     "completionEvidenceId",
+    "mode",
+    "sourceEntitySessionId",
+    "sourceSchema",
 )
 
 try:
@@ -306,7 +309,19 @@ class AgentEntityStateProviderMixin:
                 raise ValueError(message)
         source_session_id = cast(str, migration["sourceSessionId"])
         destination = self.core_session_id
-        if migration["destinationSessionId"] != destination or source_session_id == destination:
+        mode = migration.get("mode", "transfer")
+        if mode not in ("transfer", "in_place"):
+            raise ValueError(message)
+        if mode == "in_place" and (
+            migration.get("sourceEntitySessionId") != destination
+            or migration.get("sourceSchema") not in ("1.0.0", "1.1.0", "1.2.0")
+            or not isinstance(migration.get("requestDigest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", migration["requestDigest"]) is None
+        ):
+            raise ValueError(message)
+        if migration["destinationSessionId"] != destination or (
+            mode == "transfer" and source_session_id == destination
+        ):
             raise ValueError(message)
         # Reset clears the local session, but does not relinquish migration ownership.
         if stored is not None:
@@ -563,13 +578,16 @@ class AgentEntity:
         high_watermark: float = HIGH_WATERMARK,
         low_watermark: float = LOW_WATERMARK,
         response_delivery_window_seconds: int = DELIVERY_WINDOW_SECONDS,
+        prepare_history: bool = True,
     ) -> None:
         validate_retention(retention, high_watermark, low_watermark)
         validate_response_delivery_window(response_delivery_window_seconds)
-        self.agent = ensure_durable_history(agent, prune_excluded=prunes_excluded(retention))
+        self.agent = (
+            ensure_durable_history(agent, prune_excluded=prunes_excluded(retention)) if prepare_history else agent
+        )
         self.callback = callback
         self._state_provider = state_provider
-        self._retention = retention
+        self._retention: RetentionMode = retention
         self._max_state_bytes = resolve_state_budget(max_state_bytes)
         self._high_watermark = high_watermark
         self._low_watermark = low_watermark
