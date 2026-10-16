@@ -11,9 +11,11 @@ import pytest
 from _execution_test_support import JsonStateProvider, RecordingChatClient
 from _history_pipeline_test_support import ToolChatClient
 from _invocation_test_support import lookup
-from agent_framework import Agent, AgentResponse, ContextProvider, Message
+from agent_framework import Agent, AgentResponse, AgentSession, ContextProvider, InMemoryHistoryProvider, Message
 from test_agent_compatibility_prototype import _evidence, _legacy
 from test_complete_compatibility import _continued, _ExternalHistory
+from test_history_success_acceptance import _DropA
+from test_history_success_acceptance import _ExternalHistory as _AcceptingExternalHistory
 
 from agent_framework_durabletask import (
     CompatibleAgentEntity,
@@ -51,6 +53,165 @@ class _RichReplyAgent(Agent):
             return deepcopy(self.response)
 
         return complete()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["entity", "external", "service"])
+@pytest.mark.parametrize("store_inputs", [False, True])
+@pytest.mark.parametrize("identity", ["occurrence", "public", "unkeyed"])
+async def test_legacy_acceptance_follows_primary_owner_after_middleware_on_cold_redelivery(
+    owner: str, store_inputs: bool, identity: str
+) -> None:
+    source = _legacy()
+    provider = JsonStateProvider(source)
+    client = RecordingChatClient(conversation_id="remote")
+    history = (
+        _AcceptingExternalHistory(store_inputs=store_inputs)
+        if owner == "external"
+        else InMemoryHistoryProvider(store_inputs=store_inputs)
+    )
+    first = CompatibleAgentEntity(
+        Agent(client=client, context_providers=[history], middleware=[_DropA()]),
+        state_provider=provider,
+        deployment_mode="legacy",
+    )
+    inputs = [
+        Message("user", [text], message_id=text if identity != "unkeyed" else None).to_dict() for text in ("A", "B")
+    ]
+    options = {"store": owner == "service"}
+    result = await first.run(
+        RunRequest(
+            "",
+            correlation_id="first",
+            context_messages=inputs,
+            context_message_ids=["occurrence-A", "occurrence-B"] if identity == "occurrence" else None,
+            options=options,
+        )
+    )
+    assert not result.additional_properties.get("durable_status")
+    assert "A" not in [message.text for message in client.received_messages[0]]
+    accepted = provider.raw["data"]["extensionData"]["_dafx_legacy_ingestion"]["messages"]
+    assert set(accepted) == ({"occurrence-B"} if identity == "occurrence" else {"B"} if identity == "public" else set())
+    assert [message["contents"][0]["text"] for message in inputs] == ["A", "B"]
+    client = RecordingChatClient(conversation_id="remote")
+    cold = CompatibleAgentEntity(
+        Agent(
+            client=client,
+            context_providers=[
+                _AcceptingExternalHistory(store_inputs=store_inputs)
+                if owner == "external"
+                else InMemoryHistoryProvider(store_inputs=store_inputs)
+            ],
+        ),
+        state_provider=JsonStateProvider(provider.raw),
+        deployment_mode="legacy",
+    )
+    await cold.run(
+        RunRequest(
+            "",
+            correlation_id="redelivery",
+            context_messages=inputs,
+            context_message_ids=["occurrence-A", "occurrence-B"] if identity == "occurrence" else None,
+            options=options,
+        )
+    )
+    assert sum(message.text == "A" for message in client.received_messages[0]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["1.0.0", "1.1.0", "1.2.0"])
+async def test_conversion_never_promotes_middleware_filtered_legacy_acceptance(version: str) -> None:
+    provider = JsonStateProvider(_legacy(version=version))
+    first = CompatibleAgentEntity(
+        Agent(
+            client=RecordingChatClient(),
+            context_providers=[_AcceptingExternalHistory()],
+            middleware=[_DropA()],
+        ),
+        state_provider=provider,
+        deployment_mode="legacy",
+    )
+    inputs = [Message("user", [text], message_id=text).to_dict() for text in ("A", "B")]
+    response = await first.run(
+        RunRequest(
+            "",
+            correlation_id="first",
+            context_messages=inputs,
+            context_message_ids=["occurrence-A", "occurrence-B"],
+        )
+    )
+    completed_at = provider.raw["data"]["conversationHistory"][-1]["createdAt"]
+
+    def evidence(raw: dict[str, Any]) -> LegacyMigrationEvidence:
+        completion = _evidence(raw).completion_evidence
+        assert completion is not None
+        completion["results"].append({
+            "correlationId": "first",
+            "outcome": "succeeded",
+            "completedAt": completed_at,
+            "response": serialize_terminal_response(serialize_agent_response(response)),
+        })
+        return LegacyMigrationEvidence(completion_evidence=completion)
+
+    converted = CompatibleAgentEntity(
+        Agent(client=RecordingChatClient(), context_providers=[_AcceptingExternalHistory()]),
+        state_provider=provider,
+        legacy_migration_evidence=evidence,
+    )
+    await converted.run(RunRequest("convert", correlation_id="convert"))
+    assert provider.raw["schemaVersion"] == "2.0.0"
+    assert set(DurableAgentState.from_dict(provider.raw).data.ingested_messages) == {"occurrence-B"}
+    client = RecordingChatClient()
+    cold = CompatibleAgentEntity(
+        Agent(client=client, context_providers=[_AcceptingExternalHistory()]),
+        state_provider=JsonStateProvider(provider.raw),
+    )
+    await cold.run(
+        RunRequest(
+            "",
+            correlation_id="redelivery",
+            context_messages=inputs,
+            context_message_ids=["occurrence-A", "occurrence-B"],
+        )
+    )
+    assert [message.text for message in client.received_messages[0]] == ["A"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["entity", "external", "service"])
+async def test_legacy_store_only_memory_audit_preserves_prior_and_new_messages(owner: str) -> None:
+    source = _legacy()
+    session = AgentSession(session_id="original-logical-session")
+    session.service_session_id = "remote" if owner == "service" else None
+    session.state["audit"] = {"messages": [Message("user", ["audit-prior"])], "keep": True}
+    source["data"]["session"] = session.to_dict()
+    provider = JsonStateProvider(source)
+    for correlation in ("first", "cold"):
+        history = [_AcceptingExternalHistory()] if owner == "external" else []
+        audit = InMemoryHistoryProvider("audit", load_messages=False)
+        client = RecordingChatClient(conversation_id="remote", response_message_id=f"response-{correlation}")
+        entity = CompatibleAgentEntity(
+            Agent(client=client, context_providers=[*history, audit]),
+            state_provider=provider,
+            deployment_mode="legacy",
+        )
+        result = await entity.run(
+            RunRequest(correlation, correlation_id=correlation, options={"store": owner == "service"})
+        )
+        assert not result.additional_properties.get("durable_status")
+        restored = AgentSession.from_dict(provider.raw["data"]["session"])
+        messages = restored.state["audit"].get("messages", [])
+        assert [message.text for message in messages] == (
+            ["audit-prior", "first", "reply-1"]
+            if correlation == "first"
+            else ["audit-prior", "first", "reply-1", "cold", "reply-1"]
+        )
+        assert restored.state["audit"]["keep"] is True
+        assert "audit-prior" not in [message.text for message in client.received_messages[0]]
+        assert audit.load_messages is False
+        assert all(
+            "messages" not in bag for key, bag in restored.state.items() if key != "audit" and isinstance(bag, dict)
+        )
 
 
 @pytest.mark.asyncio
@@ -327,13 +488,19 @@ class _AfterRunFailure(ContextProvider):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["model", "after-run"])
-async def test_failed_context_acceptance_does_not_replay_staged_request_on_cold_redelivery(phase: str) -> None:
+@pytest.mark.parametrize("owner", ["entity", "external", "service"])
+async def test_failed_context_acceptance_does_not_replay_staged_request_on_cold_redelivery(
+    phase: str, owner: str
+) -> None:
     source = _legacy()
     provider = JsonStateProvider(source)
+    history: list[ContextProvider] = [_AfterRunFailure("audit")] if phase == "after-run" else []
+    if owner == "external":
+        history.append(_AcceptingExternalHistory())
     failing = Agent(
-        client=RecordingChatClient(fail=phase == "model"),
+        client=RecordingChatClient(fail=phase == "model", conversation_id="remote"),
         name="rollback",
-        context_providers=[_AfterRunFailure("audit")] if phase == "after-run" else [],
+        context_providers=history,
     )
     first = CompatibleAgentEntity(failing, state_provider=provider, deployment_mode="legacy")
     failed = await first.run(
@@ -342,9 +509,11 @@ async def test_failed_context_acceptance_does_not_replay_staged_request_on_cold_
             correlation_id="failed",
             context_messages=[_context_extra(1)],
             context_message_ids=["occurrence"],
+            options={"store": owner == "service"},
         )
     )
     assert failed.additional_properties["durable_status"] == "error"
+    assert "_dafx_legacy_ingestion" not in provider.raw["data"]["extensionData"]
     assert not any(
         entry.get("$type") == "request" and entry.get("correlationId") == "failed"
         for entry in provider.raw["data"]["conversationHistory"]

@@ -4,16 +4,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from agent_framework import AgentSession, HistoryProvider, InMemoryHistoryProvider, Message, SupportsAgentRun
 
 from ._history_provider import (
     DurableHistoryProvider,
     _copy_with_history_providers,  # pyright: ignore[reportPrivateUsage]
+    _ObservedHistoryProvider,  # pyright: ignore[reportPrivateUsage]
     ensure_durable_history,
     prepare_history_owner,
     service_stores_history,
@@ -51,7 +53,45 @@ class LegacyHistoryView:
     memory_sources: tuple[str, ...]
 
 
-def prepare_legacy_history(agent: SupportsAgentRun, options: dict[str, Any]) -> LegacyHistoryView:
+class LegacyInputAcceptance:
+    """Observe request-local inputs without binding a v2 state writer to legacy state."""
+
+    def __init__(self, state: DurableAgentState) -> None:
+        self._previous = legacy_ingestion(state) or {}
+        self._scope = uuid4().hex
+        self._accepted: set[int] = set()
+
+    def mark(self, message: Message, index: int) -> None:
+        message._dafx_legacy_input = (self._scope, index)  # type: ignore[attr-defined]
+
+    def accept(self, messages: Sequence[Message]) -> None:
+        for message in messages:
+            marker = getattr(message, "_dafx_legacy_input", None)
+            if isinstance(marker, tuple):
+                values = cast("tuple[Any, ...]", marker)
+                if len(values) == 2 and values[0] == self._scope and type(values[1]) is int:
+                    self._accepted.add(values[1])
+
+    def reconcile(self, state: DurableAgentState, entry: DurableAgentStateRequest) -> None:
+        entry.messages = [message for index, message in enumerate(entry.messages) if index in self._accepted]
+        known = deepcopy(self._previous)
+        for stored in entry.messages:
+            identity, fingerprint = stored.ingestion_occurrence, stored.ingestion_identity
+            if identity is not None and fingerprint is not None:
+                prior = known.get(identity, [])
+                if prior is not None and fingerprint not in prior:
+                    known[identity] = [*prior, fingerprint]
+        profile = _legacy_ingestion_profile(state)
+        if profile is None:
+            raise ValueError("Legacy input acceptance requires a staged ingestion profile.")
+        profile["messages"] = known
+
+
+def prepare_legacy_history(
+    agent: SupportsAgentRun,
+    options: dict[str, Any],
+    accept_inputs: Callable[[Sequence[Message]], None] | None = None,
+) -> LegacyHistoryView:
     """Use exactly one history owner while retaining ordinary audit/context hooks."""
     service = service_stores_history(agent, options)
     providers = getattr(agent, "context_providers", ())
@@ -85,8 +125,10 @@ def prepare_legacy_history(agent: SupportsAgentRun, options: dict[str, Any]) -> 
     if not isinstance(prepared_providers, (list, tuple)):
         return LegacyHistoryView(prepared, owner, "external" if owner == "external" else "entity", None, ())
     updated: list[Any] = []
+    memory: list[str] = []
     for provider in cast("Sequence[Any]", prepared_providers):
         if isinstance(provider, DurableHistoryProvider):
+            memory.append(provider.source_id)
             provider = InMemoryHistoryProvider(
                 source_id=provider.source_id,
                 load_messages=provider.load_messages and not service,
@@ -96,9 +138,15 @@ def prepare_legacy_history(agent: SupportsAgentRun, options: dict[str, Any]) -> 
                 store_context_from=provider.store_context_from,
                 skip_excluded=provider.skip_excluded,
             )
+        if (
+            accept_inputs is not None
+            and not service
+            and isinstance(provider, HistoryProvider)
+            and provider.load_messages
+        ):
+            provider = _ObservedHistoryProvider(provider, accept_inputs)
         updated.append(provider)
     prepared = _copy_with_history_providers(prepared, updated)
-    memory = tuple(p.source_id for p in updated if type(p) is InMemoryHistoryProvider)
     primary_owner: Literal["entity", "external"] = (
         "external"
         if primary is not None
@@ -106,7 +154,7 @@ def prepare_legacy_history(agent: SupportsAgentRun, options: dict[str, Any]) -> 
         and not isinstance(primary, DurableHistoryProvider)
         else "entity"
     )
-    return LegacyHistoryView(prepared, owner, primary_owner, source_id, memory)
+    return LegacyHistoryView(prepared, owner, primary_owner, source_id, tuple(memory))
 
 
 def bind_legacy_owner(state: DurableAgentState, view: LegacyHistoryView) -> None:
@@ -280,6 +328,8 @@ def stage_legacy_request(
         if prior is None or fingerprint in prior:
             continue
         known[identity] = [*prior, fingerprint]
+        stored.ingestion_occurrence = identity
+        stored.ingestion_identity = fingerprint
         kept.append(stored)
     entry.messages = kept
     extensions = state.data.extension_data

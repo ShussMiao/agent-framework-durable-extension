@@ -30,8 +30,9 @@ from ._entities import (
     _validation_diagnostic,  # pyright: ignore[reportPrivateUsage]
 )
 from ._history_provider import ensure_durable_history
-from ._invocation_safety import DurableToolGuard, InvocationProgress
+from ._invocation_safety import DurableServiceClient, DurableToolGuard, InvocationProgress
 from ._legacy_execution import (
+    LegacyInputAcceptance,
     bind_legacy_owner,
     bind_migrated_public_ingestion,
     clear_legacy_deliveries,
@@ -374,7 +375,8 @@ class CompatibleAgentEntity(AgentEntity):
         completed = working.try_get_agent_response(request.correlation_id)
         if completed is not None:
             return completed
-        view = prepare_legacy_history(self._registered_agent, request.options)
+        acceptance = LegacyInputAcceptance(working)
+        view = prepare_legacy_history(self._registered_agent, request.options, acceptance.accept)
         self.agent = view.agent
         original_extensions = deepcopy(working.data.extension_data)
         bind_legacy_owner(working, view)
@@ -410,11 +412,12 @@ class CompatibleAgentEntity(AgentEntity):
             options.setdefault("response_format", request.response_format)
             if not request.enable_tool_calls:
                 self._disable_tool_calls(options)
-            current = [
-                message
-                for stored in entry.messages
-                if (message := self._to_current_message(stored, request)) is not None
-            ]
+            current: list[Message] = []
+            for index, stored in enumerate(entry.messages):
+                message = self._to_current_message(stored, request)
+                if message is not None:
+                    acceptance.mark(message, index)
+                    current.append(message)
             session: Any = None
             create = getattr(self.agent, "create_session", None)
             store = EntitySessionStore(working.data, self._state_provider.core_session_id)
@@ -453,7 +456,12 @@ class CompatibleAgentEntity(AgentEntity):
             if session is not None:
                 kwargs["session"] = session
             progress = InvocationProgress()
-            if isinstance(self.agent, Agent):
+            middleware_agent = self.agent
+            if isinstance(middleware_agent, Agent):
+                if view.owner == "service":
+                    invocation_agent = copy(cast(Any, middleware_agent))
+                    invocation_agent.client = DurableServiceClient(invocation_agent.client, acceptance.accept)
+                    self.agent = invocation_agent
                 guard = [DurableToolGuard(progress, enabled=request.enable_tool_calls)]
                 kwargs.update({"middleware": guard, "client_kwargs": {"middleware": guard}})
             try:
@@ -462,6 +470,8 @@ class CompatibleAgentEntity(AgentEntity):
                 )
                 snapshot = serialize_agent_response(response)
                 serialize_terminal_response(snapshot)
+                if request.context_messages is not None:
+                    acceptance.reconcile(working, entry)
                 if session is not None:
                     if view.owner != "service":
                         session.service_session_id = inactive_service_id

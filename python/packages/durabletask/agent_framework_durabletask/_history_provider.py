@@ -14,7 +14,7 @@ import copy
 import json
 import logging
 from collections import deque
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -1123,7 +1123,9 @@ class _ObservedHistoryProvider(HistoryProvider):
     persistence surface only and does not instrument opaque custom hook behavior here.
     """
 
-    def __init__(self, provider: HistoryProvider) -> None:
+    def __init__(
+        self, provider: HistoryProvider, accept_inputs: Callable[[Sequence[Message]], None] | None = None
+    ) -> None:
         super().__init__(
             source_id=provider.source_id,
             load_messages=provider.load_messages,
@@ -1133,6 +1135,7 @@ class _ObservedHistoryProvider(HistoryProvider):
             store_context_from=provider.store_context_from,
         )
         self.__wrapped__ = provider
+        self._accept_inputs = accept_inputs
         if hasattr(provider, "after_run_once_per_turn"):
             self.after_run_once_per_turn = provider.after_run_once_per_turn
 
@@ -1144,9 +1147,16 @@ class _ObservedHistoryProvider(HistoryProvider):
 
     async def save_messages(self, session_id: str | None, messages: Sequence[Message], **kwargs: Any) -> None:
         await self.__wrapped__.save_messages(session_id, messages, **kwargs)
-        binding = current_durable_history_binding()
-        if binding is not None and self.store_inputs:
-            binding.accept(messages)
+        if self.store_inputs:
+            self._accept(messages)
+
+    def _accept(self, messages: Sequence[Message]) -> None:
+        if self._accept_inputs is not None:
+            self._accept_inputs(messages)
+        else:
+            binding = current_durable_history_binding()
+            if binding is not None:
+                binding.accept(messages)
 
     async def before_run(self, *, agent: Any, session: Any, context: Any, state: dict[str, Any]) -> None:
         await self.__wrapped__.before_run(agent=agent, session=session, context=context, state=state)
@@ -1169,8 +1179,8 @@ class _ObservedHistoryProvider(HistoryProvider):
         ):
             await super().after_run(agent=agent, session=session, context=context, state=state)
             binding = current_durable_history_binding()
-            if binding is not None and not binding.service_owns_history:
-                binding.accept(context.input_messages)
+            if self._accept_inputs is not None or (binding is not None and not binding.service_owns_history):
+                self._accept(context.input_messages)
         else:
             await after_run(agent=agent, session=session, context=context, state=state)
 
