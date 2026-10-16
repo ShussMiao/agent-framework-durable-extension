@@ -125,6 +125,8 @@ extension records bridge-era acceptances; `_dafx_legacy_owner` binds the selecte
 The ingestion profile's v2 form stores historical public lookups in `publicMessages`, separate
 from accepted occurrences in `messages`. Its v1 form remains readable without activating unknown
 siblings. Public lookups are consulted only when explicit occurrence IDs are absent.
+Promotion to the v2 ingestion profile rejects an existing opaque v1 `publicMessages` sibling
+before execution rather than overwriting it.
 Existing nonempty scalar cursors require trusted delivery evidence before accepting new context
 when no bridge ledger exists. Failed runs do not advance that ledger. Conversion merges its
 acceptances into v2. Remote provider/model/tool effects remain at-least-once: a local state rollback
@@ -149,6 +151,8 @@ Fingerprints use the original input identity, including message extras, rather t
 projection that may omit them.
 Validated delivery-only evidence is carried into legacy fallback even without scalar cursors or
 when bridge receipts already exist. Its public lookups never consume an explicit delivery occurrence.
+Successful ordinary turns retain supplied delivery evidence even when `context_messages` is omitted.
+History substitution preserves configured `after_run_once_per_turn` metadata and Core's iteration cadence.
 Session-capable custom agents without a context pipeline receive prior history directly rather than
 relying on a nonexistent provider to load it.
 Automatic in-place conversion seeds active occurrence receipts only from the bridge ledger.

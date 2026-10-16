@@ -16,6 +16,7 @@ from agent_framework import (
     AgentMiddleware,
     AgentResponse,
     AgentSession,
+    ChatOptions,
     HistoryProvider,
     InMemoryHistoryProvider,
     Message,
@@ -25,6 +26,7 @@ from test_agent_compatibility_prototype import _legacy
 
 from agent_framework_durabletask import (
     CompatibleAgentEntity,
+    DurableAgentState,
     LegacyMigrationEvidence,
     RunRequest,
     serialize_agent_response,
@@ -296,6 +298,124 @@ async def test_delivery_only_evidence_survives_legacy_fallback(cursor: bool, bri
     assert provider.raw["schemaVersion"] == "1.1.0"
     assert sum(message.text == "recorded-accepted" for message in client.received_messages[0]) == int(explicit)
     assert evidence_calls == [state_snapshot_digest(source)]
+
+
+@pytest.mark.parametrize("empty_context", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_plain_turn_retains_delivery_evidence_for_cold_public_lookup(empty_context: bool, explicit: bool) -> None:
+    accepted = Message("user", ["recorded"], message_id="public").to_dict()
+
+    def evidence(raw: dict[str, Any]) -> LegacyMigrationEvidence:
+        return LegacyMigrationEvidence(
+            delivery_evidence={
+                "sourceDigest": state_snapshot_digest(raw),
+                "evidenceId": "accepted-journal",
+                "complete": True,
+                "messages": [accepted],
+            }
+        )
+
+    provider = JsonStateProvider(_legacy())
+    first = CompatibleAgentEntity(
+        Agent(client=RecordingChatClient()),
+        state_provider=provider,
+        legacy_migration_evidence=evidence,
+    )
+    await first.run(RunRequest("normal", correlation_id="normal", context_messages=[] if empty_context else None))
+    client = RecordingChatClient()
+    cold = CompatibleAgentEntity(
+        Agent(client=client), state_provider=JsonStateProvider(provider.raw), deployment_mode="legacy"
+    )
+    await cold.run(
+        RunRequest(
+            "",
+            correlation_id="cold",
+            context_messages=[accepted],
+            context_message_ids=["public"] if explicit else None,
+        )
+    )
+    assert sum(message.text == "recorded" for message in client.received_messages[0]) == int(explicit)
+
+
+@pytest.mark.parametrize("opaque", [None, {}, 42])
+@pytest.mark.parametrize("empty_context", [False, True])
+async def test_profile_promotion_rejects_opaque_public_lookup_sibling_before_execution(
+    opaque: Any, empty_context: bool
+) -> None:
+    source = _legacy()
+    source["data"]["extensionData"]["_dafx_legacy_ingestion"] = {
+        "profile": "dafx-legacy-ingestion-v1",
+        "messages": {},
+        "publicMessages": opaque,
+    }
+    provider = JsonStateProvider(source)
+    client = RecordingChatClient()
+
+    def evidence(raw: dict[str, Any]) -> LegacyMigrationEvidence:
+        return LegacyMigrationEvidence(
+            delivery_evidence={
+                "sourceDigest": state_snapshot_digest(raw),
+                "evidenceId": "accepted-journal",
+                "complete": True,
+                "messages": [Message("user", ["recorded"], message_id="public").to_dict()],
+            }
+        )
+
+    entity = CompatibleAgentEntity(Agent(client=client), state_provider=provider, legacy_migration_evidence=evidence)
+    with pytest.raises(ValueError, match="publicMessages"):
+        await entity.run(RunRequest("normal", correlation_id="normal", context_messages=[] if empty_context else None))
+    assert provider.raw == source and provider.attempted_writes == 0 and client.received_messages == []
+
+
+async def test_empty_journal_does_not_activate_or_replace_opaque_public_lookup_sibling() -> None:
+    source = _legacy()
+    profile = {"profile": "dafx-legacy-ingestion-v1", "messages": {}, "publicMessages": 42}
+    source["data"]["extensionData"]["_dafx_legacy_ingestion"] = profile
+    provider = JsonStateProvider(source)
+    entity = CompatibleAgentEntity(
+        Agent(client=RecordingChatClient()),
+        state_provider=provider,
+        legacy_migration_evidence=lambda raw: LegacyMigrationEvidence(
+            delivery_evidence={
+                "sourceDigest": state_snapshot_digest(raw),
+                "evidenceId": "empty-journal",
+                "complete": True,
+                "messages": [],
+            }
+        ),
+    )
+    await entity.run(RunRequest("", correlation_id="empty", context_messages=[]))
+    assert provider.raw["data"]["extensionData"]["_dafx_legacy_ingestion"] == profile
+
+
+class _IterationOptions(ChatOptions[None]):
+    _agent_loop_iteration: str
+
+
+@pytest.mark.parametrize("once", [False, True])
+async def test_legacy_replacement_preserves_configured_iteration_persistence_cadence(once: bool) -> None:
+    reference_history = InMemoryHistoryProvider()
+    configured_history = InMemoryHistoryProvider()
+    reference_history.after_run_once_per_turn = once
+    configured_history.after_run_once_per_turn = once
+    reference = Agent(client=RecordingChatClient(), context_providers=[reference_history])
+    session = reference.create_session()
+    await reference.run("iteration", session=session, options=_IterationOptions(_agent_loop_iteration="turn"))
+    expected = session.state[reference_history.source_id].get("messages", [])
+    provider = JsonStateProvider(_legacy(used=False))
+    entity = CompatibleAgentEntity(
+        Agent(client=RecordingChatClient(), context_providers=[configured_history]),
+        state_provider=provider,
+        deployment_mode="legacy",
+    )
+    await entity.run(RunRequest("iteration", correlation_id="iteration", options={"_agent_loop_iteration": "turn"}))
+    actual = [
+        message.to_chat_message().text
+        for entry in DurableAgentState.from_dict(provider.raw).data.conversation_history
+        for message in entry.messages
+    ]
+    assert actual == [message.text for message in expected]
+    assert configured_history.after_run_once_per_turn is once
 
 
 class _SessionAgent:

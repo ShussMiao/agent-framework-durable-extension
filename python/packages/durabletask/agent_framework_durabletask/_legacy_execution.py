@@ -228,6 +228,7 @@ def prepare_legacy_history(
     memory: list[str] = []
     for provider in cast("Sequence[Any]", prepared_providers):
         if isinstance(provider, DurableHistoryProvider):
+            original = provider
             memory.append(provider.source_id)
             provider = InMemoryHistoryProvider(
                 source_id=provider.source_id,
@@ -238,6 +239,8 @@ def prepare_legacy_history(
                 store_context_from=provider.store_context_from,
                 skip_excluded=provider.skip_excluded,
             )
+            if hasattr(original, "after_run_once_per_turn"):
+                provider.after_run_once_per_turn = original.after_run_once_per_turn
         if (
             accept_inputs is not None
             and not service
@@ -402,8 +405,9 @@ def stage_legacy_request(
 ) -> DurableAgentStateRequest:
     """Stage occurrence-aware context without manufacturing scalar cursor provenance."""
     entry = DurableAgentStateRequest.from_run_request(request)
-    if request.context_messages is None:
+    if request.context_messages is None and delivery_evidence is None:
         return entry
+    profile = _legacy_ingestion_profile(state) or {}
     known = legacy_ingestion(state)
     public = legacy_public_ingestion(state)
     positions = state.data.ingested_positions or {}
@@ -421,9 +425,14 @@ def stage_legacy_request(
         public = journal
     elif known is None and positions:
         raise ValueError("Legacy ingestion positions require trusted delivery evidence before context delivery.")
+    if public and profile.get("profile") == "dafx-legacy-ingestion-v1" and "publicMessages" in profile:
+        raise ValueError("Legacy ingestion profile promotion would overwrite opaque publicMessages metadata.")
     known = known or {}
     kept: list[DurableAgentStateMessage] = []
     for index, stored in enumerate(entry.messages):
+        if request.context_messages is None:
+            kept.append(stored)
+            continue
         identity = request.context_message_ids[index] if request.context_message_ids is not None else stored.message_id
         if not identity:
             kept.append(stored)
@@ -443,7 +452,6 @@ def stage_legacy_request(
     if extensions is None:
         extensions = {}
         state.data.extension_data = extensions
-    profile = _legacy_ingestion_profile(state) or {}
     extensions[_LEDGER] = {
         **profile,
         "profile": "dafx-legacy-ingestion-v2" if public else profile.get("profile", "dafx-legacy-ingestion-v1"),
