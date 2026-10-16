@@ -41,19 +41,41 @@ public sealed class AgentEntityPublicRetentionTests
     [InlineData(1, "", true, false)]
     [InlineData(null, "legacy", false, false)]
     [InlineData(null, null, true, false)]
-    public async Task ConfigurationIsValidatedAndCapturedBeforeCallbacksAsync(int? code, string? value, bool auto, bool valid)
+    public Task ConfigurationIsValidatedAndCapturedAtFinalizationAsync(int? code, string? value, bool auto, bool valid) =>
+        RunConfigurationProbeAsync(new(code, value, auto, valid));
+
+    [Theory]
+    [InlineData(1, false, false)]
+    [InlineData(1, true, false)]
+    [InlineData(null, false, false)]
+    [InlineData(null, true, false)]
+    [InlineData(1, false, true)]
+    [InlineData(1, true, true)]
+    [InlineData(null, false, true)]
+    [InlineData(null, true, true)]
+    public Task AdditiveConfigurationFinalizesBothOrdersAsync(int? code, bool reverse, bool split) =>
+        RunConfigurationProbeAsync(new(code, code is null ? "isolated_v2" : null, Auto: true, Valid: true,
+            reverse, split, LateEnvironment: true));
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task InvalidFinalWatermarksFailBeforeRuntimeCreationAsync(bool reverse) =>
+        RunConfigurationProbeAsync(new(1, null, Auto: true, Valid: false, reverse, Split: true));
+
+    private static async Task RunConfigurationProbeAsync(ConfigurationCase test)
     {
         ProcessStartInfo start = new("dotnet") { RedirectStandardOutput = true, RedirectStandardError = true };
         start.ArgumentList.Add(typeof(AgentEntityPublicRetentionTests).Assembly.Location);
         start.ArgumentList.Add("--filter-method");
-        start.ArgumentList.Add("*EnvironmentProbe");
+        start.ArgumentList.Add("*EnvironmentProbeAsync");
         start.ArgumentList.Add("--no-progress");
         start.Environment.Remove(ModeEnvironment);
-        if (value is not null)
+        if (test.Value is not null)
         {
-            start.Environment[ModeEnvironment] = value;
+            start.Environment[ModeEnvironment] = test.Value;
         }
-        start.Environment[ProbeEnvironment] = JsonSerializer.Serialize(new ConfigurationCase(code, value, auto, valid));
+        start.Environment[ProbeEnvironment] = JsonSerializer.Serialize(test);
         using Process child = Process.Start(start)!;
         Task<string> output = child.StandardOutput.ReadToEndAsync();
         Task<string> error = child.StandardError.ReadToEndAsync();
@@ -62,7 +84,7 @@ public sealed class AgentEntityPublicRetentionTests
     }
 
     [Fact]
-    public void EnvironmentProbe()
+    public async Task EnvironmentProbeAsync()
     {
         string? raw = Environment.GetEnvironmentVariable(ProbeEnvironment);
         if (raw is null)
@@ -71,32 +93,102 @@ public sealed class AgentEntityPublicRetentionTests
         }
         ConfigurationCase test = JsonSerializer.Deserialize<ConfigurationCase>(raw)!;
         int callbacks = 0;
-        DurableAgentsOptions? captured = null;
-        ServiceCollection services = new();
-        Exception? failure = Record.Exception(() => services.ConfigureDurableAgents(options =>
+        int workerRegistrations = 0;
+        int clientInitializations = 0;
+        int agentFactories = 0;
+        HostApplicationBuilder builder = Host.CreateApplicationBuilder();
+        builder.Logging.ClearProviders();
+        IServiceCollection services = builder.Services;
+        if (test.LateEnvironment)
         {
-            captured = options;
+            Environment.SetEnvironmentVariable(ModeEnvironment, "invalid-during-registration");
+        }
+        void Deployment(DurableAgentsOptions options)
+        {
             if (test.Code is int code)
             {
                 options.DeploymentMode = (DurableAgentDeploymentMode)code;
             }
+            if (test.Split)
+            {
+                options.HistoryRetentionLowWatermark = test.Valid ? .4 : .8;
+                options.MaxStateBytes = null;
+            }
+        }
+        void Retention(DurableAgentsOptions options)
+        {
             options.HistoryRetentionMode = test.Auto ? DurableAgentHistoryRetentionMode.Auto : DurableAgentHistoryRetentionMode.KeepAll;
-            options.AddAIAgentFactory("agent", _ => throw new InvalidOperationException("Factory must not run."));
-        }, workerBuilder: _ => callbacks++, clientBuilder: _ => callbacks++));
+            if (test.Split)
+            {
+                options.HistoryRetentionHighWatermark = .6;
+            }
+        }
+        services.ConfigureDurableAgents(options =>
+        {
+            if (test.Reverse)
+            {
+                Deployment(options);
+            }
+            else
+            {
+                Retention(options);
+            }
+            options.AddAIAgentFactory("agent", _ =>
+            {
+                agentFactories++;
+                throw new InvalidOperationException("Factory must not run.");
+            });
+        }, workerBuilder: worker =>
+        {
+            callbacks++;
+            worker.AddTasks(_ => workerRegistrations++);
+            worker.UseGrpc();
+        }, clientBuilder: client =>
+        {
+            callbacks++;
+            client.Services.PostConfigure<DurableTaskClientOptions>(_ => clientInitializations++);
+            client.UseGrpc();
+        });
+        services.ConfigureDurableAgents(test.Reverse ? Retention : Deployment);
+        services.ConfigureDurableOptions(_ => { });
+        services.ConfigureDurableWorkflows(_ => { });
+        if (test.LateEnvironment)
+        {
+            Environment.SetEnvironmentVariable(ModeEnvironment, test.Value);
+        }
+        Assert.Equal(2, callbacks);
+        using IHost host = builder.Build();
         if (!test.Valid)
         {
-            Assert.IsType<InvalidOperationException>(failure);
-            Assert.Equal(0, callbacks);
+            Assert.Throws<InvalidOperationException>(() => host.Services.GetRequiredService<DurableAgentsOptions>());
+            Assert.Throws<InvalidOperationException>(() => host.Services.GetDurableAgentProxy("agent"));
+            Assert.Throws<InvalidOperationException>(() => host.Services.GetRequiredService<DurableTaskClient>());
+            Assert.Throws<InvalidOperationException>(() => host.Services.GetRequiredService<IDurableTaskClientProvider>());
+            Assert.Throws<InvalidOperationException>(() => host.Services.GetServices<IHostedService>());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => host.StartAsync(TestContext.Current.CancellationToken));
+            Assert.Equal(0, workerRegistrations);
+            Assert.Equal(0, clientInitializations);
+            Assert.Equal(0, agentFactories);
             return;
         }
-        Assert.Null(failure);
-        Assert.Equal(2, callbacks);
+        DurableAgentsOptions captured = host.Services.GetRequiredService<DurableAgentsOptions>();
         DurableAgentDeploymentMode expected = test.Code == 1 || test.Value is not null
             ? DurableAgentDeploymentMode.SchemaV2 : DurableAgentDeploymentMode.Legacy;
-        Assert.Equal(expected, captured!.DeploymentMode);
-        Environment.SetEnvironmentVariable(ModeEnvironment, "invalid-after-capture");
-        services.ConfigureDurableAgents(_ => { });
         Assert.Equal(expected, captured.DeploymentMode);
+        DurableAgentRetentionSettings policy = captured.GetRetentionSettings();
+        Assert.Equal(test.Auto ? DurableAgentHistoryRetentionMode.Auto : DurableAgentHistoryRetentionMode.KeepAll, policy.Mode);
+        Assert.Equal(test.Auto ? 1_048_576 : null, policy.MaxStateBytes);
+        Assert.Equal(test.Split ? .6 : .85, policy.HighWatermark);
+        Assert.Equal(test.Split ? .4 : .70, policy.LowWatermark);
+        Environment.SetEnvironmentVariable(ModeEnvironment, "invalid-after-capture");
+        Assert.NotNull(host.Services.GetRequiredService<DurableTaskClient>());
+        Assert.NotNull(host.Services.GetRequiredService<IDurableTaskClientProvider>());
+        Assert.NotEmpty(host.Services.GetServices<IHostedService>());
+        Assert.Equal(1, workerRegistrations);
+        Assert.Equal(1, clientInitializations);
+        Assert.Equal(0, agentFactories);
+        Assert.Equal(expected, captured.DeploymentMode);
+        Assert.Equal(policy, captured.GetRetentionSettings());
     }
 
     [Fact]
@@ -111,12 +203,40 @@ public sealed class AgentEntityPublicRetentionTests
         Assert.Equal(DurableAgentDeploymentMode.SchemaV2, options.DeploymentMode);
         Assert.Equal(32 * 1024, options.GetRetentionSettings().MaxStateBytes);
         int callbacks = 0;
-        Assert.Throws<InvalidOperationException>(() => new ServiceCollection().ConfigureDurableAgents(config =>
+        ServiceCollection services = new();
+        services.ConfigureDurableAgents(config =>
         {
             config.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
             config.AddAIAgentFactory("never", _ => throw new InvalidOperationException("Factory must not run."));
-        }, workerBuilder: _ => callbacks++, clientBuilder: _ => callbacks++));
-        Assert.Equal(0, callbacks);
+        }, workerBuilder: _ => callbacks++, clientBuilder: _ => callbacks++);
+        using ServiceProvider provider = services.BuildServiceProvider();
+        Assert.Throws<InvalidOperationException>(() => provider.GetRequiredService<DurableAgentsOptions>());
+        Assert.Equal(2, callbacks);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HostWithoutSdkBuildersValidatesBeforeStartingServicesAsync(bool valid)
+    {
+        HostApplicationBuilder builder = Host.CreateApplicationBuilder();
+        builder.Logging.ClearProviders();
+        builder.Services.ConfigureDurableAgents(options => options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto);
+        if (valid)
+        {
+            builder.Services.ConfigureDurableOptions(options => options.Agents.DeploymentMode = DurableAgentDeploymentMode.SchemaV2);
+        }
+        using IHost host = builder.Build();
+        if (valid)
+        {
+            await host.StartAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(DurableAgentDeploymentMode.SchemaV2, host.Services.GetRequiredService<DurableAgentsOptions>().DeploymentMode);
+            await host.StopAsync(TestContext.Current.CancellationToken);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => host.StartAsync(TestContext.Current.CancellationToken));
+        }
     }
 
     [Theory]
@@ -409,7 +529,8 @@ public sealed class AgentEntityPublicRetentionTests
     private static DurableAgentState StateJson(string? json) =>
         Assert.IsType<DurableAgentState>(s_converter.Deserialize(json, typeof(DurableAgentState)));
 
-    private sealed record ConfigurationCase(int? Code, string? Value, bool Auto, bool Valid);
+    private sealed record ConfigurationCase(int? Code, string? Value, bool Auto, bool Valid,
+        bool Reverse = false, bool Split = false, bool LateEnvironment = false);
     private sealed class Clock(DateTimeOffset now) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => now;

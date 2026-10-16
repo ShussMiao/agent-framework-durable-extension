@@ -8,6 +8,7 @@ using Microsoft.DurableTask.Worker;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.Agents.AI.DurableTask;
 
@@ -102,6 +103,11 @@ public static class ServiceCollectionExtensions
     /// Multiple calls to this method (or to <see cref="ConfigureDurableAgents"/>
     /// and <see cref="ConfigureDurableWorkflows"/>) are supported and configurations are composed additively.
     /// </para>
+    /// <para>
+    /// Configuration delegates run during registration. Complete all registrations before resolving services:
+    /// the completed agent configuration is validated and its deployment environment captured on first options
+    /// resolution or host startup, before the registered SDK worker or client is initialized.
+    /// </para>
     /// </remarks>
     /// <param name="services">The service collection to configure.</param>
     /// <param name="configure">A delegate to configure the durable options for both agents and workflows.</param>
@@ -136,7 +142,6 @@ public static class ServiceCollectionExtensions
 
         // Apply the configuration immediately to capture agent names for keyed service registration
         configure(sharedOptions);
-        sharedOptions.Agents.ValidateConfiguration();
 
         // Register keyed services for any new agents
         RegisterAgentKeyedServices(services, sharedOptions);
@@ -171,7 +176,11 @@ public static class ServiceCollectionExtensions
             // Only add if not already registered (to support multiple Configure* calls)
             if (!services.Any(d => d.ServiceType == typeof(AIAgent) && d.IsKeyedService && Equals(d.ServiceKey, factory.Key)))
             {
-                services.AddKeyedSingleton(factory.Key, (sp, _) => factory.Value(sp).AsDurableAgentProxy(sp));
+                services.AddKeyedSingleton(factory.Key, (sp, _) =>
+                {
+                    sp.GetRequiredService<DurableAgentsOptions>();
+                    return factory.Value(sp).AsDurableAgentProxy(sp);
+                });
             }
         }
     }
@@ -201,6 +210,10 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<DurableServicesMarker>();
 
+        services.AddOptions<DurableAgentsOptions>().ValidateOnStart();
+        services.TryAddSingleton<IOptionsFactory<DurableAgentsOptions>>(
+            sp => new DurableAgentsOptionsFactory(sp.GetRequiredService<DurableOptions>().Agents));
+
         services.TryAddSingleton<DurableWorkflowRunner>();
 
         // Register workflow and agent services
@@ -211,7 +224,7 @@ public static class ServiceCollectionExtensions
             sp => sp.GetRequiredService<DurableOptions>().Agents.GetAgentFactories());
 
         // Register DurableAgentsOptions resolver
-        services.TryAddSingleton(sp => sp.GetRequiredService<DurableOptions>().Agents);
+        services.TryAddSingleton(sp => sp.GetRequiredService<IOptions<DurableAgentsOptions>>().Value);
     }
 
     /// <summary>
@@ -235,6 +248,9 @@ public static class ServiceCollectionExtensions
         // The options object is populated by all Configure* calls before the worker starts.
         services.AddDurableTaskWorker(builder =>
         {
+            // The SDK resolves the registry before constructing the worker, not just before starting it.
+            services.AddOptions<DurableTaskRegistry>(builder.Name)
+                .Configure<DurableAgentsOptions>((_, _) => { });
             workerBuilder(builder);
 
             builder.AddTasks(registry => RegisterTasksFromOptions(registry, sharedOptions));
@@ -257,7 +273,13 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<DurableTaskClientMarker>();
 
-        services.AddDurableTaskClient(clientBuilder);
+        services.AddDurableTaskClient(builder =>
+        {
+            // SDK transport options inherit these base options before initializing the client.
+            services.AddOptions<DurableTaskClientOptions>(builder.Name)
+                .Configure<DurableAgentsOptions>((_, _) => { });
+            clientBuilder(builder);
+        });
         services.TryAddSingleton<IWorkflowClient, DurableWorkflowClient>();
         services.TryAddSingleton<IDurableAgentClient, DefaultDurableAgentClient>();
     }
@@ -389,6 +411,16 @@ public static class ServiceCollectionExtensions
     private sealed record WorkflowRegistrationInfo(string OrchestrationName, List<ActivityRegistrationInfo> Activities);
 
     private sealed record ActivityRegistrationInfo(string ActivityName, ExecutorBinding Binding);
+
+    // DurableAgentsOptions has an internal constructor and must use the instance shared by all callbacks.
+    private sealed class DurableAgentsOptionsFactory(DurableAgentsOptions options) : IOptionsFactory<DurableAgentsOptions>
+    {
+        public DurableAgentsOptions Create(string name)
+        {
+            options.ValidateConfiguration();
+            return options;
+        }
+    }
 
     /// <summary>
     /// Validates that an agent with the specified name has been registered.
