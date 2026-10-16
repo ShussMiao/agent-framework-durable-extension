@@ -66,8 +66,7 @@ rather than being silently reinterpreted. Automatic retention uses the same exac
 checks the cumulative increment and rejects overflow before committing any staged deletion or other working-state
 change. Opaque JSON and unknown metadata retain their existing exact preservation behavior.
 
-Mailbox lookup, delivery, and guarded entity-local commit behavior are implemented. Session ownership,
-replay filtering, transcript compaction, and provider behavior remain deferred to later stack layers.
+Mailbox lookup, delivery, and guarded entity-local commit behavior are implemented. Session ownership and provider restoration are runtime responsibilities rather than DTO behavior; see the [durable agent state architecture](../../../../docs/features/durable-agents/durable-state-architecture.md). Public `Auto` retention prunes eligible entity transcript, not external provider history.
 
 Version-aware validation is symmetric: historical 1.x free-form roles, string function-call `arguments`, and
 URI content without `mediaType` remain readable and writable, while schema 2 applies its closed role set and
@@ -98,8 +97,7 @@ unchanged through the independent working clone. This layer never selects a prov
 
 The shared DTOs retain their schema contract. Delivery lookup and polling use the same resolver for both
 layouts. `ResultRetentionPeriod` defaults to the portable 60-second delivery window and accepts another
-positive duration or `null` for no payload expiry; expiry never removes the completion receipt. Binding
-selection/enforcement and transcript retention are not implemented by this layer.
+positive duration or `null` for no payload expiry; expiry never removes the completion receipt. The runtime enforces history ownership and applies configured transcript retention separately from these shared DTOs.
 With the mailbox writer explicitly enabled, successful new runs and the scheduled/explicit
 `CheckAndExpireResults` entity operation durably remove due `terminalResults` entries and transition
 their existing receipts to `unavailable`. The operation uses an independent state copy and commits its
@@ -148,11 +146,8 @@ With the schema-2 writer enabled, one successful durable entity operation atomic
 terminal result and receipt together with that operation's session continuation, ingestion bookkeeping,
 entity-local transcript, whole-entity TTL, optional binding, and other local control state. External provider
 writes and tool side effects are outside that entity-local transaction. A failed outer invocation or durable
-commit does not establish a new completion receipt. External history-provider callback exceptions roll back local state without creating a failed receipt ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)); see [Make retries safe in your application](../../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application). A separate internal, default-off
-finalization capability requires a certified adapter to explicitly attest accepted input, provider phase, and
-non-retryable/exhausted finality; the resulting session must serialize and the failed result, receipt, session,
-and accepted request evidence must pass the normal commit path. No generic exception/message/status inference
-is permitted. Legacy conversion uses only retained authoritative
+commit does not establish a new completion receipt. Unrecovered external load/store callback failures propagate without creating a framework failed result or receipt, rolling back local working state and staged outgoing signals to the last committed continuation ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)). A load failure before model execution leaves those model/tool calls unstarted; a store failure afterward can follow effects that do not roll back. Retrying the same uncommitted correlation may execute again under either `KeepAll` or `Auto`; there is no automatic-retry or remote-rollback guarantee. See [Make retries safe in your application](../../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application) for result-ledger, duplicate-safe write, and reconciliation guidance.
+Legacy conversion uses only retained authoritative
 terminal evidence, never calls the model/tools, and cannot invent receipts for already-evicted results.
 Previously persisted legacy state stays legacy unless independently authorized as complete history;
 retained transcript alone does not establish that authorization. Known truncation/compaction prevents

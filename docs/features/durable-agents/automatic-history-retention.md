@@ -24,6 +24,8 @@ services.ConfigureDurableAgents(options =>
 
 You can also enable Schema v2 via the environment variable `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2` instead of setting `options.DeploymentMode` in code.
 
+Configuration callbacks run immediately and compose across registrations; complete all registrations before resolving services or starting the host. Completed settings and the deployment environment are validated and captured at first options finalization, before normal SDK worker/client initialization or registered agent factories run. See [C# registration and validation timing](schema-v2-migration.md#c-registration-and-validation-timing).
+
 ## How budgeting and pruning work
 
 - **Whole-entity byte budget:** `Auto` measures the full serialized entity state (UTF-8 JSON storage envelope), not token count.
@@ -52,4 +54,4 @@ You can also enable Schema v2 via the environment variable `DURABLE_AGENTS_DEPLO
 
 ## External history providers and retry safety
 
-External `ChatHistoryProvider` callbacks and tool calls run outside the durable entity transaction. If an external load or store callback throws an exception, the entity rolls back local state changes without creating a completion receipt, so a retry may execute the turn again ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)). See [Make retries safe in your application](schema-v2-migration.md#make-retries-safe-in-your-application) in the migration guide for idempotency-key patterns.
+External `ChatHistoryProvider` callbacks, model calls, and tools run outside the durable entity transaction. Under both `KeepAll` and `Auto`, an unrecovered external load/store callback failure propagates without creating a framework failed result or receipt; local working state and staged outgoing signals roll back, but remote effects do not ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)). A load failure before model execution leaves those model/tool calls unstarted. A store failure after execution may follow model/tool effects or a successful remote write, so retrying the same uncommitted correlation may execute again. See [Make retries safe in your application](schema-v2-migration.md#make-retries-safe-in-your-application) for result ledgers, duplicate-safe history writes, and reconciliation guidance.

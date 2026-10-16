@@ -41,6 +41,8 @@ For a comprehensive tour of all the functionality, concepts, and APIs, check out
 
 `DurableAgentsOptions.DeploymentMode` selects the state schema for new sessions: `Legacy` (Schema `1.2.0`) is the default, and `SchemaV2` (`options.DeploymentMode = DurableAgentDeploymentMode.SchemaV2;` or `DURABLE_AGENTS_DEPLOYMENT_MODE=isolated_v2`) enables Schema `2.0.0` with either `KeepAll` or `Auto` history retention. `Auto` defaults to a 1 MiB (`1,048,576` bytes) state budget and `0.85`/`0.70` watermarks; under `KeepAll`, budget and watermark settings are ignored. See [Automatic history retention in .NET](../../../docs/features/durable-agents/automatic-history-retention.md), the [Schema v2 migration guide](../../../docs/features/durable-agents/schema-v2-migration.md), and [Sample 10](../../samples/DurableAgents/ConsoleApps/10_AutoHistoryRetention/README.md).
 
+Configuration callbacks execute immediately and compose across `ConfigureDurableAgents`, `ConfigureDurableOptions`, and `ConfigureDurableWorkflows`. Complete all registrations before resolving services or starting the host. Composite validation and the deployment environment snapshot occur when completed agent options are first finalized through dependency injection, normal SDK options dependencies, or host startup, before normal SDK worker/client initialization or registered agent factories run. See [C# registration and validation timing](../../../docs/features/durable-agents/schema-v2-migration.md#c-registration-and-validation-timing) for order-independent configuration and immediate property checks.
+
 An invocation correlation ID is an idempotency key, not a transcript position. Do not reuse it for
 different work. Legacy state resolves terminal responses and errors from the retained transcript.
 Schema 2.0 resolves only the result mailbox and permanent completion receipts: pruning the transcript
@@ -81,15 +83,10 @@ own idempotency guarantees.
 
 Only a successfully committed outer invocation creates a new success receipt. Validation failures,
 cancellation, ordinary model/provider errors, serialization/capacity failures, and failed entity commits
-remain retryable; they are not converted into terminal receipts. External and service-managed history providers are supported under both `KeepAll` and `Auto`, and callback exceptions roll back local entity state without recording a completion receipt ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)). See [Make retries safe in your application](../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application) for idempotency guidance. A separate internal capability can commit
-a provider failure only when a certified adapter explicitly attests the provider phase (`Load`, `Invoke`,
-or `Store`), finality (`NonRetryable` or `RetriesExhausted`), and accepted input. The runtime then serializes
-the resulting session, validates sanitized error metadata, and commits the failed result and receipt through
-the same finalization path. No adapter is registered and the capability is disabled by default. Exception
-messages, HTTP status codes, factory/session creation failures, cancellation, reconciliation, serialization,
-scheduling, state replacement, or uncertain commit acknowledgement never establish finality.
-Existing explicitly committed terminal
-failure evidence can be read and migrated, but a transient exception does not establish such a contract.
+are not converted into terminal receipts; this does not promise automatic retries.
+External and service-managed history providers are supported under both `KeepAll` and `Auto`. Unrecovered external load/store callback failures propagate without creating a framework failed result or receipt, rolling back local working state and staged outgoing signals to the last committed continuation ([#143](https://github.com/microsoft/agent-framework-durable-extension/issues/143)).
+A load failure before model execution leaves those model/tool calls unstarted; a store failure after execution may follow model/tool effects or a successful remote write. Remote effects do not roll back. Without a committed receipt, retrying the same correlation may execute the turn again. Applications must protect side effects with idempotency and reconcile ambiguous outcomes; see [Make retries safe in your application](../../../docs/features/durable-agents/schema-v2-migration.md#make-retries-safe-in-your-application).
+Existing explicitly committed terminal failure evidence remains readable, but an exception, cancellation, or uncertain acknowledgement does not establish a new failed completion.
 Legacy conversion is evidence-only and idempotent. It never calls the model or tools and cannot
 reconstruct receipts for results already evicted from legacy state.
 
