@@ -7,7 +7,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,6 +16,7 @@ from typing import Any, cast
 from agent_framework import (
     Agent,
     AgentResponse,
+    CompactionProvider,
     Content,
     Message,
     SupportsAgentRun,
@@ -47,6 +48,12 @@ from ._legacy_execution import (
     save_legacy_session,
     seed_legacy_memory,
     stage_legacy_request,
+)
+from ._legacy_history import (
+    LegacyMemoryHistory,
+    clear_legacy_history,
+    legacy_history_profile,
+    ordered_legacy_history,
 )
 from ._message_identity import message_identity
 from ._models import RunRequest
@@ -222,6 +229,7 @@ class CompatibleAgentEntity(AgentEntity):
         legacy_ingestion(state)
         legacy_public_ingestion(state)
         legacy_delivery_snapshots(state)
+        legacy_history_profile(state)
         # Prepare a detached view before side effects to reject ambiguous providers.
         bind_legacy_owner(state, prepare_legacy_history(self._registered_agent, options))
 
@@ -394,9 +402,30 @@ class CompatibleAgentEntity(AgentEntity):
         if completed is not None:
             return completed
         acceptance = LegacyInputAcceptance(working, request.correlation_id)
-        view = prepare_legacy_history(self._registered_agent, request.options, acceptance.accept, acceptance.record)
+        view = prepare_legacy_history(
+            self._registered_agent,
+            request.options,
+            acceptance.accept,
+            acceptance.record,
+            acceptance.observe_compaction,
+        )
         self.agent = view.agent
         uses_pipeline = self._has_context_pipeline()
+        providers = getattr(self.agent, "context_providers", ())
+        if (
+            view.owner == "entity"
+            and uses_pipeline
+            and (
+                legacy_history_profile(working) is not None
+                or any(
+                    isinstance(provider, CompactionProvider)
+                    and provider.after_strategy is not None
+                    and provider.history_source_id == view.source_id
+                    for provider in cast("Sequence[Any]", providers)
+                )
+            )
+        ):
+            acceptance.memory_history = LegacyMemoryHistory(working, request.correlation_id)
         original_extensions = deepcopy(working.data.extension_data)
         bind_legacy_owner(working, view)
         entry = stage_legacy_request(
@@ -405,13 +434,15 @@ class CompatibleAgentEntity(AgentEntity):
             legacy,
             evidence.delivery_evidence if isinstance(evidence, LegacyMigrationEvidence) else None,
         )
-        prior = [
-            message
-            for old in working.data.conversation_history
-            if not self._is_error_response(old)
-            for stored in old.messages
-            if (message := self._to_replayable_message(stored)) is not None
-        ]
+        prior: list[Message] = []
+        for reference, old, stored in ordered_legacy_history(working):
+            if self._is_error_response(old):
+                continue
+            message = self._to_replayable_message(stored)
+            if message is not None:
+                if acceptance.memory_history is not None:
+                    acceptance.memory_history.bind(reference, stored, message)
+                prior.append(message)
         original_history = deepcopy(working.data.conversation_history)
         original_session = deepcopy(working.data.session)
         working.data.conversation_history.append(entry)
@@ -445,6 +476,8 @@ class CompatibleAgentEntity(AgentEntity):
                     session.service_session_id = restored.service_session_id
                 inactive_service_id = session.service_session_id
                 seed_legacy_memory(view, session, prior)
+                if acceptance.memory_history is not None:
+                    acceptance.memory_history.observe(session.state[view.source_id]["messages"], rebind_seed=True)
                 if view.owner != "service":
                     session.service_session_id = None
                     defaults = getattr(self.agent, "default_options", None)
@@ -461,7 +494,16 @@ class CompatibleAgentEntity(AgentEntity):
                 raise TypeError("Legacy continuation requires an agent with create_session().")
             messages = current if session is not None and uses_pipeline else [*prior, *current]
             if view.owner == "service" and session is not None and not session.service_session_id:
-                messages = [*prior, *current]
+                replay = prior
+                if legacy_history_profile(working) is not None:
+                    history = next(
+                        provider
+                        for provider in cast("Sequence[Any]", providers)
+                        if getattr(provider, "source_id", None) == view.source_id
+                    )
+                    if history.skip_excluded:
+                        replay = [message for message in prior if not message.additional_properties.get("_excluded")]
+                messages = [*replay, *current]
             kwargs: dict[str, Any] = {"messages": messages, "options": options}
             if session is not None:
                 kwargs["session"] = session
@@ -482,11 +524,22 @@ class CompatibleAgentEntity(AgentEntity):
                 serialize_terminal_response(snapshot)
                 if request.context_messages is not None and uses_pipeline:
                     acceptance.reconcile(working, entry)
+                terminal = acceptance.replay(working, entry, response, owner=view.owner, uses_pipeline=uses_pipeline)
+                working.data.conversation_history.append(terminal)
                 if session is not None:
+                    if acceptance.memory_history is not None:
+                        state = session.state.get(view.source_id, {})
+                        if not isinstance(state, dict):
+                            raise ValueError("Legacy history compaction requires object-valued provider state.")
+                        buffer = cast("dict[str, Any]", state).get("messages", [])
+                        if not isinstance(buffer, list) or any(
+                            not isinstance(item, Message) for item in cast("list[Any]", buffer)
+                        ):
+                            raise ValueError("Legacy history compaction requires a Core message buffer.")
+                        acceptance.memory_history.flush(working, cast("list[Message]", buffer))
                     if view.owner != "service":
                         session.service_session_id = inactive_service_id
                     await save_legacy_session(store, self._state_provider.core_session_id, session, view.memory_sources)
-                terminal = acceptance.replay(working, entry, response, owner=view.owner, uses_pipeline=uses_pipeline)
             except Exception as exc:
                 diagnostic = _validation_diagnostic(exc)
                 if diagnostic is not None:
@@ -514,7 +567,7 @@ class CompatibleAgentEntity(AgentEntity):
                 )
                 snapshot = serialize_agent_response(response)
                 terminal = DurableAgentStateResponse.from_run_response(request.correlation_id, response)
-            working.data.conversation_history.append(terminal)
+                working.data.conversation_history.append(terminal)
             record_legacy_delivery(working, request.correlation_id, snapshot)
             self._commit_legacy(source, working)
             return response
@@ -530,6 +583,7 @@ class CompatibleAgentEntity(AgentEntity):
             working = DurableAgentState.from_dict(legacy)
             if prepare_legacy_history(self._registered_agent, {}).primary_owner == "external":
                 raise NotImplementedError("Reset of external history requires a provider-owned clear operation.")
+            clear_legacy_history(working)
             working.data.conversation_history.clear()
             working.data.session = None
             clear_legacy_deliveries(working)

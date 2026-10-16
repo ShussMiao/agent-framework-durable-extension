@@ -22,6 +22,7 @@ from agent_framework import (
 from ._history_provider import (
     DurableHistoryProvider,
     _copy_with_history_providers,  # pyright: ignore[reportPrivateUsage]
+    _DurableCompactionProvider,  # pyright: ignore[reportPrivateUsage]
     _ObservedHistoryProvider,  # pyright: ignore[reportPrivateUsage]
     ensure_durable_history,
     prepare_history_owner,
@@ -29,6 +30,7 @@ from ._history_provider import (
 )
 from ._legacy_delivery import LEGACY_DELIVERY_FIELD as _DELIVERIES
 from ._legacy_delivery import read_legacy_deliveries
+from ._legacy_history import LegacyMemoryHistory
 from ._message_identity import message_identity
 from ._models import RunRequest
 from ._response_utils import serialize_input_message
@@ -81,6 +83,7 @@ class LegacyInputAcceptance:
         self._accepted: set[int] = set()
         self._accepted_messages: dict[int, Message] = {}
         self._saved: list[_LegacyHistoryWrite] = []
+        self.memory_history: LegacyMemoryHistory | None = None
 
     def mark(self, message: Message, index: int) -> None:
         message._dafx_legacy_input = (self._scope, index)  # type: ignore[attr-defined]
@@ -95,6 +98,8 @@ class LegacyInputAcceptance:
                     self._accepted_messages[values[1]] = message
 
     def record(self, messages: Sequence[Message], response: AgentResponse | None, live_memory: bool) -> None:
+        if live_memory and self.memory_history is not None:
+            self.memory_history.observe(list(messages))
         outputs = {id(message) for message in response.messages} if response is not None else set[int]()
         inputs: list[Message | DurableAgentStateMessage] = []
         replies: list[Message | DurableAgentStateMessage] = []
@@ -118,6 +123,10 @@ class LegacyInputAcceptance:
             else None
         )
         self._saved.append(_LegacyHistoryWrite(inputs, replies, metadata))
+
+    def observe_compaction(self, messages: Sequence[Message], within_strategy: bool) -> None:
+        if self.memory_history is not None:
+            self.memory_history.observe_compaction(list(messages), within_strategy)
 
     def reconcile(self, state: DurableAgentState, entry: DurableAgentStateRequest) -> None:
         known = deepcopy(self._previous)
@@ -159,11 +168,12 @@ class LegacyInputAcceptance:
         records: list[DurableAgentStateEntry] = []
 
         def stored(message: Message | DurableAgentStateMessage) -> DurableAgentStateMessage:
-            return (
-                DurableAgentStateMessage.from_chat_message(message)
-                if isinstance(message, Message)
-                else deepcopy(message)
-            )
+            if not isinstance(message, Message):
+                return deepcopy(message)
+            snapshot = DurableAgentStateMessage.from_chat_message(message)
+            if self.memory_history is not None:
+                self.memory_history.link(message, snapshot)
+            return snapshot
 
         for write in self._saved:
             if write.inputs:
@@ -191,6 +201,7 @@ def prepare_legacy_history(
     options: dict[str, Any],
     accept_inputs: Callable[[Sequence[Message]], None] | None = None,
     record_history: Callable[[Sequence[Message], AgentResponse | None, bool], None] | None = None,
+    observe_compaction: Callable[[Sequence[Message], bool], None] | None = None,
 ) -> LegacyHistoryView:
     """Use exactly one history owner while retaining ordinary audit/context hooks."""
     service = service_stores_history(agent, options)
@@ -248,6 +259,13 @@ def prepare_legacy_history(
             and provider.load_messages
         ):
             provider = _ObservedHistoryProvider(provider, accept_inputs, record_history)
+        elif (
+            type(provider) is _DurableCompactionProvider
+            and not service
+            and provider.history_source_id == source_id
+            and observe_compaction is not None
+        ):
+            provider = _DurableCompactionProvider(provider.__wrapped__, observe_compaction)
         updated.append(provider)
     prepared = _copy_with_history_providers(prepared, updated)
     primary_owner: Literal["entity", "external"] = (

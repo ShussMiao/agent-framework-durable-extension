@@ -17,7 +17,17 @@ from threading import Event
 from typing import Any
 
 import pytest
-from agent_framework import Agent, Executor, Message, WorkflowBuilder, WorkflowContext, handler, response_handler
+from agent_framework import (
+    Agent,
+    CompactionProvider,
+    CompactionStrategy,
+    Executor,
+    Message,
+    WorkflowBuilder,
+    WorkflowContext,
+    handler,
+    response_handler,
+)
 from durabletask.azuremanaged.client import DurableTaskSchedulerClient
 from durabletask.azuremanaged.worker import DurableTaskSchedulerWorker
 from durabletask.client import OrchestrationStatus
@@ -63,6 +73,7 @@ def _host(
     *,
     mode: str | None = None,
     evidence: Callable[[dict[str, Any]], LegacyMigrationEvidence | None] | None = None,
+    after_strategy: CompactionStrategy | None = None,
 ) -> Iterator[RecordingModel]:
     artifacts.mkdir()
     model = RecordingModel(artifacts, "")
@@ -73,7 +84,16 @@ def _host(
         secure_channel=False,
     )
     host = DurableAIAgentWorker(worker, deployment_mode=mode, legacy_migration_evidence=evidence)
-    host.add_agent(Agent(client=model, name=AGENT_NAME, default_options={"store": False}))
+    host.add_agent(
+        Agent(
+            client=model,
+            name=AGENT_NAME,
+            default_options={"store": False},
+            context_providers=[CompactionProvider(after_strategy=after_strategy)]
+            if after_strategy is not None
+            else None,
+        )
+    )
     host.configure_workflow(WorkflowBuilder(name="live-compatibility", start_executor=_Human(id="human")).build())
     worker.add_orchestrator(live_retention_call)
     try:
@@ -120,6 +140,35 @@ def _turn(
     response = json.loads(completed.serialized_output)
     assert response["messages"][0]["contents"][0]["text"] == f"answer:{correlation}"
     return response, _snapshot(client, entity)["state"]
+
+
+def test_live_legacy_compaction_survives_exclusive_worker_replacement(
+    live_client: DurableTaskSchedulerClient,
+    dts_endpoint: str,
+    live_taskhub: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DURABLE_AGENTS_DEPLOYMENT_MODE", raising=False)
+    entity = EntityInstanceId(entity=f"dafx-{AGENT_NAME}", key="legacy-compaction")
+
+    async def compact(messages: list[Message]) -> bool:
+        for message in messages:
+            if message.text in ("first", "answer:first"):
+                message.additional_properties["_excluded"] = True
+        messages.insert(0, Message("system", ["summary"]))
+        return True
+
+    with _host(dts_endpoint, live_taskhub, tmp_path / "compact", mode="legacy", after_strategy=compact):
+        _, source = _turn(live_client, entity, "first")
+        assert source["schemaVersion"] == "1.1.0"
+        assert source["data"]["extensionData"]["_dafx_legacy_history"]["generated"]
+    with _host(dts_endpoint, live_taskhub, tmp_path / "cold", mode="legacy") as cold:
+        _, committed = _turn(live_client, entity, "second")
+        captured = json.loads((cold.artifacts / "model-1.json").read_text(encoding="utf-8"))
+        assert [Message.from_dict(message).text for message in captured] == ["summary", "second"]
+        _, duplicate = _turn(live_client, entity, "first")
+        assert duplicate == committed and cold.calls == 1
 
 
 def test_live_legacy_continuation_migration_and_cold_replay(

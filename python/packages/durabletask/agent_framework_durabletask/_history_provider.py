@@ -29,6 +29,7 @@ from agent_framework import (
     SUMMARY_OF_MESSAGE_IDS_KEY,
     AgentResponse,
     CompactionProvider,
+    CompactionStrategy,
     HistoryProvider,
     InMemoryHistoryProvider,
     Message,
@@ -1243,10 +1244,31 @@ def _compaction_id_scope(messages: list[Message]) -> Generator[None]:
                 message.message_id = public_ids[history_id]
 
 
+class _ObservedHistoryCompactionStrategy:
+    """Observe strategy results without hiding tokenizer or other caller-owned attributes."""
+
+    def __init__(self, strategy: CompactionStrategy, observe: Callable[[Sequence[Message], bool], None]) -> None:
+        self.__wrapped__ = strategy
+        self._observe = observe
+        self.__name__ = getattr(strategy, "__name__", type(strategy).__name__)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__wrapped__, name)
+
+    async def __call__(self, messages: list[Message]) -> bool:
+        changed = await self.__wrapped__(messages)
+        self._observe(messages, True)
+        return changed
+
+
 class _DurableCompactionProvider(CompactionProvider):
     """Preserve a configured compaction provider while isolating its internal IDs."""
 
-    def __init__(self, provider: CompactionProvider) -> None:
+    def __init__(
+        self,
+        provider: CompactionProvider,
+        after_history: Callable[[Sequence[Message], bool], None] | None = None,
+    ) -> None:
         super().__init__(
             before_strategy=provider.before_strategy,
             after_strategy=provider.after_strategy,
@@ -1255,6 +1277,11 @@ class _DurableCompactionProvider(CompactionProvider):
             history_source_id=provider.history_source_id,
         )
         self.__wrapped__ = provider
+        self._after_history = after_history
+        if after_history is not None and provider.after_strategy is not None:
+            prepared = copy.copy(provider)
+            prepared.after_strategy = _ObservedHistoryCompactionStrategy(provider.after_strategy, after_history)
+            self.__wrapped__ = prepared
         if hasattr(provider, "after_run_once_per_turn"):
             self.after_run_once_per_turn = provider.after_run_once_per_turn
 
@@ -1273,6 +1300,11 @@ class _DurableCompactionProvider(CompactionProvider):
         )
         with _compaction_id_scope(cast("list[Message]", messages) if isinstance(messages, list) else []):
             await self.__wrapped__.after_run(agent=agent, session=session, context=context, state=state)
+        if self._after_history is not None:
+            self._after_history(
+                _ObservedHistoryProvider._memory_messages(history_state),  # pyright: ignore[reportPrivateUsage]
+                False,
+            )
 
 
 class _ServiceOwnedHistoryProvider(HistoryProvider):

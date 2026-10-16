@@ -156,6 +156,16 @@ Successful ordinary turns retain supplied delivery evidence even when `context_m
 History substitution preserves configured `after_run_once_per_turn` metadata and Core's iteration cadence.
 Session-capable custom agents without a context pipeline receive prior history directly rather than
 relying on a nonexistent provider to load it.
+Entity-owned legacy after-run compaction reconciles its final buffer before transient memory is
+stripped. Original request/response envelopes and bodies remain available, including excluded
+messages under `keep_all`. The declared `extensionData._dafx_legacy_history` profile records
+message-slot replay order and generated summary/revision slots without changing public message IDs
+or creating input receipts. Anonymous and duplicate public IDs use distinct transient reconciliation
+identities. Unknown profile siblings and untouched historical JSON are retained.
+Cold legacy turns honor that order even without a compaction provider. Reset clears only the
+profile's owned ordering fields. Migration materializes the order as canonical v2 history after
+validating the original source and journals; generated summaries never become delivered-input
+evidence. Older binaries do not gain this new profile's semantics merely by reading legacy JSON.
 Automatic in-place conversion seeds active occurrence receipts only from the bridge ledger.
 Historical delivery journals validate accepted public lookups and cursor consistency; their
 public message IDs do not establish transport occurrence IDs. Exact public journal receipts are
