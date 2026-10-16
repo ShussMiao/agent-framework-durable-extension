@@ -392,6 +392,50 @@ class _IterationOptions(ChatOptions[None]):
     _agent_loop_iteration: str
 
 
+@pytest.mark.parametrize("profile", [None, False, 0, "", [], {}])
+@pytest.mark.parametrize("mode", [None, "legacy"])
+async def test_present_invalid_ingestion_profile_rejects_before_execution(profile: Any, mode: str | None) -> None:
+    source = _legacy()
+    source["data"]["extensionData"]["_dafx_legacy_ingestion"] = profile
+    provider = JsonStateProvider(source)
+    client = RecordingChatClient()
+    entity = CompatibleAgentEntity(Agent(client=client), state_provider=provider, deployment_mode=mode)
+    with pytest.raises(ValueError, match="ingestion metadata"):
+        await entity.run(RunRequest("", correlation_id="next", context_messages=[]))
+    assert provider.raw == source and provider.attempted_writes == 0 and client.received_messages == []
+
+
+@pytest.mark.parametrize("operation", ["plain", "reset", "convert"])
+async def test_null_ingestion_profile_is_not_absence_on_other_mutating_paths(operation: str) -> None:
+    source = _legacy(used=operation != "convert")
+    source["data"]["extensionData"]["_dafx_legacy_ingestion"] = None
+    provider = JsonStateProvider(source)
+    client = RecordingChatClient()
+    entity = CompatibleAgentEntity(Agent(client=client), state_provider=provider)
+    with pytest.raises(ValueError, match="ingestion metadata"):
+        if operation == "reset":
+            entity.reset()
+        else:
+            await entity.run(RunRequest("normal", correlation_id="next"))
+    assert provider.raw == source and provider.attempted_writes == 0 and client.received_messages == []
+
+
+@pytest.mark.parametrize("version", [None, "v1", "v2"])
+async def test_absent_or_declared_empty_ingestion_profile_remains_usable(version: str | None) -> None:
+    source = _legacy()
+    if version is not None:
+        source["data"]["extensionData"]["_dafx_legacy_ingestion"] = {
+            "profile": f"dafx-legacy-ingestion-{version}",
+            "messages": {},
+        }
+    provider = JsonStateProvider(source)
+    client = RecordingChatClient()
+    entity = CompatibleAgentEntity(Agent(client=client), state_provider=provider, deployment_mode="legacy")
+    result = await entity.run(RunRequest("", correlation_id="next", context_messages=[]))
+    assert not result.additional_properties.get("durable_status")
+    assert provider.successful_writes == 1 and len(client.received_messages) == 1
+
+
 @pytest.mark.parametrize("once", [False, True])
 async def test_legacy_replacement_preserves_configured_iteration_persistence_cadence(once: bool) -> None:
     reference_history = InMemoryHistoryProvider()

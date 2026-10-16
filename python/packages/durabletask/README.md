@@ -122,6 +122,7 @@ in both paths, removing configured/request tools without mutating registered age
 Legacy workflow context uses explicit delivery occurrences and content fingerprints, not public
 message IDs or cursor maxima as inferred provenance. The declared `_dafx_legacy_ingestion`
 extension records bridge-era acceptances; `_dafx_legacy_owner` binds the selected provider.
+A present ingestion field must contain a declared object profile; explicit null is not absence.
 The ingestion profile's v2 form stores historical public lookups in `publicMessages`, separate
 from accepted occurrences in `messages`. Its v1 form remains readable without activating unknown
 siblings. Public lookups are consulted only when explicit occurrence IDs are absent.

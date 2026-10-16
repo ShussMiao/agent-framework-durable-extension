@@ -290,9 +290,10 @@ def legacy_session_identity(source: dict[str, Any], default: str) -> str:
 
 
 def _legacy_ingestion_profile(state: DurableAgentState) -> dict[str, Any] | None:
-    profile = (state.data.extension_data or {}).get(_LEDGER)
-    if profile is None:
+    extensions = state.data.extension_data
+    if extensions is None or _LEDGER not in extensions:
         return None
+    profile = extensions[_LEDGER]
     if not isinstance(profile, dict):
         raise ValueError("Legacy ingestion metadata has an unsupported profile.")
     profile = cast(dict[str, Any], profile)
