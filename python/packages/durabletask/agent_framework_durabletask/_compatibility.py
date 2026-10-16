@@ -240,7 +240,15 @@ class CompatibleAgentEntity(AgentEntity):
         self._check_legacy_capacity(state)
         self._storage.commit_legacy(source, state)
 
-    def _converted(self, source: dict[str, Any]) -> DurableAgentState | None:
+    def _resolve_legacy_evidence(self, source: dict[str, Any]) -> LegacyMigrationEvidence | None:
+        evidence = (
+            self._legacy_migration_evidence(deepcopy(source)) if self._legacy_migration_evidence is not None else None
+        )
+        if evidence is not None and not isinstance(evidence, LegacyMigrationEvidence):
+            raise TypeError("legacy_migration_evidence must return LegacyMigrationEvidence or None.")
+        return evidence
+
+    def _converted(self, source: dict[str, Any], evidence: LegacyMigrationEvidence | None) -> DurableAgentState | None:
         data = source["data"]
         legacy_state = DurableAgentState.from_dict(source)
         bridge_receipts = legacy_ingestion(legacy_state) or {}
@@ -248,11 +256,6 @@ class CompatibleAgentEntity(AgentEntity):
         deliveries = legacy_delivery_snapshots(legacy_state)
         used = bool(data.get("conversationHistory") or data.get("session") or data.get("ingestedPositions"))
         used = used or "truncation" in data or bool(bridge_receipts) or bool(public_receipts) or bool(deliveries)
-        evidence = (
-            self._legacy_migration_evidence(deepcopy(source)) if self._legacy_migration_evidence is not None else None
-        )
-        if evidence is not None and not isinstance(evidence, LegacyMigrationEvidence):
-            raise TypeError("legacy_migration_evidence must return LegacyMigrationEvidence or None.")
         digest = state_snapshot_digest(source)
         completion = evidence.completion_evidence if evidence is not None else None
         delivery = evidence.delivery_evidence if evidence is not None else None
@@ -356,9 +359,18 @@ class CompatibleAgentEntity(AgentEntity):
             return await super().run(run_request)
         legacy = source or DurableAgentState(schema_version="1.1.0").to_dict()
         self._validate_legacy_profile(legacy, run_request.options)
-        converted = self._converted(legacy) if source and self._deployment_mode != "legacy" else None
+        if self._deployment_mode == "legacy":
+            completed = DurableAgentState.from_dict(legacy).try_get_agent_response(run_request.correlation_id)
+            if completed is not None:
+                return completed
+        evidence = (
+            self._resolve_legacy_evidence(legacy)
+            if (source and self._deployment_mode != "legacy") or run_request.context_messages is not None
+            else None
+        )
+        converted = self._converted(legacy, evidence) if source and self._deployment_mode != "legacy" else None
         if converted is None:
-            return await self._run_legacy(source, legacy, run_request)
+            return await self._run_legacy(source, legacy, run_request, evidence)
         parent = self._state_provider
         self._state_provider = _MigrationStateProvider(parent, source, converted.to_dict())
         try:
@@ -368,29 +380,25 @@ class CompatibleAgentEntity(AgentEntity):
             self._state_provider = parent
             self._storage.invalidate()
 
-    async def _run_legacy(self, source: dict[str, Any], legacy: dict[str, Any], request: RunRequest) -> AgentResponse:
+    async def _run_legacy(
+        self,
+        source: dict[str, Any],
+        legacy: dict[str, Any],
+        request: RunRequest,
+        evidence: LegacyMigrationEvidence | None,
+    ) -> AgentResponse:
         if self._retention != "keep_all":
             raise ValueError("Transcript compaction retention requires v2; this legacy session was not migrated.")
         working = DurableAgentState.from_dict(legacy)
         completed = working.try_get_agent_response(request.correlation_id)
         if completed is not None:
             return completed
-        acceptance = LegacyInputAcceptance(working)
-        view = prepare_legacy_history(self._registered_agent, request.options, acceptance.accept)
+        acceptance = LegacyInputAcceptance(working, request.correlation_id)
+        view = prepare_legacy_history(self._registered_agent, request.options, acceptance.accept, acceptance.record)
         self.agent = view.agent
+        uses_pipeline = self._has_context_pipeline()
         original_extensions = deepcopy(working.data.extension_data)
         bind_legacy_owner(working, view)
-        evidence = None
-        if (
-            request.context_messages is not None
-            and working.data.ingested_positions
-            and legacy_ingestion(working) is None
-        ):
-            evidence = (
-                self._legacy_migration_evidence(deepcopy(legacy))
-                if self._legacy_migration_evidence is not None
-                else None
-            )
         entry = stage_legacy_request(
             working,
             request,
@@ -404,6 +412,8 @@ class CompatibleAgentEntity(AgentEntity):
             for stored in old.messages
             if (message := self._to_replayable_message(stored)) is not None
         ]
+        original_history = deepcopy(working.data.conversation_history)
+        original_session = deepcopy(working.data.session)
         working.data.conversation_history.append(entry)
         self._check_legacy_capacity(working)
         self._legacy_state = working
@@ -449,7 +459,7 @@ class CompatibleAgentEntity(AgentEntity):
                     options.pop("conversation_id", None)
             elif working.data.session or view.owner != "entity":
                 raise TypeError("Legacy continuation requires an agent with create_session().")
-            messages = current if session is not None else [*prior, *current]
+            messages = current if session is not None and uses_pipeline else [*prior, *current]
             if view.owner == "service" and session is not None and not session.service_session_id:
                 messages = [*prior, *current]
             kwargs: dict[str, Any] = {"messages": messages, "options": options}
@@ -470,12 +480,13 @@ class CompatibleAgentEntity(AgentEntity):
                 )
                 snapshot = serialize_agent_response(response)
                 serialize_terminal_response(snapshot)
-                if request.context_messages is not None:
+                if request.context_messages is not None and uses_pipeline:
                     acceptance.reconcile(working, entry)
                 if session is not None:
                     if view.owner != "service":
                         session.service_session_id = inactive_service_id
                     await save_legacy_session(store, self._state_provider.core_session_id, session, view.memory_sources)
+                terminal = acceptance.replay(working, entry, response, owner=view.owner, uses_pipeline=uses_pipeline)
             except Exception as exc:
                 diagnostic = _validation_diagnostic(exc)
                 if diagnostic is not None:
@@ -483,10 +494,9 @@ class CompatibleAgentEntity(AgentEntity):
                 else:
                     logger.exception("Legacy agent execution failed.")
                 working.data.extension_data = original_extensions
-                if request.context_messages is not None:
-                    working.data.conversation_history = [
-                        previous for previous in working.data.conversation_history if previous is not entry
-                    ]
+                working.data.session = original_session
+                if uses_pipeline or request.context_messages is not None:
+                    working.data.conversation_history = original_history
                 response = AgentResponse(
                     messages=[
                         Message(
@@ -503,9 +513,8 @@ class CompatibleAgentEntity(AgentEntity):
                     additional_properties={"durable_status": "error", "correlation_id": request.correlation_id},
                 )
                 snapshot = serialize_agent_response(response)
-            working.data.conversation_history.append(
-                DurableAgentStateResponse.from_run_response(request.correlation_id, response)
-            )
+                terminal = DurableAgentStateResponse.from_run_response(request.correlation_id, response)
+            working.data.conversation_history.append(terminal)
             record_legacy_delivery(working, request.correlation_id, snapshot)
             self._commit_legacy(source, working)
             return response

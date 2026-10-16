@@ -303,11 +303,18 @@ async def test_delivery_journal_public_lookup_ids_are_not_explicit_occurrence_re
     )
     client = RecordingChatClient()
     provider = JsonStateProvider(source)
+
+    def current_evidence(raw: dict[str, Any]) -> LegacyMigrationEvidence:
+        journal = deepcopy(evidence.delivery_evidence)
+        assert journal is not None
+        journal["sourceDigest"] = state_snapshot_digest(raw)
+        return LegacyMigrationEvidence(completion_evidence=evidence.completion_evidence, delivery_evidence=journal)
+
     entity = CompatibleAgentEntity(
         Agent(client=client, name="complete"),
         state_provider=provider,
         deployment_mode=None if migrate else "legacy",
-        legacy_migration_evidence=lambda _: evidence,
+        legacy_migration_evidence=current_evidence,
     )
     await entity.run(RunRequest("boundary", correlation_id="boundary"))
     await entity.run(
@@ -319,7 +326,7 @@ async def test_delivery_journal_public_lookup_ids_are_not_explicit_occurrence_re
         )
     )
     count = sum(message.text == "old question" for message in client.received_messages[-1])
-    assert count == (1 if migrate and not explicit else 2)
+    assert count == (1 if not explicit else 2)
 
 
 @pytest.mark.asyncio

@@ -129,11 +129,17 @@ Existing nonempty scalar cursors require trusted delivery evidence before accept
 when no bridge ledger exists. Failed runs do not advance that ledger. Conversion merges its
 acceptances into v2. Remote provider/model/tool effects remain at-least-once: a local state rollback
 cannot undo a remote side effect.
-New context receipts and replayable inputs are reconciled against post-middleware acceptance by
-the primary history owner, or a completed observed service request. Filtering an input does not
-consume its delivery occurrence, even when input transcript storage is disabled. Observation uses
-the same history/service hooks as v2 without binding a v2 writer to legacy state. Opaque custom
-hooks and unobserved service requests do not establish acceptance by inference.
+New context receipts follow post-middleware acceptance by the primary history owner, or a completed
+observed service request. Filtering an input does not consume its delivery occurrence, even when
+input transcript storage is disabled. Replay is recorded separately from successful primary history
+writes, preserving edited content, context selection, storage flags and tool-call ordering. Receipt
+fingerprints still describe the original delivered input, not the edited replay representation.
+External save payloads and response classification are captured at the completed save boundary.
+Built-in memory bodies remain live until session persistence, while their classification stays fixed.
+Disabling output history does not remove the full duplicate-response delivery cache, and storage
+flags do not retroactively erase historical bodies. Observation uses the same history/service hooks
+as v2 without binding a v2 writer to legacy state. Opaque custom hooks and unobserved service requests
+do not establish acceptance or provider writes by inference.
 Only memory providers substituted for `DurableHistoryProvider` are transient. Caller-configured
 store-only `InMemoryHistoryProvider` audit state retains its prior and newly stored messages across
 cold continuation.
@@ -141,6 +147,10 @@ Failed context deliveries also remove their staged request from replayable local
 retaining the terminal error, so a cold redelivery does not include the uncommitted input twice.
 Fingerprints use the original input identity, including message extras, rather than a transcript
 projection that may omit them.
+Validated delivery-only evidence is carried into legacy fallback even without scalar cursors or
+when bridge receipts already exist. Its public lookups never consume an explicit delivery occurrence.
+Session-capable custom agents without a context pipeline receive prior history directly rather than
+relying on a nonexistent provider to load it.
 Automatic in-place conversion seeds active occurrence receipts only from the bridge ledger.
 Historical delivery journals validate accepted public lookups and cursor consistency; their
 public message IDs do not establish transport occurrence IDs. Exact public journal receipts are

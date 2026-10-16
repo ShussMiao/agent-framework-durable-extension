@@ -1124,7 +1124,10 @@ class _ObservedHistoryProvider(HistoryProvider):
     """
 
     def __init__(
-        self, provider: HistoryProvider, accept_inputs: Callable[[Sequence[Message]], None] | None = None
+        self,
+        provider: HistoryProvider,
+        accept_inputs: Callable[[Sequence[Message]], None] | None = None,
+        record_history: Callable[[Sequence[Message], AgentResponse | None, bool], None] | None = None,
     ) -> None:
         super().__init__(
             source_id=provider.source_id,
@@ -1136,6 +1139,8 @@ class _ObservedHistoryProvider(HistoryProvider):
         )
         self.__wrapped__ = provider
         self._accept_inputs = accept_inputs
+        self._record_history = record_history
+        self._record_response: AgentResponse | None = None
         if hasattr(provider, "after_run_once_per_turn"):
             self.after_run_once_per_turn = provider.after_run_once_per_turn
 
@@ -1146,9 +1151,33 @@ class _ObservedHistoryProvider(HistoryProvider):
         return await self.__wrapped__.get_messages(session_id, **kwargs)
 
     async def save_messages(self, session_id: str | None, messages: Sequence[Message], **kwargs: Any) -> None:
+        memory = type(self.__wrapped__) is InMemoryHistoryProvider
+        previous: set[int] = set()
+        if self._record_history is not None and memory:
+            previous = {id(message) for message in self._memory_messages(kwargs.get("state"))}
         await self.__wrapped__.save_messages(session_id, messages, **kwargs)
+        if self._record_history is not None:
+            saved: Sequence[Message] = messages
+            if memory:
+                saved = [
+                    message for message in self._memory_messages(kwargs.get("state")) if id(message) not in previous
+                ]
+            self._record_history(saved, self._record_response, memory)
         if self.store_inputs:
             self._accept(messages)
+
+    @staticmethod
+    def _memory_messages(state: Any) -> list[Message]:
+        if state is None:
+            return []
+        if not isinstance(state, dict):
+            raise ValueError("Memory history state must be an object.")
+        messages = cast("dict[str, Any]", state).get("messages", [])
+        if not isinstance(messages, list) or any(
+            not isinstance(message, Message) for message in cast("list[Any]", messages)
+        ):
+            raise ValueError("Memory history messages must be a list of Core messages.")
+        return cast("list[Message]", messages)
 
     def _accept(self, messages: Sequence[Message]) -> None:
         if self._accept_inputs is not None:
@@ -1177,7 +1206,11 @@ class _ObservedHistoryProvider(HistoryProvider):
             and after_run.__self__ is self.__wrapped__
             and after_run.__func__ is HistoryProvider.after_run
         ):
-            await super().after_run(agent=agent, session=session, context=context, state=state)
+            self._record_response = context.response
+            try:
+                await super().after_run(agent=agent, session=session, context=context, state=state)
+            finally:
+                self._record_response = None
             binding = current_durable_history_binding()
             if self._accept_inputs is not None or (binding is not None and not binding.service_owns_history):
                 self._accept(context.input_messages)

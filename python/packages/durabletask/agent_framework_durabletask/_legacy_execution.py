@@ -10,7 +10,14 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 from uuid import uuid4
 
-from agent_framework import AgentSession, HistoryProvider, InMemoryHistoryProvider, Message, SupportsAgentRun
+from agent_framework import (
+    AgentResponse,
+    AgentSession,
+    HistoryProvider,
+    InMemoryHistoryProvider,
+    Message,
+    SupportsAgentRun,
+)
 
 from ._history_provider import (
     DurableHistoryProvider,
@@ -24,15 +31,19 @@ from ._legacy_delivery import LEGACY_DELIVERY_FIELD as _DELIVERIES
 from ._legacy_delivery import read_legacy_deliveries
 from ._message_identity import message_identity
 from ._models import RunRequest
+from ._response_utils import serialize_input_message
 from ._session_store import EntitySessionStore
 from ._shared_agent_state import (
     DurableAgentState,
     DurableAgentStateData,
+    DurableAgentStateEntry,
     DurableAgentStateMessage,
     DurableAgentStateRequest,
+    DurableAgentStateResponse,
 )
 from ._shared_response import serialize_terminal_response
 from ._state_migration import (
+    _apply_journal,  # pyright: ignore[reportPrivateUsage]
     _journal_receipts,  # pyright: ignore[reportPrivateUsage]
     state_snapshot_digest,
 )
@@ -53,13 +64,23 @@ class LegacyHistoryView:
     memory_sources: tuple[str, ...]
 
 
+@dataclass
+class _LegacyHistoryWrite:
+    inputs: list[Message | DurableAgentStateMessage]
+    outputs: list[Message | DurableAgentStateMessage]
+    response: DurableAgentStateResponse | None
+
+
 class LegacyInputAcceptance:
     """Observe request-local inputs without binding a v2 state writer to legacy state."""
 
-    def __init__(self, state: DurableAgentState) -> None:
+    def __init__(self, state: DurableAgentState, correlation_id: str) -> None:
         self._previous = legacy_ingestion(state) or {}
+        self._correlation_id = correlation_id
         self._scope = uuid4().hex
         self._accepted: set[int] = set()
+        self._accepted_messages: dict[int, Message] = {}
+        self._saved: list[_LegacyHistoryWrite] = []
 
     def mark(self, message: Message, index: int) -> None:
         message._dafx_legacy_input = (self._scope, index)  # type: ignore[attr-defined]
@@ -71,11 +92,38 @@ class LegacyInputAcceptance:
                 values = cast("tuple[Any, ...]", marker)
                 if len(values) == 2 and values[0] == self._scope and type(values[1]) is int:
                     self._accepted.add(values[1])
+                    self._accepted_messages[values[1]] = message
+
+    def record(self, messages: Sequence[Message], response: AgentResponse | None, live_memory: bool) -> None:
+        outputs = {id(message) for message in response.messages} if response is not None else set[int]()
+        inputs: list[Message | DurableAgentStateMessage] = []
+        replies: list[Message | DurableAgentStateMessage] = []
+        for message in messages:
+            # Memory bodies remain live until the enclosing session snapshot, not an earlier save hook.
+            captured = (
+                message if live_memory else DurableAgentStateMessage.from_core_dict(serialize_input_message(message))
+            )
+            (replies if id(message) in outputs else inputs).append(captured)
+        metadata = (
+            DurableAgentStateResponse.from_run_response(
+                self._correlation_id,
+                AgentResponse(
+                    messages=[],
+                    created_at=response.created_at,
+                    usage_details=deepcopy(response.usage_details),
+                    additional_properties=deepcopy(response.additional_properties),
+                ),
+            )
+            if response is not None
+            else None
+        )
+        self._saved.append(_LegacyHistoryWrite(inputs, replies, metadata))
 
     def reconcile(self, state: DurableAgentState, entry: DurableAgentStateRequest) -> None:
-        entry.messages = [message for index, message in enumerate(entry.messages) if index in self._accepted]
         known = deepcopy(self._previous)
-        for stored in entry.messages:
+        for index, stored in enumerate(entry.messages):
+            if index not in self._accepted:
+                continue
             identity, fingerprint = stored.ingestion_occurrence, stored.ingestion_identity
             if identity is not None and fingerprint is not None:
                 prior = known.get(identity, [])
@@ -86,11 +134,63 @@ class LegacyInputAcceptance:
             raise ValueError("Legacy input acceptance requires a staged ingestion profile.")
         profile["messages"] = known
 
+    def replay(
+        self,
+        state: DurableAgentState,
+        entry: DurableAgentStateRequest,
+        response: AgentResponse,
+        *,
+        owner: Literal["entity", "external", "service"],
+        uses_pipeline: bool,
+    ) -> DurableAgentStateResponse:
+        """Project successful owner writes, independently of ingress receipts and delivery."""
+        correlation_id = entry.correlation_id
+        if correlation_id is None:
+            raise ValueError("Legacy replay persistence requires an operation correlation ID.")
+        terminal = DurableAgentStateResponse.from_run_response(correlation_id, response)
+        if not uses_pipeline:
+            return terminal
+        if owner == "service":
+            entry.messages = [
+                DurableAgentStateMessage.from_chat_message(message)
+                for _, message in sorted(self._accepted_messages.items())
+            ]
+            return terminal
+        records: list[DurableAgentStateEntry] = []
+
+        def stored(message: Message | DurableAgentStateMessage) -> DurableAgentStateMessage:
+            return (
+                DurableAgentStateMessage.from_chat_message(message)
+                if isinstance(message, Message)
+                else deepcopy(message)
+            )
+
+        for write in self._saved:
+            if write.inputs:
+                records.append(
+                    DurableAgentStateRequest(
+                        correlation_id,
+                        entry.created_at,
+                        [stored(message) for message in write.inputs],
+                    )
+                )
+            if write.outputs and write.response is not None:
+                saved = deepcopy(write.response)
+                saved.messages = [stored(message) for message in write.outputs]
+                records.append(saved)
+        terminal.messages = []
+        if records and isinstance(records[-1], DurableAgentStateResponse):
+            terminal.messages = records.pop().messages
+        index = next(index for index, previous in enumerate(state.data.conversation_history) if previous is entry)
+        state.data.conversation_history[index : index + 1] = records
+        return terminal
+
 
 def prepare_legacy_history(
     agent: SupportsAgentRun,
     options: dict[str, Any],
     accept_inputs: Callable[[Sequence[Message]], None] | None = None,
+    record_history: Callable[[Sequence[Message], AgentResponse | None, bool], None] | None = None,
 ) -> LegacyHistoryView:
     """Use exactly one history owner while retaining ordinary audit/context hooks."""
     service = service_stores_history(agent, options)
@@ -121,7 +221,7 @@ def prepare_legacy_history(
         else None
     )
     prepared = prepare_history_owner(prepared, service)
-    prepared_providers = getattr(prepared, "context_providers", ())
+    prepared_providers = getattr(prepared, "context_providers", None)
     if not isinstance(prepared_providers, (list, tuple)):
         return LegacyHistoryView(prepared, owner, "external" if owner == "external" else "entity", None, ())
     updated: list[Any] = []
@@ -144,7 +244,7 @@ def prepare_legacy_history(
             and isinstance(provider, HistoryProvider)
             and provider.load_messages
         ):
-            provider = _ObservedHistoryProvider(provider, accept_inputs)
+            provider = _ObservedHistoryProvider(provider, accept_inputs, record_history)
         updated.append(provider)
     prepared = _copy_with_history_providers(prepared, updated)
     primary_owner: Literal["entity", "external"] = (
@@ -306,15 +406,22 @@ def stage_legacy_request(
         return entry
     known = legacy_ingestion(state)
     public = legacy_public_ingestion(state)
-    if known is None:
-        known = {}
-        positions = state.data.ingested_positions or {}
-        if positions and delivery_evidence is None:
-            raise ValueError("Legacy ingestion positions require trusted delivery evidence before context delivery.")
-        if delivery_evidence is not None:
-            _, public = _journal_receipts(
-                delivery_evidence, source_digest=state_snapshot_digest(source), positions=positions
-            )
+    positions = state.data.ingested_positions or {}
+    if delivery_evidence is not None:
+        _, journal = _journal_receipts(
+            delivery_evidence, source_digest=state_snapshot_digest(source), positions=positions
+        )
+        _apply_journal(DurableAgentState.from_dict(source), journal)
+        if any(
+            fingerprint not in journal.get(identity, [])
+            for identity, values in public.items()
+            for fingerprint in values
+        ):
+            raise ValueError("Recorded delivery evidence omits committed public lookup fingerprints.")
+        public = journal
+    elif known is None and positions:
+        raise ValueError("Legacy ingestion positions require trusted delivery evidence before context delivery.")
+    known = known or {}
     kept: list[DurableAgentStateMessage] = []
     for index, stored in enumerate(entry.messages):
         identity = request.context_message_ids[index] if request.context_message_ids is not None else stored.message_id
