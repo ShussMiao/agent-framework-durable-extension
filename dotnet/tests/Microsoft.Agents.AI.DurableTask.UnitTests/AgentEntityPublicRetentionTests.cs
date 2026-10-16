@@ -392,9 +392,13 @@ public sealed class AgentEntityPublicRetentionTests
             Client client = new() { Tool = phase == "store" };
             Provider provider = new() { Failure = phase };
             ChatClientAgent agent = Agent(client, provider, tool);
+            // No completion is committed; "store" fails after two model calls, a tool effect, and a provider write.
+            // Local state rolls back without an "attempt" receipt, so the same correlation remains retryable.
+            // This is intentional #143 at-least-once behavior while #131 terminal-failure finalization is deferred.
             EntityBatchResult failed = await DispatchAsync(agent, original, "attempt", auto);
             Assert.NotNull(Result(failed).FailureDetails);
             Assert.Equal(original, failed.EntityState);
+            Assert.False(failed.EntityState is not null && State(failed).Data.CompletionReceipts!.ContainsKey("attempt"));
             Assert.Empty(failed.Actions!);
             Assert.Same(provider, agent.ChatHistoryProvider);
             Assert.Equal(phase == "store" ? 2 : 0, client.Calls);
@@ -404,6 +408,7 @@ public sealed class AgentEntityPublicRetentionTests
             Client cold = new() { Tool = phase == "store" };
             EntityBatchResult retry = await DispatchAsync(Agent(cold, retryProvider, tool), failed.EntityState, "attempt", auto);
             Assert.Null(Result(retry).FailureDetails);
+            Assert.Equal(phase == "store" ? 2 : 1, cold.Calls);
             Assert.Equal(DurableAgentStateCompletionReceipt.SucceededOutcome, State(retry).Data.CompletionReceipts!["attempt"].Outcome);
             if (phase == "store")
             {
