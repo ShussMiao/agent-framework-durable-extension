@@ -27,6 +27,8 @@ from ._shared_agent_state import (
     DurableAgentStateMessage,
     DurableAgentStateRequest,
 )
+from ._shared_response import serialize_terminal_response
+from ._shared_state_validation import validate_identifier
 from ._state_migration import (
     _journal_receipts,  # pyright: ignore[reportPrivateUsage]
     state_snapshot_digest,
@@ -35,6 +37,7 @@ from ._state_migration import (
 _LEDGER = "_dafx_legacy_ingestion"
 _OWNER = "_dafx_legacy_owner"
 _PUBLIC_LEDGER = "_dafx_legacy_public_ingestion"
+_DELIVERIES = "_dafx_legacy_delivery"
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,52 @@ def bind_migrated_public_ingestion(state: DurableAgentState, journal: dict[str, 
         state.data.extension_data = extensions
 
 
+def legacy_delivery_snapshots(state: DurableAgentState) -> dict[str, dict[str, Any]]:
+    """Validate only declared, newly recorded full responses, never infer old outcomes."""
+    extensions = state.data.extension_data or {}
+    if _DELIVERIES not in extensions:
+        return {}
+    profile = extensions[_DELIVERIES]
+    if not isinstance(profile, dict):
+        raise ValueError("Legacy delivery metadata has an unsupported profile.")
+    profile = cast(dict[str, Any], profile)
+    if profile.get("profile") != "dafx-legacy-delivery-v1" or not isinstance(profile.get("responses"), dict):
+        raise ValueError("Legacy delivery metadata has an unsupported profile.")
+    responses = cast(dict[str, dict[str, Any]], profile["responses"])
+    for correlation_id, snapshot in responses.items():
+        validate_identifier(correlation_id, "Legacy delivery correlationId")
+        if not isinstance(snapshot, dict):
+            raise ValueError("Legacy delivery snapshots must be response objects.")
+        serialize_terminal_response(snapshot)
+    return deepcopy(responses)
+
+
+def record_legacy_delivery(state: DurableAgentState, correlation_id: str, snapshot: dict[str, Any]) -> None:
+    """Stage a complete response in backward-readable entity extension metadata."""
+    responses = legacy_delivery_snapshots(state)
+    serialize_terminal_response(snapshot)
+    responses[correlation_id] = deepcopy(snapshot)
+    extensions = state.data.extension_data
+    if extensions is None:
+        extensions = {}
+        state.data.extension_data = extensions
+    previous = cast(dict[str, Any], extensions.get(_DELIVERIES, {}))
+    extensions[_DELIVERIES] = {
+        **previous,
+        "profile": "dafx-legacy-delivery-v1",
+        "responses": responses,
+    }
+
+
+def clear_legacy_deliveries(state: DurableAgentState) -> None:
+    """Reset known delivery results with the transcript while preserving opaque siblings."""
+    legacy_delivery_snapshots(state)
+    extensions = state.data.extension_data or {}
+    if _DELIVERIES in extensions:
+        profile = cast(dict[str, Any], extensions[_DELIVERIES])
+        extensions[_DELIVERIES] = {**profile, "responses": {}}
+
+
 def stage_legacy_request(
     state: DurableAgentState,
     request: RunRequest,
@@ -239,7 +288,7 @@ def stage_legacy_request(
         if not identity:
             kept.append(stored)
             continue
-        fingerprint = message_identity(stored.to_chat_message())
+        fingerprint = stored.ingestion_identity or message_identity(stored.to_chat_message())
         if request.context_message_ids is None and fingerprint in public.get(stored.message_id or "", []):
             continue
         prior = known.get(identity, [])

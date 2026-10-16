@@ -34,11 +34,14 @@ from ._invocation_safety import DurableToolGuard, InvocationProgress
 from ._legacy_execution import (
     bind_legacy_owner,
     bind_migrated_public_ingestion,
+    clear_legacy_deliveries,
+    legacy_delivery_snapshots,
     legacy_ingestion,
     legacy_public_ingestion,
     legacy_session_identity,
     migrated_public_ingestion,
     prepare_legacy_history,
+    record_legacy_delivery,
     restore_legacy_session,
     save_legacy_session,
     seed_legacy_memory,
@@ -46,6 +49,7 @@ from ._legacy_execution import (
 )
 from ._message_identity import message_identity
 from ._models import RunRequest
+from ._response_utils import load_agent_response, serialize_agent_response
 from ._retention import (
     DEFAULT_MAX_STATE_BYTES,
     DEFAULT_RETENTION,
@@ -57,6 +61,7 @@ from ._retention import (
 )
 from ._session_store import EntitySessionStore
 from ._shared_agent_state import DurableAgentState, DurableAgentStateMessage, DurableAgentStateResponse
+from ._shared_response import serialize_terminal_response
 from ._shared_state_validation import validate_identifier
 from ._state_capacity import StateCapacityError
 from ._state_migration import (
@@ -215,6 +220,7 @@ class CompatibleAgentEntity(AgentEntity):
         state = DurableAgentState.from_dict(source)
         legacy_ingestion(state)
         legacy_public_ingestion(state)
+        legacy_delivery_snapshots(state)
         # Prepare a detached view before side effects to reject ambiguous providers.
         bind_legacy_owner(state, prepare_legacy_history(self._registered_agent, options))
 
@@ -238,8 +244,9 @@ class CompatibleAgentEntity(AgentEntity):
         legacy_state = DurableAgentState.from_dict(source)
         bridge_receipts = legacy_ingestion(legacy_state) or {}
         public_receipts = legacy_public_ingestion(legacy_state)
+        deliveries = legacy_delivery_snapshots(legacy_state)
         used = bool(data.get("conversationHistory") or data.get("session") or data.get("ingestedPositions"))
-        used = used or "truncation" in data or bool(bridge_receipts) or bool(public_receipts)
+        used = used or "truncation" in data or bool(bridge_receipts) or bool(public_receipts) or bool(deliveries)
         evidence = (
             self._legacy_migration_evidence(deepcopy(source)) if self._legacy_migration_evidence is not None else None
         )
@@ -266,6 +273,11 @@ class CompatibleAgentEntity(AgentEntity):
             ).isoformat()
             _, results, _ = _completion_journal(completion, source_digest=digest, expires_at=expires_at)
             _validate_retained_completions(data.get("conversationHistory", []), results)
+            for correlation_id, snapshot in deliveries.items():
+                result = results.get(correlation_id)
+                original = serialize_terminal_response(snapshot)
+                if result is None or state_snapshot_digest(result["response"]) != state_snapshot_digest(original):
+                    raise ValueError("Completion evidence must preserve every known full legacy delivery snapshot.")
         if ((used or journal) and completion is None) or (positions and delivery is None):
             logger.info("Automatic migration deferred: required legacy migration evidence is unavailable.")
             return None
@@ -359,6 +371,9 @@ class CompatibleAgentEntity(AgentEntity):
         if self._retention != "keep_all":
             raise ValueError("Transcript compaction retention requires v2; this legacy session was not migrated.")
         working = DurableAgentState.from_dict(legacy)
+        snapshot = legacy_delivery_snapshots(working).get(request.correlation_id)
+        if snapshot is not None:
+            return load_agent_response(snapshot)
         completed = working.try_get_agent_response(request.correlation_id)
         if completed is not None:
             return completed
@@ -448,6 +463,8 @@ class CompatibleAgentEntity(AgentEntity):
                 response = await self._invoke_agent(
                     kwargs, request.correlation_id, self._state_provider.session_id, request.message, progress
                 )
+                snapshot = serialize_agent_response(response)
+                serialize_terminal_response(snapshot)
                 if session is not None:
                     if view.owner != "service":
                         session.service_session_id = inactive_service_id
@@ -455,6 +472,10 @@ class CompatibleAgentEntity(AgentEntity):
             except Exception as exc:
                 logger.exception("Legacy agent execution failed.")
                 working.data.extension_data = original_extensions
+                if request.context_messages is not None:
+                    working.data.conversation_history = [
+                        previous for previous in working.data.conversation_history if previous is not entry
+                    ]
                 response = AgentResponse(
                     messages=[
                         Message(
@@ -470,9 +491,11 @@ class CompatibleAgentEntity(AgentEntity):
                     created_at=datetime.now(timezone.utc).isoformat(),
                     additional_properties={"durable_status": "error", "correlation_id": request.correlation_id},
                 )
+                snapshot = serialize_agent_response(response)
             working.data.conversation_history.append(
                 DurableAgentStateResponse.from_run_response(request.correlation_id, response)
             )
+            record_legacy_delivery(working, request.correlation_id, snapshot)
             self._commit_legacy(source, working)
             return response
         finally:
@@ -489,6 +512,7 @@ class CompatibleAgentEntity(AgentEntity):
                 raise NotImplementedError("Reset of external history requires a provider-owned clear operation.")
             working.data.conversation_history.clear()
             working.data.session = None
+            clear_legacy_deliveries(working)
             self._commit_legacy(source, working)
             self._storage.invalidate()
             return

@@ -82,6 +82,14 @@ If a legacy session lacks a saved ID, restoration supplies the resolved entity i
 detached snapshot, without changing committed continuation before a successful run.
 Used sessions without authoritative migration evidence continue on the legacy execution path.
 Legacy history is never pressure-pruned; an enabled byte budget rejects oversized writes instead.
+New legacy completions retain their complete canonical Core delivery snapshots in the declared
+`extensionData._dafx_legacy_delivery` profile, preserving structured values and response metadata
+for cold duplicates. Historical transcript projections are not promoted into these snapshots.
+The profile is bounded by the entity-state budget, retained with legacy history, and cleared by
+legacy reset. It does not establish a complete historical completion journal; conversion evidence
+must preserve any full snapshots that are known.
+A nonempty delivery cache counts as used state even if retained history or session data is absent,
+so it cannot bypass conversion evidence or cause a known completion to execute again.
 
 An empty legacy profile can be converted automatically. Used profiles require a trusted
 `legacy_migration_evidence` callback returning `LegacyMigrationEvidence` with the complete,
@@ -116,6 +124,10 @@ Existing nonempty scalar cursors require trusted delivery evidence before accept
 when no bridge ledger exists. Failed runs do not advance that ledger. Conversion merges its
 acceptances into v2. Remote provider/model/tool effects remain at-least-once: a local state rollback
 cannot undo a remote side effect.
+Failed context deliveries also remove their staged request from replayable local history while
+retaining the terminal error, so a cold redelivery does not include the uncommitted input twice.
+Fingerprints use the original input identity, including message extras, rather than a transcript
+projection that may omit them.
 Automatic in-place conversion seeds active occurrence receipts only from the bridge ledger.
 Historical delivery journals validate accepted public lookups and cursor consistency; their
 public message IDs do not establish transport occurrence IDs. Exact public journal receipts are

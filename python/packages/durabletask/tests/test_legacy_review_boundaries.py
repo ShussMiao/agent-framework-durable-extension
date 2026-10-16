@@ -11,7 +11,7 @@ import pytest
 from _execution_test_support import JsonStateProvider, RecordingChatClient
 from _history_pipeline_test_support import ToolChatClient
 from _invocation_test_support import lookup
-from agent_framework import Agent, Message
+from agent_framework import Agent, AgentResponse, ContextProvider, Message
 from test_agent_compatibility_prototype import _evidence, _legacy
 from test_complete_compatibility import _continued, _ExternalHistory
 
@@ -19,6 +19,7 @@ from agent_framework_durabletask import (
     CompatibleAgentEntity,
     LegacyMigrationEvidence,
     RunRequest,
+    serialize_agent_response,
     state_snapshot_digest,
 )
 from agent_framework_durabletask._shared_response import serialize_terminal_response
@@ -33,6 +34,304 @@ class _ToolPolicyAgent(Agent):
         configuration = getattr(self.client, "function_invocation_configuration", {})
         self.invocations.append((dict(kwargs.get("options", {})), configuration.get("enabled")))
         return super().run(*args, **kwargs)
+
+
+class _RichReplyAgent(Agent):
+    def __init__(self, response: AgentResponse[Any]) -> None:
+        super().__init__(client=RecordingChatClient(), name="delivery")
+        self.response = response
+        self.invocations: list[str] = []
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        async def complete() -> AgentResponse[Any]:
+            self.invocations.append("model")
+            return deepcopy(self.response)
+
+        return complete()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [{"answer": [1, False, None]}, 0, False, None])
+@pytest.mark.parametrize("version", ["1.0.0", "1.1.0", "1.2.0"])
+async def test_new_legacy_deliveries_preserve_complete_response_on_cold_duplicates(value: Any, version: str) -> None:
+    response = AgentResponse(
+        messages=[Message("assistant", ["done"])],
+        value=value,
+        response_id="original-response",
+        finish_reason="stop",
+        additional_properties={"application": {"keep": True}},
+    )
+    provider = JsonStateProvider(_legacy(version=version))
+    first_agent = _RichReplyAgent(response)
+    first = CompatibleAgentEntity(first_agent, state_provider=provider, deployment_mode="legacy")
+    original = await first.run(RunRequest("new", correlation_id="new"))
+    committed = deepcopy(provider.raw)
+    cold_agent = _RichReplyAgent(AgentResponse(messages=[Message("assistant", ["must not execute"])]))
+    cold_provider = JsonStateProvider(committed)
+    cold = CompatibleAgentEntity(cold_agent, state_provider=cold_provider, deployment_mode="legacy")
+    duplicate = await cold.run(RunRequest("new", correlation_id="new"))
+    assert serialize_agent_response(duplicate) == serialize_agent_response(original)
+    assert (
+        duplicate.value == value and duplicate.response_id == "original-response" and duplicate.finish_reason == "stop"
+    )
+    assert first_agent.invocations == ["model"] and cold_agent.invocations == []
+    assert cold_provider.raw == committed and cold_provider.attempted_writes == 0
+
+
+@pytest.mark.asyncio
+async def test_historical_legacy_projection_is_not_promoted_to_a_complete_delivery() -> None:
+    source = _legacy()
+    agent = _RichReplyAgent(AgentResponse(messages=[Message("assistant", ["unused"])]))
+    provider = JsonStateProvider(source)
+    entity = CompatibleAgentEntity(agent, state_provider=provider, deployment_mode="legacy")
+    result = await entity.run(RunRequest("old", correlation_id="old"))
+    assert result.text == "old answer" and agent.invocations == []
+    assert provider.raw == source and provider.attempted_writes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["1.0.0", "1.1.0", "1.2.0"])
+@pytest.mark.parametrize("history", ["absent", "empty"])
+@pytest.mark.parametrize("cached", [False, True])
+async def test_partial_legacy_state_is_not_fresh_when_a_known_delivery_remains(
+    version: str,
+    history: str,
+    cached: bool,
+) -> None:
+    provider = JsonStateProvider(_legacy(version=version))
+    original = AgentResponse[Any](
+        messages=[Message("assistant", ["known"])],
+        value={"known": True},
+        response_id="known-response",
+        finish_reason="stop",
+    )
+    first = CompatibleAgentEntity(_RichReplyAgent(original), state_provider=provider, deployment_mode="legacy")
+    await first.run(RunRequest("known", correlation_id="known"))
+    source = deepcopy(provider.raw)
+    source["data"].pop("session", None)
+    if history == "absent":
+        source["data"].pop("conversationHistory")
+    else:
+        source["data"]["conversationHistory"] = []
+    if not cached:
+        source["data"]["extensionData"]["_dafx_legacy_delivery"]["responses"] = {}
+    cold_provider = JsonStateProvider(source)
+    agent = _RichReplyAgent(AgentResponse[Any](messages=[Message("assistant", ["fresh"])], value={"fresh": True}))
+    cold = CompatibleAgentEntity(agent, state_provider=cold_provider)
+    result = await cold.run(RunRequest("known", correlation_id="known"))
+    if cached:
+        assert result.value == {"known": True} and result.response_id == "known-response"
+        assert agent.invocations == [] and cold_provider.raw == source and cold_provider.attempted_writes == 0
+    else:
+        assert result.value == {"fresh": True} and agent.invocations == ["model"]
+        assert cold_provider.raw["schemaVersion"] == "2.0.0"
+
+
+def _context_extra(revision: int) -> dict[str, Any]:
+    raw = Message("user", ["delivered"], message_id="public").to_dict()
+    raw["future_message"] = {"revision": revision}
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_legacy_occurrence_revisions_include_original_message_extras() -> None:
+    provider = JsonStateProvider(_legacy())
+    client = RecordingChatClient()
+    for revision in (1, 2):
+        entity = CompatibleAgentEntity(
+            Agent(client=client, name="extras"),
+            state_provider=provider,
+            deployment_mode="legacy",
+        )
+        await entity.run(
+            RunRequest(
+                "",
+                correlation_id=f"revision-{revision}",
+                context_messages=[_context_extra(revision)],
+                context_message_ids=["occurrence"],
+            )
+        )
+    fingerprints = provider.raw["data"]["extensionData"]["_dafx_legacy_ingestion"]["messages"]["occurrence"]
+    assert len(fingerprints) == 2
+    assert sum(message.text == "delivered" for message in client.received_messages[-1]) == 2
+
+
+@pytest.mark.asyncio
+async def test_original_extra_fingerprint_survives_conversion_and_cold_redelivery() -> None:
+    provider = JsonStateProvider(_legacy())
+    first = CompatibleAgentEntity(
+        Agent(client=RecordingChatClient(), name="extras"),
+        state_provider=provider,
+        deployment_mode="legacy",
+    )
+    response = await first.run(
+        RunRequest(
+            "",
+            correlation_id="first",
+            context_messages=[_context_extra(1)],
+            context_message_ids=["occurrence"],
+        )
+    )
+    completed_at = provider.raw["data"]["conversationHistory"][-1]["createdAt"]
+
+    def evidence(raw: dict[str, Any]) -> LegacyMigrationEvidence:
+        completion = _evidence(raw).completion_evidence
+        assert completion is not None
+        completion["results"].append({
+            "correlationId": "first",
+            "outcome": "succeeded",
+            "completedAt": completed_at,
+            "response": serialize_terminal_response(serialize_agent_response(response)),
+        })
+        return LegacyMigrationEvidence(completion_evidence=completion)
+
+    converted = CompatibleAgentEntity(
+        Agent(client=RecordingChatClient(), name="extras"),
+        state_provider=provider,
+        legacy_migration_evidence=evidence,
+    )
+    await converted.run(RunRequest("convert", correlation_id="convert"))
+    client = RecordingChatClient()
+    cold = CompatibleAgentEntity(
+        Agent(client=client, name="extras"),
+        state_provider=JsonStateProvider(provider.raw),
+    )
+    await cold.run(
+        RunRequest(
+            "",
+            correlation_id="repeat",
+            context_messages=[_context_extra(1)],
+            context_message_ids=["occurrence"],
+        )
+    )
+    assert sum(message.text == "delivered" for message in client.received_messages[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_reset_clears_new_delivery_results_but_not_opaque_profile_siblings() -> None:
+    agent = _RichReplyAgent(
+        AgentResponse[Any](
+            messages=[Message("assistant", ["done"])],
+            value={"kept": True},
+        )
+    )
+    provider = JsonStateProvider(_legacy())
+    entity = CompatibleAgentEntity(agent, state_provider=provider, deployment_mode="legacy")
+    await entity.run(RunRequest("new", correlation_id="new"))
+    provider.raw["data"]["extensionData"]["_dafx_legacy_delivery"]["future"] = {"keep": True}
+    entity.reset()
+    profile = provider.raw["data"]["extensionData"]["_dafx_legacy_delivery"]
+    assert profile["responses"] == {} and profile["future"] == {"keep": True}
+    await entity.run(RunRequest("new", correlation_id="new"))
+    assert agent.invocations == ["model", "model"]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_legacy_delivery_profile_is_not_overwritten() -> None:
+    source = _legacy()
+    source["data"]["extensionData"]["_dafx_legacy_delivery"] = {"application": "opaque"}
+    provider = JsonStateProvider(source)
+    agent = _RichReplyAgent(AgentResponse(messages=[Message("assistant", ["unused"])]))
+    entity = CompatibleAgentEntity(agent, state_provider=provider, deployment_mode="legacy")
+    with pytest.raises(ValueError, match="Legacy delivery metadata"):
+        await entity.run(RunRequest("new", correlation_id="new"))
+    assert provider.raw == source and agent.invocations == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preserve", [False, True])
+async def test_conversion_evidence_must_preserve_known_full_delivery_fields(preserve: bool) -> None:
+    response = AgentResponse[Any](
+        messages=[Message("assistant", ["done"])],
+        value={"answer": 42},
+        response_id="full-response",
+        finish_reason="stop",
+    )
+    provider = JsonStateProvider(_legacy())
+    legacy = CompatibleAgentEntity(_RichReplyAgent(response), state_provider=provider, deployment_mode="legacy")
+    delivered = await legacy.run(RunRequest("new", correlation_id="new"))
+    source = deepcopy(provider.raw)
+    completed_at = source["data"]["conversationHistory"][-1]["createdAt"]
+
+    def evidence(raw: dict[str, Any]) -> LegacyMigrationEvidence:
+        completion = _evidence(raw).completion_evidence
+        assert completion is not None
+        snapshot = serialize_terminal_response(serialize_agent_response(delivered))
+        if not preserve:
+            snapshot.pop("value")
+        completion["results"].append({
+            "correlationId": "new",
+            "outcome": "succeeded",
+            "completedAt": completed_at,
+            "response": snapshot,
+        })
+        return LegacyMigrationEvidence(completion_evidence=completion)
+
+    client = RecordingChatClient()
+    converted = CompatibleAgentEntity(
+        Agent(client=client, name="delivery"),
+        state_provider=provider,
+        legacy_migration_evidence=evidence,
+    )
+    if not preserve:
+        with pytest.raises(ValueError, match="known full legacy delivery"):
+            await converted.run(RunRequest("convert", correlation_id="convert"))
+        assert provider.raw == source and client.received_messages == []
+    else:
+        await converted.run(RunRequest("convert", correlation_id="convert"))
+        cold = CompatibleAgentEntity(
+            Agent(client=RecordingChatClient(), name="delivery"),
+            state_provider=JsonStateProvider(provider.raw),
+        )
+        result = await cold.run(RunRequest("new", correlation_id="new"))
+        assert result.value == {"answer": 42} and result.response_id == "full-response"
+
+
+class _AfterRunFailure(ContextProvider):
+    async def after_run(self, **kwargs: Any) -> None:
+        raise OSError("audit save failed after model completion")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["model", "after-run"])
+async def test_failed_context_acceptance_does_not_replay_staged_request_on_cold_redelivery(phase: str) -> None:
+    source = _legacy()
+    provider = JsonStateProvider(source)
+    failing = Agent(
+        client=RecordingChatClient(fail=phase == "model"),
+        name="rollback",
+        context_providers=[_AfterRunFailure("audit")] if phase == "after-run" else [],
+    )
+    first = CompatibleAgentEntity(failing, state_provider=provider, deployment_mode="legacy")
+    failed = await first.run(
+        RunRequest(
+            "",
+            correlation_id="failed",
+            context_messages=[_context_extra(1)],
+            context_message_ids=["occurrence"],
+        )
+    )
+    assert failed.additional_properties["durable_status"] == "error"
+    assert not any(
+        entry.get("$type") == "request" and entry.get("correlationId") == "failed"
+        for entry in provider.raw["data"]["conversationHistory"]
+    )
+    assert provider.raw["data"]["conversationHistory"][-1]["correlationId"] == "failed"
+    client = RecordingChatClient()
+    cold = CompatibleAgentEntity(
+        Agent(client=client, name="rollback"),
+        state_provider=JsonStateProvider(provider.raw),
+        deployment_mode="legacy",
+    )
+    await cold.run(
+        RunRequest(
+            "",
+            correlation_id="retry",
+            context_messages=[_context_extra(1)],
+            context_message_ids=["occurrence"],
+        )
+    )
+    assert sum(message.text == "delivered" for message in client.received_messages[0]) == 1
 
 
 @pytest.mark.asyncio
@@ -224,7 +523,10 @@ async def test_failed_legacy_delivery_does_not_commit_either_receipt_namespace()
         )
     )
     assert response.additional_properties["durable_status"] == "error"
-    assert provider.raw["data"]["extensionData"] == source["data"]["extensionData"]
+    extensions = deepcopy(provider.raw["data"]["extensionData"])
+    delivery = extensions.pop("_dafx_legacy_delivery")
+    assert extensions == source["data"]["extensionData"]
+    assert delivery["responses"]["failed"] == serialize_agent_response(response)
     assert provider.raw["data"]["ingestedPositions"] == {"upstream": 0}
 
 
