@@ -45,8 +45,8 @@ from agent_framework_durabletask._workflows.serialization import serialize_workf
 
 
 class _ExternalHistory(HistoryProvider):
-    def __init__(self, *, fail: bool = False) -> None:
-        super().__init__("external")
+    def __init__(self, *, fail: bool = False, source_id: str = "external") -> None:
+        super().__init__(source_id)
         self.fail = fail
         self.ids: list[str | None] = []
         self.continuations: list[Any] = []
@@ -810,7 +810,11 @@ def test_legacy_nested_route_uses_recorded_ordinal_not_current_list_position() -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["legacy", None])
-async def test_recorded_scalar_delivery_evidence_seeds_legacy_occurrences(mode: str | None) -> None:
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_recorded_scalar_delivery_evidence_preserves_public_lookup_semantics(
+    mode: str | None,
+    explicit: bool,
+) -> None:
     source = _legacy()
     source["data"]["ingestedPositions"] = {"upstream": 0}
     accepted = Message("user", ["accepted"], message_id="accepted-id")
@@ -834,10 +838,10 @@ async def test_recorded_scalar_delivery_evidence_seeds_legacy_occurrences(mode: 
             "",
             correlation_id="delivery",
             context_messages=[accepted.to_dict()],
-            context_message_ids=["accepted-id"],
+            context_message_ids=["accepted-id"] if explicit else None,
         )
     )
-    assert all(message.text != "accepted" for message in client.received_messages[0])
+    assert any(message.text == "accepted" for message in client.received_messages[0]) is explicit
     assert provider.raw["data"]["ingestedPositions"] == {"upstream": 0}
     assert provider.raw["schemaVersion"] == "1.1.0"
 

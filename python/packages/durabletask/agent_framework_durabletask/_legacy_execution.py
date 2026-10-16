@@ -21,7 +21,12 @@ from ._history_provider import (
 from ._message_identity import message_identity
 from ._models import RunRequest
 from ._session_store import EntitySessionStore
-from ._shared_agent_state import DurableAgentState, DurableAgentStateMessage, DurableAgentStateRequest
+from ._shared_agent_state import (
+    DurableAgentState,
+    DurableAgentStateData,
+    DurableAgentStateMessage,
+    DurableAgentStateRequest,
+)
 from ._state_migration import (
     _journal_receipts,  # pyright: ignore[reportPrivateUsage]
     state_snapshot_digest,
@@ -109,7 +114,7 @@ def bind_legacy_owner(state: DurableAgentState, view: LegacyHistoryView) -> None
         state.data.extension_data = extensions
     selected = {"profile": "dafx-legacy-owner-v1", "owner": view.primary_owner, "sourceId": view.source_id}
     previous = extensions.get(_OWNER)
-    if previous is not None and previous != selected:
+    if _OWNER in extensions and previous != selected:
         raise ValueError("Legacy history ownership does not match the committed provider binding.")
     extensions[_OWNER] = selected
 
@@ -130,24 +135,50 @@ def legacy_session_identity(source: dict[str, Any], default: str) -> str:
     return identity or default
 
 
-def legacy_ingestion(state: DurableAgentState) -> dict[str, list[str] | None] | None:
-    """Read only the declared bridge-era acceptance profile, never guess from cursor maxima."""
+def _legacy_ingestion_profile(state: DurableAgentState) -> dict[str, Any] | None:
     profile = (state.data.extension_data or {}).get(_LEDGER)
     if profile is None:
         return None
     if not isinstance(profile, dict):
         raise ValueError("Legacy ingestion metadata has an unsupported profile.")
     profile = cast(dict[str, Any], profile)
-    if profile.get("profile") != "dafx-legacy-ingestion-v1":
+    if profile.get("profile") not in ("dafx-legacy-ingestion-v1", "dafx-legacy-ingestion-v2"):
         raise ValueError("Legacy ingestion metadata has an unsupported profile.")
-    messages = profile.get("messages")
-    if not isinstance(messages, dict):
+    if not isinstance(profile.get("messages"), dict):
         raise ValueError("Legacy ingestion metadata requires a messages object.")
+    return profile
+
+
+def legacy_ingestion(state: DurableAgentState) -> dict[str, list[str] | None] | None:
+    """Read only declared occurrence acceptances, never guess from cursor maxima."""
+    profile = _legacy_ingestion_profile(state)
+    if profile is None:
+        return None
     validation = DurableAgentState()
-    validated = cast(dict[str, list[str] | None], messages)
+    validated = cast(dict[str, list[str] | None], profile["messages"])
     validation.data.ingested_messages = deepcopy(validated)
     validation.to_dict()
     return deepcopy(validated)
+
+
+def _public_receipts(messages: Any) -> dict[str, list[str]]:
+    if not isinstance(messages, dict):
+        raise ValueError("Public ingestion metadata requires a messages object.")
+    messages = cast(dict[str, list[str]], messages)
+    if any(not isinstance(fingerprints, list) for fingerprints in messages.values()):
+        raise ValueError("Public ingestion receipts require exact content fingerprints.")
+    validation = DurableAgentState()
+    validation.data.ingested_messages.update(deepcopy(messages))
+    validation.to_dict()
+    return deepcopy(messages)
+
+
+def legacy_public_ingestion(state: DurableAgentState) -> dict[str, list[str]]:
+    """Keep recorded public lookups separate from the bridge occurrence ledger."""
+    profile = _legacy_ingestion_profile(state)
+    if profile is None or profile["profile"] != "dafx-legacy-ingestion-v2":
+        return {}
+    return _public_receipts(profile.get("publicMessages", {}))
 
 
 def migrated_public_ingestion(state: DurableAgentState) -> dict[str, list[str]]:
@@ -168,13 +199,7 @@ def migrated_public_ingestion(state: DurableAgentState) -> dict[str, list[str]]:
         or not isinstance(profile.get("messages"), dict)
     ):
         raise ValueError("Migrated public ingestion metadata has an unsupported profile.")
-    messages = cast(dict[str, list[str]], profile["messages"])
-    if any(not isinstance(fingerprints, list) for fingerprints in messages.values()):
-        raise ValueError("Migrated public ingestion receipts require exact content fingerprints.")
-    validation = DurableAgentState()
-    validation.data.ingested_messages.update(deepcopy(messages))
-    validation.to_dict()
-    return deepcopy(messages)
+    return _public_receipts(profile["messages"])
 
 
 def bind_migrated_public_ingestion(state: DurableAgentState, journal: dict[str, list[str]]) -> None:
@@ -198,13 +223,14 @@ def stage_legacy_request(
     if request.context_messages is None:
         return entry
     known = legacy_ingestion(state)
+    public = legacy_public_ingestion(state)
     if known is None:
         known = {}
         positions = state.data.ingested_positions or {}
         if positions and delivery_evidence is None:
             raise ValueError("Legacy ingestion positions require trusted delivery evidence before context delivery.")
         if delivery_evidence is not None:
-            _, known = _journal_receipts(
+            _, public = _journal_receipts(
                 delivery_evidence, source_digest=state_snapshot_digest(source), positions=positions
             )
     kept: list[DurableAgentStateMessage] = []
@@ -214,6 +240,8 @@ def stage_legacy_request(
             kept.append(stored)
             continue
         fingerprint = message_identity(stored.to_chat_message())
+        if request.context_message_ids is None and fingerprint in public.get(stored.message_id or "", []):
+            continue
         prior = known.get(identity, [])
         if prior is None or fingerprint in prior:
             continue
@@ -224,8 +252,28 @@ def stage_legacy_request(
     if extensions is None:
         extensions = {}
         state.data.extension_data = extensions
-    extensions[_LEDGER] = {"profile": "dafx-legacy-ingestion-v1", "messages": known}
+    profile = _legacy_ingestion_profile(state) or {}
+    extensions[_LEDGER] = {
+        **profile,
+        "profile": "dafx-legacy-ingestion-v2" if public else profile.get("profile", "dafx-legacy-ingestion-v1"),
+        "messages": known,
+        **({"publicMessages": public} if public else {}),
+    }
     return entry
+
+
+async def restore_legacy_session(
+    data: DurableAgentStateData,
+    scope: str,
+    identity: str,
+) -> AgentSession | None:
+    """Normalize the resolved identity only on a detached restoration snapshot."""
+    if data.session is None:
+        return None
+    snapshot = deepcopy(data.session)
+    snapshot["session_id"] = identity
+    restored = DurableAgentStateData(session=snapshot)
+    return await EntitySessionStore(restored, scope).get(scope)
 
 
 def seed_legacy_memory(view: LegacyHistoryView, session: Any, prior: list[Message]) -> None:

@@ -35,9 +35,11 @@ from ._legacy_execution import (
     bind_legacy_owner,
     bind_migrated_public_ingestion,
     legacy_ingestion,
+    legacy_public_ingestion,
     legacy_session_identity,
     migrated_public_ingestion,
     prepare_legacy_history,
+    restore_legacy_session,
     save_legacy_session,
     seed_legacy_memory,
     stage_legacy_request,
@@ -210,9 +212,11 @@ class CompatibleAgentEntity(AgentEntity):
         if any(name in data for name in ("historyBinding", "pythonIngestion", "terminalResults", "completionReceipts")):
             raise ValueError("Legacy state contains schema-2 control fields.")
         legacy_session_identity(source, self._state_provider.core_session_id)
-        legacy_ingestion(DurableAgentState.from_dict(source))
+        state = DurableAgentState.from_dict(source)
+        legacy_ingestion(state)
+        legacy_public_ingestion(state)
         # Prepare a detached view before side effects to reject ambiguous providers.
-        prepare_legacy_history(self._registered_agent, options)
+        bind_legacy_owner(state, prepare_legacy_history(self._registered_agent, options))
 
     def _check_legacy_capacity(self, state: DurableAgentState) -> None:
         if self._max_state_bytes is not None:
@@ -233,8 +237,9 @@ class CompatibleAgentEntity(AgentEntity):
         data = source["data"]
         legacy_state = DurableAgentState.from_dict(source)
         bridge_receipts = legacy_ingestion(legacy_state) or {}
+        public_receipts = legacy_public_ingestion(legacy_state)
         used = bool(data.get("conversationHistory") or data.get("session") or data.get("ingestedPositions"))
-        used = used or "truncation" in data or bool(bridge_receipts)
+        used = used or "truncation" in data or bool(bridge_receipts) or bool(public_receipts)
         evidence = (
             self._legacy_migration_evidence(deepcopy(source)) if self._legacy_migration_evidence is not None else None
         )
@@ -248,6 +253,13 @@ class CompatibleAgentEntity(AgentEntity):
         if delivery is not None:
             _, journal = _journal_receipts(delivery, source_digest=digest, positions=positions)
             _apply_journal(legacy_state, journal)
+            if any(
+                fingerprint not in journal.get(identity, [])
+                for identity, fingerprints in public_receipts.items()
+                for fingerprint in fingerprints
+            ):
+                raise ValueError("Recorded delivery evidence omits committed public lookup fingerprints.")
+            public_receipts = journal
         if completion is not None:
             expires_at = (
                 datetime.now(timezone.utc) + timedelta(seconds=self._response_delivery_window_seconds)
@@ -286,7 +298,7 @@ class CompatibleAgentEntity(AgentEntity):
         # Historical journals key public lookups, not delivery occurrences.
         # Only the declared bridge ledger establishes active occurrence receipts.
         converted.data.ingested_messages = deepcopy(bridge_receipts)
-        bind_migrated_public_ingestion(converted, journal)
+        bind_migrated_public_ingestion(converted, public_receipts)
         return converted
 
     def _drop_already_stored(
@@ -384,6 +396,8 @@ class CompatibleAgentEntity(AgentEntity):
         try:
             options = {**request.options}
             options.setdefault("response_format", request.response_format)
+            if not request.enable_tool_calls:
+                self._disable_tool_calls(options)
             current = [
                 message
                 for stored in entry.messages
@@ -394,12 +408,13 @@ class CompatibleAgentEntity(AgentEntity):
             store = EntitySessionStore(working.data, self._state_provider.core_session_id)
             inactive_service_id: Any = None
             if callable(create):
-                session = create(session_id=legacy_session_identity(legacy, self._state_provider.core_session_id))
+                identity = legacy_session_identity(legacy, self._state_provider.core_session_id)
+                session = create(session_id=identity)
                 if inspect.isawaitable(session):
                     session = await session
                 if not isinstance(getattr(session, "state", None), dict):
                     raise TypeError("Legacy create_session must return a session with object-valued state.")
-                restored = await store.get(self._state_provider.core_session_id)
+                restored = await restore_legacy_session(working.data, self._state_provider.core_session_id, identity)
                 if restored is not None:
                     session.state.update(restored.state)
                     session.service_session_id = restored.service_session_id
@@ -470,6 +485,8 @@ class CompatibleAgentEntity(AgentEntity):
             legacy = source or DurableAgentState(schema_version="1.1.0").to_dict()
             self._validate_legacy_profile(legacy, {})
             working = DurableAgentState.from_dict(legacy)
+            if prepare_legacy_history(self._registered_agent, {}).primary_owner == "external":
+                raise NotImplementedError("Reset of external history requires a provider-owned clear operation.")
             working.data.conversation_history.clear()
             working.data.session = None
             self._commit_legacy(source, working)

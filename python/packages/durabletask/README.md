@@ -78,6 +78,8 @@ Both hosts support legacy state versions 1.0, 1.1 and 1.2, entity-owned transcri
 external history providers and service-owned conversations. They restore serialized provider
 state and the original logical session ID, preserve unknown session siblings, and retain an
 inactive service continuation across local-history turns. Registered providers are not mutated.
+If a legacy session lacks a saved ID, restoration supplies the resolved entity identity on a
+detached snapshot, without changing committed continuation before a successful run.
 Used sessions without authoritative migration evidence continue on the legacy execution path.
 Legacy history is never pressure-pruned; an enabled byte budget rejects oversized writes instead.
 
@@ -98,10 +100,18 @@ are reconciled from the subsequently read state.
 Legacy mode can return committed v2 duplicates but cannot run new v2 turns, reset v2 state,
 expire v2 results or perform migration. It never downgrades receipts. Legacy cleanup is a no-op,
 and legacy reset retains its schema and unrelated metadata.
+Legacy reset rejects an external primary history provider, matching v2. The runtime provides no
+generic provider-owned clear operation, so it must not report a local-only reset as complete.
+The committed legacy owner is checked before continuation or conversion, so completion evidence
+never authorizes switching providers. Disabling tool calls uses the same invocation-local policy
+in both paths, removing configured/request tools without mutating registered agents or clients.
 
 Legacy workflow context uses explicit delivery occurrences and content fingerprints, not public
 message IDs or cursor maxima as inferred provenance. The declared `_dafx_legacy_ingestion`
 extension records bridge-era acceptances; `_dafx_legacy_owner` binds the selected provider.
+The ingestion profile's v2 form stores historical public lookups in `publicMessages`, separate
+from accepted occurrences in `messages`. Its v1 form remains readable without activating unknown
+siblings. Public lookups are consulted only when explicit occurrence IDs are absent.
 Existing nonempty scalar cursors require trusted delivery evidence before accepting new context
 when no bridge ledger exists. Failed runs do not advance that ledger. Conversion merges its
 acceptances into v2. Remote provider/model/tool effects remain at-least-once: a local state rollback

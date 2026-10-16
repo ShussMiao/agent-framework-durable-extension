@@ -808,28 +808,7 @@ class AgentEntity:
         try:
             self.agent = prepare_history_owner(self.agent, service_owns_history)
             if not run_request.enable_tool_calls:
-                invocation_agent = copy(self.agent)
-                defaults = getattr(invocation_agent, "default_options", None)
-                if isinstance(defaults, Mapping):
-                    invocation_agent.default_options = {  # type: ignore[attr-defined]
-                        **cast("Mapping[str, Any]", defaults),
-                        "tools": [],
-                        "tool_choice": "none",
-                    }
-                client = getattr(invocation_agent, "client", None)
-                invocation_configuration = getattr(client, "function_invocation_configuration", None)
-                if client is not None and isinstance(invocation_configuration, Mapping):
-                    invocation_client = copy(client)
-                    invocation_client.function_invocation_configuration = {
-                        **cast("Mapping[str, Any]", invocation_configuration),
-                        "enabled": False,
-                    }
-                    invocation_agent.client = invocation_client  # type: ignore[attr-defined]
-                if isinstance(getattr(invocation_agent, "mcp_tools", None), list):
-                    invocation_agent.mcp_tools = []  # type: ignore[attr-defined]
-                self.agent = invocation_agent
-                options["tools"] = []
-                options["tool_choice"] = "none"
+                self._disable_tool_calls(options)
             if uses_context_pipeline:
                 session = await self._create_session()
                 if not service_owns_history:
@@ -1369,6 +1348,31 @@ class AgentEntity:
             self._state_provider.core_session_id,
             transient_history_source=history.source_id if history is not None else None,
         )
+
+    def _disable_tool_calls(self, options: dict[str, Any]) -> None:
+        """Apply the invocation-local policy without changing registered defaults."""
+        invocation_agent = copy(self.agent)
+        defaults = getattr(invocation_agent, "default_options", None)
+        if isinstance(defaults, Mapping):
+            invocation_agent.default_options = {  # type: ignore[attr-defined]
+                **cast("Mapping[str, Any]", defaults),
+                "tools": [],
+                "tool_choice": "none",
+            }
+        client = getattr(invocation_agent, "client", None)
+        configuration = getattr(client, "function_invocation_configuration", None)
+        if client is not None and isinstance(configuration, Mapping):
+            invocation_client = copy(client)
+            invocation_client.function_invocation_configuration = {
+                **cast("Mapping[str, Any]", configuration),
+                "enabled": False,
+            }
+            invocation_agent.client = invocation_client  # type: ignore[attr-defined]
+        if isinstance(getattr(invocation_agent, "mcp_tools", None), list):
+            invocation_agent.mcp_tools = []  # type: ignore[attr-defined]
+        self.agent = invocation_agent
+        options["tools"] = []
+        options["tool_choice"] = "none"
 
     def _drop_already_stored(
         self, messages: list[DurableAgentStateMessage], *, occurrence_ids: list[str] | None = None
