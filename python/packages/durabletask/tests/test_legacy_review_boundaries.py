@@ -17,8 +17,11 @@ from test_complete_compatibility import _continued, _ExternalHistory
 
 from agent_framework_durabletask import (
     CompatibleAgentEntity,
+    DurableAgentState,
+    LegacyDurableAgentState,
     LegacyMigrationEvidence,
     RunRequest,
+    read_agent_state,
     serialize_agent_response,
     state_snapshot_digest,
 )
@@ -48,6 +51,36 @@ class _RichReplyAgent(Agent):
             return deepcopy(self.response)
 
         return complete()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reader_kind", ["dispatcher", "legacy", "shared"])
+async def test_legacy_readers_share_complete_delivery_lookup_without_mutating_state(reader_kind: str) -> None:
+    provider = JsonStateProvider(_legacy())
+    response = AgentResponse[Any](
+        messages=[Message("assistant", ["done"])],
+        value={"answer": 42},
+        response_id="full",
+        finish_reason="stop",
+    )
+    producer = CompatibleAgentEntity(_RichReplyAgent(response), state_provider=provider, deployment_mode="legacy")
+    await producer.run(RunRequest("new", correlation_id="new"))
+    raw = deepcopy(provider.raw)
+    raw["data"].pop("conversationHistory")
+    before = deepcopy(raw)
+    reader = (
+        read_agent_state(raw)
+        if reader_kind == "dispatcher"
+        else LegacyDurableAgentState.from_dict(raw)
+        if reader_kind == "legacy"
+        else DurableAgentState.from_dict(raw)
+    )
+    delivered: AgentResponse[Any] | None = reader.try_get_agent_response("new")
+    assert delivered is not None and delivered.value == {"answer": 42}
+    delivered.value["answer"] = 99
+    repeated = reader.try_get_agent_response("new")
+    assert repeated is not None and repeated.value == {"answer": 42}
+    assert raw == before
 
 
 @pytest.mark.asyncio

@@ -49,7 +49,7 @@ from ._legacy_execution import (
 )
 from ._message_identity import message_identity
 from ._models import RunRequest
-from ._response_utils import load_agent_response, serialize_agent_response
+from ._response_utils import serialize_agent_response
 from ._retention import (
     DEFAULT_MAX_STATE_BYTES,
     DEFAULT_RETENTION,
@@ -371,9 +371,6 @@ class CompatibleAgentEntity(AgentEntity):
         if self._retention != "keep_all":
             raise ValueError("Transcript compaction retention requires v2; this legacy session was not migrated.")
         working = DurableAgentState.from_dict(legacy)
-        snapshot = legacy_delivery_snapshots(working).get(request.correlation_id)
-        if snapshot is not None:
-            return load_agent_response(snapshot)
         completed = working.try_get_agent_response(request.correlation_id)
         if completed is not None:
             return completed
@@ -470,7 +467,11 @@ class CompatibleAgentEntity(AgentEntity):
                         session.service_session_id = inactive_service_id
                     await save_legacy_session(store, self._state_provider.core_session_id, session, view.memory_sources)
             except Exception as exc:
-                logger.exception("Legacy agent execution failed.")
+                diagnostic = _validation_diagnostic(exc)
+                if diagnostic is not None:
+                    logger.error("Legacy agent execution failed. %s", diagnostic)
+                else:
+                    logger.exception("Legacy agent execution failed.")
                 working.data.extension_data = original_extensions
                 if request.context_messages is not None:
                     working.data.conversation_history = [
@@ -482,7 +483,7 @@ class CompatibleAgentEntity(AgentEntity):
                             "assistant",
                             [
                                 Content.from_error(
-                                    message=_validation_diagnostic(exc) or str(exc),
+                                    message=diagnostic or str(exc),
                                     error_code=type(exc).__name__,
                                 )
                             ],

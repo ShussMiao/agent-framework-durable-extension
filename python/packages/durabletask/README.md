@@ -85,6 +85,11 @@ Legacy history is never pressure-pruned; an enabled byte budget rejects oversize
 New legacy completions retain their complete canonical Core delivery snapshots in the declared
 `extensionData._dafx_legacy_delivery` profile, preserving structured values and response metadata
 for cold duplicates. Historical transcript projections are not promoted into these snapshots.
+Both legacy readers and public client polling consult the same validated delivery profile.
+Functions includes the full `agentResponse`/`agent_response` fields for declared full deliveries,
+while historical text-only payloads and legacy status behavior remain unchanged.
+Legacy validation failures use the same sanitized diagnostic-first logging as v2, including
+wrapped and grouped Pydantic errors, without logging their private input values or tracebacks.
 The profile is bounded by the entity-state budget, retained with legacy history, and cleared by
 legacy reset. It does not establish a complete historical completion journal; conversion evidence
 must preserve any full snapshots that are known.

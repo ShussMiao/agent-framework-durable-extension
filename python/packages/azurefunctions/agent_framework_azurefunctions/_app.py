@@ -69,6 +69,7 @@ from agent_framework_durabletask import (
     validate_workflow_start_input,
     wrap_workflow_input,
 )
+from agent_framework_durabletask._legacy_delivery import read_legacy_deliveries
 from agent_framework_durabletask._workflows._legacy_serialization import deserialize_value as deserialize_legacy_value
 from agent_framework_durabletask._workflows.compatibility import (
     WorkflowExecutionResolver,
@@ -2076,6 +2077,10 @@ class AgentFunctionApp(DFAppBase):
                     correlation_id=correlation_id,
                     state=state,
                 )
+                if correlation_id in read_legacy_deliveries(state.data.extension_data):
+                    delivery = serialize_agent_response(agent_response)
+                    result["agent_response"] = delivery
+                    result["agentResponse"] = delivery
                 logger.debug(f"[HTTP Trigger] Found response for correlation ID: {correlation_id}")
 
         except Exception:
