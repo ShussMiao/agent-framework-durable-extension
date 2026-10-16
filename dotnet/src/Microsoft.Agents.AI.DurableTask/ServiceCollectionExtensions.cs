@@ -106,7 +106,7 @@ public static class ServiceCollectionExtensions
     /// <para>
     /// Configuration delegates run during registration. Complete all registrations before resolving services:
     /// the completed agent configuration is validated and its deployment environment captured on first options
-    /// resolution or host startup, before the registered SDK worker or client is initialized.
+    /// resolution or host startup, before registered agent factories run or the SDK worker or client is initialized.
     /// </para>
     /// </remarks>
     /// <param name="services">The service collection to configure.</param>
@@ -219,9 +219,9 @@ public static class ServiceCollectionExtensions
         // Register workflow and agent services
         services.TryAddSingleton<DataConverter, DurableDataConverter>();
 
-        // Register agent factories resolver - returns factories from the shared options
+        // Finalize options before exposing factories, including to Functions metadata generation.
         services.TryAddSingleton(
-            sp => sp.GetRequiredService<DurableOptions>().Agents.GetAgentFactories());
+            sp => sp.GetRequiredService<DurableAgentsOptions>().GetAgentFactories());
 
         // Register DurableAgentsOptions resolver
         services.TryAddSingleton(sp => sp.GetRequiredService<IOptions<DurableAgentsOptions>>().Value);
