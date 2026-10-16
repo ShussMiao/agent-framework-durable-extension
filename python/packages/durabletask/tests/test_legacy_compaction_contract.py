@@ -15,6 +15,7 @@ from agent_framework import (
     SUMMARY_OF_MESSAGE_IDS_KEY,
     Agent,
     CompactionProvider,
+    ContextProvider,
     InMemoryHistoryProvider,
     Message,
     included_token_count,
@@ -31,6 +32,148 @@ from agent_framework_durabletask import (
     state_snapshot_digest,
 )
 from agent_framework_durabletask._shared_response import serialize_terminal_response
+
+
+class _LateHistoryInsert(ContextProvider):
+    def __init__(self, enabled: bool) -> None:
+        super().__init__("late")
+        self.enabled = enabled
+
+    async def after_run(self, *, session: Any, **kwargs: Any) -> None:
+        if self.enabled:
+            session.state[InMemoryHistoryProvider.DEFAULT_SOURCE_ID]["messages"].append(Message("system", ["late"]))
+
+
+@pytest.mark.parametrize("late", [False, True])
+async def test_late_buffer_insertions_survive_cold_continuation(late: bool) -> None:
+    async def compact(messages: list[Message]) -> bool:
+        return False
+
+    history = InMemoryHistoryProvider()
+    provider = JsonStateProvider(_legacy())
+    entity = CompatibleAgentEntity(
+        Agent(
+            client=RecordingChatClient(),
+            context_providers=[
+                _LateHistoryInsert(late),
+                CompactionProvider(after_strategy=compact, history_source_id=history.source_id),
+                history,
+            ],
+        ),
+        state_provider=provider,
+        deployment_mode="legacy",
+    )
+    result = await entity.run(RunRequest("new", correlation_id="first"))
+    assert not result.additional_properties.get("durable_status")
+    client = RecordingChatClient()
+    cold = CompatibleAgentEntity(
+        Agent(client=client), state_provider=JsonStateProvider(provider.raw), deployment_mode="legacy"
+    )
+    await cold.run(RunRequest("next", correlation_id="next"))
+    expected = ["old question", "old answer", "new", "reply-1", *(["late"] if late else []), "next"]
+    assert [message.text for message in client.received_messages[0]] == expected
+
+
+@pytest.mark.parametrize("current", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_in_place_summary_keeps_original_source_and_derived_identities_distinct(
+    current: bool, nested: bool
+) -> None:
+    original_text = "new" if current else "old question"
+
+    async def compact(messages: list[Message]) -> bool:
+        source = next(message for message in messages if message.text == original_text)
+        original_id = source.message_id
+        source.role = "system"
+        source.contents = Message("system", ["summary"]).contents
+        group = source.additional_properties[GROUP_ANNOTATION_KEY] if nested else source.additional_properties
+        group[SUMMARY_OF_MESSAGE_IDS_KEY] = [original_id]
+        group[SUMMARIZED_BY_SUMMARY_ID_KEY] = original_id
+        return True
+
+    history = InMemoryHistoryProvider()
+    provider = JsonStateProvider(_legacy())
+    entity = CompatibleAgentEntity(
+        Agent(
+            client=RecordingChatClient(),
+            context_providers=[
+                CompactionProvider(after_strategy=compact, history_source_id=history.source_id),
+                history,
+            ],
+        ),
+        state_provider=provider,
+        deployment_mode="legacy",
+    )
+    result = await entity.run(RunRequest("new", correlation_id="first"))
+    assert not result.additional_properties.get("durable_status")
+    raw = provider.raw
+    assert raw["data"]["extensionData"]["_dafx_legacy_history"]["generated"]
+    reference = raw["data"]["extensionData"]["_dafx_legacy_history"]["generated"][0]
+    index, offset = (int(part) for part in reference.split(":"))
+    summary = raw["data"]["conversationHistory"][index]["messages"][offset]
+    group = summary["extensionData"][GROUP_ANNOTATION_KEY] if nested else summary["extensionData"]
+    source_id = group[SUMMARY_OF_MESSAGE_IDS_KEY][0]
+    assert source_id != f"dafx_legacy:{reference}"
+    index, offset = (int(part) for part in source_id.removeprefix("dafx_legacy:").split(":"))
+    archived = raw["data"]["conversationHistory"][index]["messages"][offset]
+    assert archived["contents"][0]["text"] == original_text
+    assert archived["extensionData"]["_excluded"] is True
+    source_properties = archived["extensionData"][GROUP_ANNOTATION_KEY] if nested else archived["extensionData"]
+    assert source_properties[SUMMARIZED_BY_SUMMARY_ID_KEY] == f"dafx_legacy:{reference}"
+    assert SUMMARIZED_BY_SUMMARY_ID_KEY not in group
+
+
+@pytest.mark.parametrize("same_text", [False, True])
+async def test_in_place_summary_revisions_keep_their_complete_source_chain(same_text: bool) -> None:
+    async def rewrite(messages: list[Message], text: str) -> bool:
+        source = messages[0]
+        identity = source.message_id
+        source.role = "system"
+        source.contents = Message("system", [text]).contents
+        source.additional_properties[GROUP_ANNOTATION_KEY].update({
+            SUMMARY_OF_MESSAGE_IDS_KEY: [identity],
+            SUMMARIZED_BY_SUMMARY_ID_KEY: identity,
+        })
+        return True
+
+    async def first(messages: list[Message]) -> bool:
+        return await rewrite(messages, "summary-one")
+
+    async def second(messages: list[Message]) -> bool:
+        return await rewrite(messages, "summary-one" if same_text else "summary-two")
+
+    history = InMemoryHistoryProvider()
+    provider = JsonStateProvider(_legacy())
+    entity = CompatibleAgentEntity(
+        Agent(
+            client=RecordingChatClient(),
+            context_providers=[
+                CompactionProvider(after_strategy=second, history_source_id=history.source_id, source_id="second"),
+                CompactionProvider(after_strategy=first, history_source_id=history.source_id, source_id="first"),
+                history,
+            ],
+        ),
+        state_provider=provider,
+        deployment_mode="legacy",
+    )
+    result = await entity.run(RunRequest("new", correlation_id="first"))
+    assert not result.additional_properties.get("durable_status")
+    raw = provider.raw
+    references = raw["data"]["extensionData"]["_dafx_legacy_history"]["generated"]
+    assert len(references) == 2
+    chain = ["0:0", *references]
+    for source_reference, summary_reference in zip(chain, chain[1:]):
+        source_index, source_offset = (int(part) for part in source_reference.split(":"))
+        summary_index, summary_offset = (int(part) for part in summary_reference.split(":"))
+        source = raw["data"]["conversationHistory"][source_index]["messages"][source_offset]
+        summary = raw["data"]["conversationHistory"][summary_index]["messages"][summary_offset]
+        assert source["extensionData"]["_excluded"] is True
+        assert source["extensionData"][GROUP_ANNOTATION_KEY][SUMMARIZED_BY_SUMMARY_ID_KEY] == (
+            f"dafx_legacy:{summary_reference}"
+        )
+        assert summary["extensionData"][GROUP_ANNOTATION_KEY][SUMMARY_OF_MESSAGE_IDS_KEY] == [
+            f"dafx_legacy:{source_reference}"
+        ]
 
 
 @pytest.mark.parametrize("compact", [False, True])

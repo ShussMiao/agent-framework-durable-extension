@@ -99,7 +99,7 @@ class LegacyInputAcceptance:
 
     def record(self, messages: Sequence[Message], response: AgentResponse | None, live_memory: bool) -> None:
         if live_memory and self.memory_history is not None:
-            self.memory_history.observe(list(messages))
+            self.memory_history.capture_write(list(messages))
         outputs = {id(message) for message in response.messages} if response is not None else set[int]()
         inputs: list[Message | DurableAgentStateMessage] = []
         replies: list[Message | DurableAgentStateMessage] = []
@@ -172,7 +172,7 @@ class LegacyInputAcceptance:
                 return deepcopy(message)
             snapshot = DurableAgentStateMessage.from_chat_message(message)
             if self.memory_history is not None:
-                self.memory_history.link(message, snapshot)
+                snapshot = self.memory_history.link(message, snapshot)
             return snapshot
 
         for write in self._saved:

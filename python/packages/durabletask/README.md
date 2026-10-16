@@ -162,6 +162,8 @@ messages under `keep_all`. The declared `extensionData._dafx_legacy_history` pro
 message-slot replay order and generated summary/revision slots without changing public message IDs
 or creating input receipts. Anonymous and duplicate public IDs use distinct transient reconciliation
 identities. Unknown profile siblings and untouched historical JSON are retained.
+Late buffer insertions receive identities at final reconciliation. In-place summary revisions retain
+distinct archived source identities and backlinks, including sources from the current turn's writes.
 Cold legacy turns honor that order even without a compaction provider. Reset clears only the
 profile's owned ordering fields. Migration materializes the order as canonical v2 history after
 validating the original source and journals; generated summaries never become delivered-input

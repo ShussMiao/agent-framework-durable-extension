@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from collections.abc import Iterator
 from copy import copy, deepcopy
 from typing import Any, cast
@@ -33,6 +34,15 @@ _FIELD = "_dafx_legacy_history"
 _PROFILE = "dafx-legacy-history-v1"
 _PREFIX = "dafx_legacy:"
 HistorySlot = tuple[str, DurableAgentStateEntry, DurableAgentStateMessage]
+
+
+def _summary_properties(message: Message) -> dict[str, Any]:
+    group = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+    if isinstance(group, dict):
+        properties = cast("dict[str, Any]", group)
+        if properties.get(SUMMARY_OF_MESSAGE_IDS_KEY) is not None:
+            return properties
+    return message.additional_properties
 
 
 def _slots(state: DurableAgentState) -> list[HistorySlot]:
@@ -155,6 +165,9 @@ class LegacyMemoryHistory:
         self._candidate_ids: dict[int, str] = {}
         self._public_ids: dict[str, str | None] = {}
         self._bodies: dict[str, str] = {}
+        self._snapshots: dict[str, DurableAgentStateMessage] = {}
+        self._writes: dict[int, str] = {}
+        self._archived: dict[str, None] = {}
         self._ordinal = 0
         self._scope = uuid4().hex
         generated = generated_legacy_history(state)
@@ -164,7 +177,9 @@ class LegacyMemoryHistory:
     def _body(message: Message) -> str:
         payload = serialize_input_message(message)
         payload.pop("additional_properties", None)
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        sources = _summary_properties(message).get(SUMMARY_OF_MESSAGE_IDS_KEY)
+        version: dict[str, Any] = {"message": payload, "summarySources": sources if isinstance(sources, list) else None}
+        return json.dumps(version, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
     def bind(self, reference: str, stored: DurableAgentStateMessage, message: Message) -> None:
         token = f"{_PREFIX}{reference}"
@@ -186,6 +201,50 @@ class LegacyMemoryHistory:
                 self._public_ids[cast(str, getattr(message, self._attribute))] = message.message_id
             self._working[cast(str, getattr(message, self._attribute))] = message
 
+    def _remember(self, message: Message) -> None:
+        token = cast(str, getattr(message, self._attribute))
+        if token not in self._snapshots:
+            self._snapshots[token] = DurableAgentStateMessage.from_core_dict(serialize_input_message(message))
+        self._bodies.setdefault(token, self._body(message))
+
+    def capture_write(self, messages: list[Message]) -> None:
+        self.observe(messages)
+        for message in messages:
+            token = cast(str, getattr(message, self._attribute))
+            self._writes.setdefault(id(message), token)
+            self._remember(message)
+
+    def _separate_revision(self, message: Message) -> None:
+        token = cast(str, getattr(message, self._attribute))
+        original = self._linked.get(token) or self._snapshots.get(token)
+        if original is None or self._body(message) == self._bodies[token]:
+            return
+        archived = original.to_chat_message()
+        archived.additional_properties = deepcopy(original.extension_data or {})
+        setattr(archived, self._attribute, token)
+        raw_group = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+        group = cast("dict[str, Any]", raw_group) if isinstance(raw_group, dict) else None
+        links = _summary_properties(message)
+        sources = links.get(SUMMARY_OF_MESSAGE_IDS_KEY, [])
+        candidates = {token, message.message_id, self._candidate_ids.get(id(message))} - {None}
+        if isinstance(sources, list) and token in sources:
+            for properties, target in (
+                (message.additional_properties, archived.additional_properties),
+                (group, archived.additional_properties.setdefault(GROUP_ANNOTATION_KEY, {})),
+            ):
+                if isinstance(properties, dict) and isinstance(target, dict):
+                    source_properties = properties
+                    value = source_properties.get(SUMMARIZED_BY_SUMMARY_ID_KEY)
+                    if SUMMARIZED_BY_SUMMARY_ID_KEY in source_properties and any(
+                        value == candidate for candidate in candidates
+                    ):
+                        target[SUMMARIZED_BY_SUMMARY_ID_KEY] = value
+                        del source_properties[SUMMARIZED_BY_SUMMARY_ID_KEY]
+        self._working[token] = archived
+        self._archived.setdefault(token, None)
+        self.observe([message])
+        self._remember(message)
+
     def observe_compaction(self, messages: list[Message], within_strategy: bool) -> None:
         if not within_strategy:
             for message in messages:
@@ -205,19 +264,29 @@ class LegacyMemoryHistory:
                 self._candidate_ids[id(message)] = candidate
         self.observe(messages)
         for message in messages:
+            message.message_id = public_ids[id(message)]
+            self._separate_revision(message)
+            self._remember(message)
             token = cast(str, getattr(message, self._attribute))
-            self._public_ids[token] = public_ids[id(message)]
+            self._public_ids[token] = message.message_id
             message.message_id = token
         identities = {
             cast(str, getattr(message, self._attribute)): cast(str, message.message_id) for message in messages
         }
         self._repair_links(messages, identities)
 
-    def link(self, message: Message, stored: DurableAgentStateMessage) -> None:
+    def link(self, message: Message, stored: DurableAgentStateMessage) -> DurableAgentStateMessage:
         self.observe([message])
+        self._separate_revision(message)
         token = cast("str", getattr(message, self._attribute))
+        original = self._writes.get(id(message), token)
+        if original != token:
+            stored = deepcopy(self._snapshots[original])
+            self._linked[original] = stored
+            return stored
         self._linked[token] = stored
         self._bodies[token] = self._body(message)
+        return stored
 
     @staticmethod
     def _annotations(message: Message) -> dict[str, Any]:
@@ -227,7 +296,7 @@ class LegacyMemoryHistory:
         for summary in messages:
             token = cast(str, getattr(summary, self._attribute))
             group = summary.additional_properties.get(GROUP_ANNOTATION_KEY)
-            links = cast("dict[str, Any]", group) if isinstance(group, dict) else summary.additional_properties
+            links = _summary_properties(summary)
             source_ids = links.get(SUMMARY_OF_MESSAGE_IDS_KEY)
             if not isinstance(source_ids, list):
                 continue
@@ -256,13 +325,35 @@ class LegacyMemoryHistory:
     def flush(self, state: DurableAgentState, buffer: list[Message]) -> None:
         """Stage annotations, generated messages and ordering within the enclosing turn rollback."""
         profile = legacy_history_profile(state)
+        self.observe(buffer)
+        for message in buffer:
+            self._separate_revision(message)
         working: list[tuple[Message, DurableAgentStateMessage]] = []
         derived: list[DurableAgentStateRequest] = []
         seen: set[str] = set()
-        revised: set[int] = set()
         terminal = state.data.conversation_history[-1]
         if not isinstance(terminal, DurableAgentStateResponse):
             raise ValueError("Legacy memory reconciliation requires the current terminal response.")
+        required = deque([*buffer, *(self._working[token] for token in self._archived)])
+        while required:
+            message = required.popleft()
+            sources = _summary_properties(message).get(SUMMARY_OF_MESSAGE_IDS_KEY, [])
+            if isinstance(sources, list):
+                for token in cast("list[Any]", sources):
+                    if (
+                        isinstance(token, str)
+                        and token in self._snapshots
+                        and token not in self._linked
+                        and token not in self._archived
+                    ):
+                        self._archived[token] = None
+                        required.append(self._working[token])
+        for token in self._archived:
+            if token not in self._linked:
+                archived = deepcopy(self._snapshots[token])
+                self._linked[token] = archived
+                self._generated.add(id(archived))
+                derived.append(DurableAgentStateRequest(self._correlation_id, terminal.created_at, [archived]))
         for message in buffer:
             token = getattr(message, self._attribute, None)
             if isinstance(token, str) and token in seen:
@@ -270,10 +361,6 @@ class LegacyMemoryHistory:
             if isinstance(token, str):
                 seen.add(token)
             stored = self._linked.get(token) if isinstance(token, str) else None
-            if stored is not None and isinstance(token, str) and self._body(message) != self._bodies[token]:
-                revised.add(id(stored))
-                stored.extension_data = {**(stored.extension_data or {}), "_excluded": True}
-                stored = None
             if stored is None:
                 stored = DurableAgentStateMessage.from_core_dict(serialize_input_message(message))
                 self._generated.add(id(stored))
@@ -292,15 +379,15 @@ class LegacyMemoryHistory:
             for message, stored in working
             if isinstance(getattr(message, self._attribute, None), str)
         })
-        self._repair_links([message for message, _ in working], aliases)
+        self._repair_links(
+            [message for token, message in self._working.items() if token in aliases],
+            aliases,
+        )
         for message, stored in working:
             stored.extension_data = self._annotations(message) or None
         for token, stored in self._linked.items():
             if id(stored) not in present:
-                annotations = (
-                    stored.extension_data or {} if id(stored) in revised else self._annotations(self._working[token])
-                )
-                stored.extension_data = {**annotations, "_excluded": True}
+                stored.extension_data = {**self._annotations(self._working[token]), "_excluded": True}
         order = [locations[id(stored)] for _, stored in working]
         absent = [reference for reference, _, stored in slots if id(stored) not in present]
         extensions = state.data.extension_data
