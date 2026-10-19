@@ -3,7 +3,135 @@
 """Coverage checks for the Azure Functions sample integration tests."""
 
 import ast
+import importlib.util
+import json
+import sys
 from pathlib import Path
+from types import ModuleType
+from unittest.mock import Mock
+
+import pytest
+
+
+@pytest.fixture
+def integration_conftest(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    path = Path(__file__).parent / "integration_tests" / "conftest.py"
+    spec = importlib.util.spec_from_file_location("azure_functions_integration_conftest", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "_load_env_file_if_present", lambda: None)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("func_available", "azurite_available", "expected_skip", "expected_reason"),
+    [
+        (True, True, False, "Integration tests enabled."),
+        (False, True, True, "Azure Functions Core Tools"),
+        (True, False, True, "Azurite not running"),
+    ],
+)
+def test_integration_prerequisites_do_not_require_dts(
+    integration_conftest: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    func_available: bool,
+    azurite_available: bool,
+    expected_skip: bool,
+    expected_reason: str,
+) -> None:
+    checked_ports: list[int] = []
+
+    def port_available(port: int, host: str = "localhost") -> bool:
+        assert host == "localhost"
+        checked_ports.append(port)
+        return port == 10000 and azurite_available
+
+    monkeypatch.setattr(integration_conftest, "_check_func_cli_available", lambda: func_available)
+    monkeypatch.setattr(integration_conftest, "_check_port_listening", port_available)
+
+    skipped, reason = integration_conftest._should_skip_azure_functions_integration_tests()
+
+    assert skipped is expected_skip
+    assert expected_reason in reason
+    assert checked_ports == ([10000] if func_available else [])
+
+
+@pytest.mark.parametrize(
+    ("func_available", "azurite_available", "sample_name", "foundry_available", "expected_reason"),
+    [
+        (True, True, "13_subworkflow_hitl", False, None),
+        (True, True, "01_single_agent", True, None),
+        (True, True, "01_single_agent", False, "Missing required environment variables"),
+        (False, True, "13_subworkflow_hitl", False, "Azure Functions Core Tools"),
+        (True, False, "13_subworkflow_hitl", False, "Azurite not running"),
+    ],
+)
+def test_integration_collection_preserves_required_service_skips(
+    integration_conftest: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    func_available: bool,
+    azurite_available: bool,
+    sample_name: str,
+    foundry_available: bool,
+    expected_reason: str | None,
+) -> None:
+    monkeypatch.setattr(integration_conftest, "_check_func_cli_available", lambda: func_available)
+    monkeypatch.setattr(
+        integration_conftest,
+        "_check_port_listening",
+        lambda port, host="localhost": port == 10000 and azurite_available,
+    )
+    for name in ("FOUNDRY_PROJECT_ENDPOINT", "FOUNDRY_MODEL"):
+        if foundry_available:
+            monkeypatch.setenv(name, "configured")
+        else:
+            monkeypatch.delenv(name, raising=False)
+    item = Mock()
+    item.fspath = Path(__file__).parent / "integration_tests" / "test_sample.py"
+    item.get_closest_marker.return_value = Mock(args=(sample_name,))
+
+    integration_conftest.pytest_collection_modifyitems(Mock(), [item])
+
+    if expected_reason is None:
+        item.add_marker.assert_not_called()
+    else:
+        item.add_marker.assert_called_once()
+        marker = item.add_marker.call_args.args[0]
+        assert marker.name == "skip"
+        assert expected_reason in marker.kwargs["reason"]
+
+
+@pytest.mark.parametrize(
+    ("sample_name", "foundry_available", "expected_reason"),
+    [
+        ("13_subworkflow_hitl", False, None),
+        ("01_single_agent", True, None),
+        ("01_single_agent", False, "FOUNDRY_PROJECT_ENDPOINT"),
+    ],
+)
+def test_integration_environment_does_not_require_scheduler_configuration(
+    integration_conftest: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    sample_name: str,
+    foundry_available: bool,
+    expected_reason: str | None,
+) -> None:
+    monkeypatch.setenv("AzureWebJobsStorage", "UseDevelopmentStorage=true")
+    monkeypatch.setenv("FUNCTIONS_WORKER_RUNTIME", "python")
+    monkeypatch.delenv("DURABLE_TASK_SCHEDULER_CONNECTION_STRING", raising=False)
+    for name in ("FOUNDRY_PROJECT_ENDPOINT", "FOUNDRY_MODEL"):
+        if foundry_available:
+            monkeypatch.setenv(name, "configured")
+        else:
+            monkeypatch.delenv(name, raising=False)
+
+    if expected_reason is None:
+        integration_conftest._load_and_validate_env(Path(sample_name))
+    else:
+        with pytest.raises(pytest.fail.Exception, match=expected_reason):
+            integration_conftest._load_and_validate_env(Path(sample_name))
 
 
 def _sample_markers(test_file: Path) -> set[str]:
@@ -97,14 +225,93 @@ def test_integration_pipelines_run_azure_functions_suite() -> None:
         repo_root / ".github" / "workflows" / "python-integration-tests.yml",
         repo_root / "eng" / "templates" / "jobs" / "python-integration-tests.yml",
     ]
-    expected_command = "pytest packages/azurefunctions/tests/integration_tests"
+    # This package is a standalone uv project with its own environment, so the suite
+    # runs from the package directory and the pytest target is relative to it.
+    required_fragments = ("python/packages/azurefunctions", "pytest tests/integration_tests")
 
-    missing_invocations = [
-        str(path.relative_to(repo_root))
+    missing_fragments = {
+        str(path.relative_to(repo_root)): missing
         for path in pipeline_paths
-        if expected_command not in path.read_text(encoding="utf-8")
-    ]
-    assert not missing_invocations, f"Azure Functions integration suite is not invoked by: {missing_invocations}"
+        if (
+            missing := [fragment for fragment in required_fragments if fragment not in path.read_text(encoding="utf-8")]
+        )
+    }
+    assert not missing_fragments, f"Azure Functions integration suite is not invoked by: {missing_fragments}"
+
+
+def test_sample_hosts_use_the_compatible_ga_bundle_and_azure_storage() -> None:
+    sample_root = Path(__file__).resolve().parents[3] / "samples" / "azure_functions"
+    hosts = list(sample_root.glob("*/host.json"))
+    assert len(hosts) == 14
+    for path in hosts:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert config["extensionBundle"] == {
+            "id": "Microsoft.Azure.Functions.ExtensionBundle",
+            "version": "[4.38.1, 5.0.0)",
+        }, path
+        assert config["extensions"]["durableTask"]["storageProvider"]["type"] == "AzureStorage", path
+
+
+def test_integration_setup_uses_current_azurite_without_api_validation_bypass() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    for path in (
+        repo_root / ".github" / "actions" / "azure-functions-integration-setup" / "action.yml",
+        repo_root / "eng" / "templates" / "jobs" / "setup-integration-infra.yml",
+    ):
+        setup = path.read_text(encoding="utf-8")
+        assert "mcr.microsoft.com/azure-storage/azurite:3.37.0" in setup, path
+        assert "--skipApiVersionCheck" not in setup, path
+
+
+def test_sample_guidance_keeps_azurite_api_validation_enabled() -> None:
+    sample_root = Path(__file__).resolve().parents[3] / "samples" / "azure_functions"
+    for path in sample_root.rglob("*"):
+        if path.suffix in (".md", ".http", ".py"):
+            assert "--skipApiVersionCheck" not in path.read_text(encoding="utf-8"), path
+
+
+def _obsolete_dts_prerequisite_lines(test_file: Path) -> list[str]:
+    tree = ast.parse(test_file.read_text(encoding="utf-8"), filename=str(test_file))
+    docstring = ast.get_docstring(tree) or ""
+    obsolete_phrases = (
+        "Durable Task Scheduler emulator running",
+        "Core Tools, Durable Task Scheduler",
+        "DTS on 8080",
+    )
+    return [line for line in docstring.splitlines() if any(phrase in line for phrase in obsolete_phrases)]
+
+
+def test_azure_storage_integration_guidance_has_no_obsolete_dts_prerequisites() -> None:
+    integration_root = Path(__file__).parent / "integration_tests"
+    stale_guidance = {
+        path.name: lines
+        for path in integration_root.glob("test_*.py")
+        if (lines := _obsolete_dts_prerequisite_lines(path))
+    }
+    assert not stale_guidance, f"Azure Storage integration tests do not require DTS: {stale_guidance}"
+
+
+@pytest.mark.parametrize(
+    "prerequisite",
+    [
+        "- Durable Task Scheduler emulator running on localhost:8080",
+        "- Azure Functions Core Tools, Durable Task Scheduler, and Azurite configured",
+        "DTS on 8080, and the selected venv's test dependencies",
+    ],
+)
+def test_dts_prerequisite_guard_detects_stale_module_guidance(tmp_path: Path, prerequisite: str) -> None:
+    test_file = tmp_path / "test_sample.py"
+    test_file.write_text(f'"""Prerequisites:\n{prerequisite}\n"""\n', encoding="utf-8")
+    assert _obsolete_dts_prerequisite_lines(test_file) == [prerequisite]
+
+
+def test_dts_prerequisite_guard_ignores_runtime_configuration(tmp_path: Path) -> None:
+    test_file = tmp_path / "test_sample.py"
+    test_file.write_text(
+        '"""Requires Core Tools and Azurite."""\nconnection_key = "DURABLE_TASK_SCHEDULER_CONNECTION_STRING"\n',
+        encoding="utf-8",
+    )
+    assert _obsolete_dts_prerequisite_lines(test_file) == []
 
 
 def test_skip_guard_detects_decorators_and_module_markers(tmp_path: Path) -> None:

@@ -5,103 +5,91 @@ on:
     paths:
       - "python/**"
       - ".github/workflows/python-merge-tests.yml"
+      - ".github/actions/python-package-validation/**"
   push:
     branches: [main]
     paths:
       - "python/**"
       - ".github/workflows/python-merge-tests.yml"
+      - ".github/actions/python-package-validation/**"
   workflow_dispatch:
 
 jobs:
   minimum-dependencies:
-    name: Python minimum dependencies
+    # agent-framework-azurefunctions requires Python 3.13 and has its own minimum job
+    # below, so this 3.10 job resolves the durabletask package's minimums on its own.
+    name: durabletask minimum dependencies (Python 3.10)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Setup Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - name: Validate package
+        uses: ./.github/actions/python-package-validation
         with:
+          package: durabletask
           python-version: "3.10"
+          minimum-dependencies: "true"
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
-
-      - name: Sync locked baseline
-        working-directory: python
-        run: uv sync --frozen --all-packages --group dev --group test
-
-      - name: Resolve exact supported minimums together
-        working-directory: python
-        run: |
-          uv pip install --group dev --group test \
-            -e packages/durabletask -e packages/azurefunctions \
-            "agent-framework-core==1.19.0" "pydantic==2.11.0" "opentelemetry-api==1.39.0" \
-            "durabletask==1.7.1" "durabletask-azuremanaged==1.4.0" "azure-functions-durable==1.3.1" \
-            opentelemetry-instrumentation-logging
-          uv pip check
-
-      - name: Verify versions and run unit tests without resynchronizing
-        working-directory: python
-        run: |
-          uv run --no-sync python -c "import importlib.metadata as m; assert m.version('agent-framework-core') == '1.19.0'; assert m.version('pydantic') == '2.11.0'; assert m.version('opentelemetry-api') == '1.39.0'"
-          uv run --no-sync python -c "import importlib.metadata as m; assert m.version('durabletask') == '1.7.1'; assert m.version('durabletask-azuremanaged') == '1.4.0'; assert m.version('azure-functions-durable') == '1.3.1'"
-          uv run --no-sync pytest -m "not integration" packages/durabletask/tests packages/azurefunctions/tests
-
-  build-test-package:
-    name: Python ${{ matrix.python-version }}
+  durabletask:
+    name: durabletask (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: python
 
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Setup Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - name: Validate package
+        uses: ./.github/actions/python-package-validation
         with:
+          package: durabletask
           python-version: ${{ matrix.python-version }}
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+  azurefunctions:
+    # agent-framework-azurefunctions depends on azure-functions-durable 2.x, which
+    # requires Python 3.13. uv resolves a workspace to one lock over the intersection
+    # of its members' requires-python, so this package is a standalone uv project
+    # with its own lockfile rather than a member of the workspace above. That keeps
+    # agent-framework-durabletask on 3.10+ and its full matrix.
+    name: azurefunctions (Python 3.13)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python/packages/azurefunctions
 
-      - name: Sync workspace
-        working-directory: python
-        run: uv sync --all-packages --group dev --group test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Ruff
-        working-directory: python
-        run: uv run ruff check packages/durabletask packages/azurefunctions
-
-      - name: Pyright (source)
-        working-directory: python
-        run: |
-          uv run pyright -p packages/durabletask/pyproject.toml
-          uv run pyright -p packages/azurefunctions/pyproject.toml
-
-      - name: MyPy (tests)
-        working-directory: python
-        run: |
-          uv run mypy --config-file pyproject.toml packages/durabletask/tests
-          uv run mypy --config-file pyproject.toml packages/azurefunctions/tests
-
-      - name: Unit tests
-        working-directory: python
-        run: uv run pytest -m "not integration" packages/durabletask/tests packages/azurefunctions/tests --cov=agent_framework_durabletask --cov=agent_framework_azurefunctions --cov-report=term-missing:skip-covered
-
-      - name: Build package
-        working-directory: python
-        run: |
-          uv build packages/durabletask --out-dir dist
-          uv build packages/azurefunctions --out-dir dist
-
-      - name: Upload package
-        if: matrix.python-version == '3.13'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Validate package
+        uses: ./.github/actions/python-package-validation
         with:
-          name: python-package
-          path: python/dist/*
+          package: azurefunctions
+          python-version: "3.13"
+
+  azurefunctions-minimum-dependencies:
+    # Both hosts use durabletask 1.11.0. This separate job also checks the Functions
+    # SDK minimums on Python 3.13 while standalone retains Python 3.10 coverage.
+    name: azurefunctions minimum dependencies (Python 3.13)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python/packages/azurefunctions
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Validate package
+        uses: ./.github/actions/python-package-validation
+        with:
+          package: azurefunctions
+          python-version: "3.13"
+          minimum-dependencies: "true"

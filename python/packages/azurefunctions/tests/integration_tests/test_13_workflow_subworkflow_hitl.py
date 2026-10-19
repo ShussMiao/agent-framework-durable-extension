@@ -14,11 +14,11 @@ deterministically (no model latency / variability).
 The function app is automatically started by the test fixture.
 
 Prerequisites:
-- Azurite running for durable orchestrations
-- Durable Task Scheduler emulator running on localhost:8080
+- Azure Functions Core Tools 4
+- Azurite 3.37.0+ running for durable orchestrations
 
-Usage:
-    uv run pytest packages/azurefunctions/tests/integration_tests/test_13_workflow_subworkflow_hitl.py -v
+Usage (from python/packages/azurefunctions):
+    uv run pytest tests/integration_tests/test_13_workflow_subworkflow_hitl.py -v
 """
 
 import time

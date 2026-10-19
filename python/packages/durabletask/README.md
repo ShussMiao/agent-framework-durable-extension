@@ -12,6 +12,21 @@ pip install agent-framework-durabletask --pre
 
 The durable task integration lets you host Microsoft Agent Framework agents using the [Durable Task](https://github.com/microsoft/durabletask-python) framework so they can persist state, replay conversation history, and recover from failures automatically.
 
+### Upgrading the Durable Task SDK
+
+Both Python hosts require `durabletask>=1.11.0,<2`; standalone still supports Python 3.10+.
+SDK 1.11 fixes nested races such as `when_any([cancel, when_all(tasks)])`. Replaying affected
+older histories can now select a different branch and fail with `NonDeterminismError`.
+Finish affected runs on the previous SDK, or keep their hub on pinned old workers and start
+new instances in a separate hub. Already-stuck runs need deliberate recovery and may not drain.
+Do not mix old and new workers on the same hub to achieve isolation. The framework's fresh
+instance and isolated-deployment requirements below still apply.
+See the [SDK release warning](https://github.com/microsoft/durabletask-python/releases/tag/v1.11.0).
+
+Coordinate SDK locks across clients and workers. A minimum version does not enforce identical
+resolved versions. Failure type names are now qualified, for example `builtins.ValueError`.
+Use `FailureDetails.is_caused_by(ValueError)` to also recognize older recorded bare names.
+
 <a id="current-runtime-contract-on-this-branch"></a>
 
 ### Current Runtime Contract On This Unreleased Stack
@@ -218,7 +233,8 @@ Streaming fallback requires an immediate capability refusal, not awaited setup, 
 Async streaming remains supported. Activity state deltas compare a detached receiving-worker encoding, not producer
 pickle bytes. Explicit writes retain their intent, and in-place JSON changes remain type-sensitive.
 
-Requires Python 3.10+, `durabletask>=1.7.1,<2` for scoped JSON decoding and SDK parent metadata,
+Requires Python 3.10+, `durabletask>=1.11.0,<2` for scoped JSON decoding, SDK parent metadata
+and corrected nested task completion,
 `agent-framework-core>=1.19.0,<2` and `pydantic>=2.11,<3` for structured response handling.
 
 #### History Provider Integration
@@ -384,21 +400,21 @@ persist cleanup. `reset` clears local transcript and session state while preserv
 receipts and live results. External-primary reset is rejected without a provider-owned clear
 operation.
 
-Generated standalone agent entities support only `run`, `reset`, `expire_responses`, `migrate`
-and administrative `delete`. Raw state setters and implementation helpers are not operations.
-Direct callers must use `run`, not `run_agent`. The Functions 1.x host is unchanged here.
+Generated agent entities on both Python hosts support only `run`, `reset`, `expire_responses`,
+`migrate` and `delete`. Raw state setters and implementation helpers are not entity operations.
+The deprecated `run_agent` operation has been removed; direct callers must use `run`.
 
 `reset` returns no value. `expire_responses` returns the integer number of expired delivery
 payloads removed by that execution, or zero for a successful no-op. Failures use the SDK operation
 failure channel. A completed call acknowledges execution; a signal acknowledges only enqueueing.
 The expiry count is not an idempotent receipt: an execution can remove payloads and lose its reply,
-then a retry can return zero.
+then a retry can return zero. Both hosts use these native results rather than host-specific wrappers.
 
 `delete` is a privileged administrative operation that removes the entire entity, including
-conversation state, live results, completion receipts and ingestion evidence. It is not reset
-or expiry. Reusing that key no longer benefits from previous duplicate-run protection, and queued
-operations can recreate the entity. Operators must quiesce and fence callers when deletion must
-be final.
+conversation state, live results, completion receipts and ingestion evidence. It is not a reset
+or expiry operation. Reusing that entity key no longer benefits from its previous duplicate-run
+protection, and queued operations can recreate it. Operators must quiesce and fence callers when
+deletion must be final. Generated HTTP and MCP routes do not expose these maintenance operations.
 
 At or after a delivery deadline, lookup reports completion with its retained outcome, even before
 physical cleanup. It never returns the expired payload, reports pending work, reruns the request or
