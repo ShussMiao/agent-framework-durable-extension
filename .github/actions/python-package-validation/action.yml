@@ -114,6 +114,15 @@ runs:
       working-directory: ${{ inputs.package == 'durabletask' && 'python' || 'python/packages/azurefunctions' }}
       run: uv build ${{ inputs.package == 'durabletask' && 'packages/durabletask' || '.' }} --out-dir dist
 
+    - name: Smoke-test Blob extra from built wheels
+      if: inputs.minimum-dependencies != 'true' && (inputs.package == 'azurefunctions' || inputs.python-version == '3.10')
+      shell: bash
+      working-directory: ${{ inputs.package == 'durabletask' && 'python' || 'python/packages/azurefunctions' }}
+      env:
+        PACKAGE: ${{ inputs.package }}
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: bash "$GITHUB_ACTION_PATH/blob-extra-smoke.sh"
+
     - name: Upload package
       if: inputs.minimum-dependencies != 'true' && inputs.python-version == '3.13'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
