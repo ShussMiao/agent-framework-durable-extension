@@ -1,6 +1,5 @@
 // Copyright (c) Microsoft. All rights reserved.
 
-using System.Text.Json;
 using GitHub.Copilot;
 using GitHubCopilotDurableAgent;
 using Microsoft.Agents.AI;
@@ -29,73 +28,35 @@ Console.WriteLine();
 await using CopilotClient copilotClient = new(
     GitHubCopilotDurableDemo.CreateClientOptions(copilotRuntimeUrl, copilotBaseDirectory));
 
-// ---------------------------------------------------------------------------
-// Demo 1: Multi-turn Durable Agent across a host restart
-// ---------------------------------------------------------------------------
-Console.WriteLine("--- Demo 1: Multi-turn Durable Session Across Host Restart ---");
+string instanceId;
 
-string marker = $"MARKER-{Guid.NewGuid():N}"[..15].ToUpperInvariant();
-JsonElement serializedDurableSession;
-
+// ---------------------------------------------------------------------------
+// Host 1: Start the incident remediation orchestration, run Turn 1 on
+//         CopilotAgent to propose a plan, then shut down Host 1 completely
+//         while the orchestration is dehydrated waiting for human approval.
+// ---------------------------------------------------------------------------
 IHost firstHost = CreateHost(copilotClient, dtsConnectionString);
 await firstHost.StartAsync();
 try
 {
-    AIAgent durableAgent = firstHost.Services.GetDurableAgentProxy(GitHubCopilotDurableDemo.AgentName);
-    AgentSession session = await durableAgent.CreateSessionAsync();
-
-    Console.WriteLine($"[Host 1 / Turn 1] Asking CopilotAgent to remember marker: {marker}");
-    AgentResponse turn1Response = await durableAgent.RunAsync(
-        $"Remember this incident token for our session: {marker}. Confirm the token in one short sentence.",
-        session);
-    Console.WriteLine($"[Host 1 / Turn 1] Response: {turn1Response.Text}");
-
-    // Serialize the outer DurableAgentSession handle so a second host or process can resume it.
-    serializedDurableSession = await durableAgent.SerializeSessionAsync(session);
-}
-finally
-{
-    await StopAndDisposeHostAsync(firstHost);
-}
-
-Console.WriteLine("Host 1 stopped. Starting Host 2 to verify cold restoration of GitHubCopilotAgentSession.SessionId...");
-
-IHost secondHost = CreateHost(copilotClient, dtsConnectionString);
-await secondHost.StartAsync();
-try
-{
-    AIAgent restoredDurableAgent = secondHost.Services.GetDurableAgentProxy(GitHubCopilotDurableDemo.AgentName);
-    AgentSession restoredSession = await restoredDurableAgent.DeserializeSessionAsync(serializedDurableSession);
-
-    Console.WriteLine("[Host 2 / Turn 2] Resuming durable session after host restart...");
-    AgentResponse turn2Response = await restoredDurableAgent.RunAsync(
-        "What incident token did I ask you to remember in Turn 1? Reply with the token.",
-        restoredSession);
-    Console.WriteLine($"[Host 2 / Turn 2] Response: {turn2Response.Text}");
-    Console.WriteLine();
-
-    // ---------------------------------------------------------------------------
-    // Demo 2: Durable Orchestration with Human-in-the-Loop (HITL) Approval
-    // ---------------------------------------------------------------------------
-    Console.WriteLine("--- Demo 2: Durable Orchestration with Human-in-the-Loop Approval ---");
-    DurableTaskClient durableClient = secondHost.Services.GetRequiredService<DurableTaskClient>();
+    DurableTaskClient firstHostClient = firstHost.Services.GetRequiredService<DurableTaskClient>();
 
     CopilotIncidentInput incidentInput = new(
         IncidentSummary: "Elevated HTTP 503 errors on checkout-service after deployment v2.4.1",
         ApprovalTimeoutMinutes: 30);
 
-    string instanceId = await durableClient.ScheduleNewOrchestrationInstanceAsync(
+    instanceId = await firstHostClient.ScheduleNewOrchestrationInstanceAsync(
         nameof(GitHubCopilotDurableDemo.RunIncidentOrchestrationAsync),
         incidentInput);
-    Console.WriteLine($"Started orchestration '{instanceId}'. Waiting for Turn 1 remediation plan...");
+    Console.WriteLine($"[Host 1] Started orchestration '{instanceId}'. Waiting for Turn 1 remediation plan...");
 
     while (true)
     {
-        OrchestrationMetadata? metadata = await durableClient.GetInstanceAsync(instanceId, getInputsAndOutputs: true);
+        OrchestrationMetadata? metadata = await firstHostClient.GetInstanceAsync(instanceId, getInputsAndOutputs: true);
         string? customStatus = metadata?.ReadCustomStatusAs<string>();
         if (customStatus?.Contains(GitHubCopilotDurableDemo.ApprovalEventName, StringComparison.Ordinal) is true)
         {
-            Console.WriteLine($"Orchestration status: {customStatus}");
+            Console.WriteLine($"[Host 1] {customStatus}");
             break;
         }
 
@@ -108,25 +69,46 @@ try
 
         await Task.Delay(TimeSpan.FromMilliseconds(250));
     }
+}
+finally
+{
+    await StopAndDisposeHostAsync(firstHost);
+}
 
-    Console.Write("Approve the proposed remediation plan? [y/n] (default: y): ");
-    string? approvalInput = Console.ReadLine();
-    bool approved = string.IsNullOrWhiteSpace(approvalInput) ||
-        approvalInput.Trim().Equals("y", StringComparison.OrdinalIgnoreCase);
+Console.WriteLine();
+Console.WriteLine("[Host 1] Stopped and disposed completely. Zero worker processes are running while awaiting operator approval.");
+Console.Write("Approve the proposed remediation plan? [y/n] (default: y): ");
+string? approvalInput = Console.ReadLine();
+bool approved = string.IsNullOrWhiteSpace(approvalInput) ||
+    approvalInput.Trim().Equals("y", StringComparison.OrdinalIgnoreCase);
 
-    await durableClient.RaiseEventAsync(
+// ---------------------------------------------------------------------------
+// Host 2: Start a brand-new worker host after the operator responds, raise the
+//         external approval event, replay the orchestration, cancel the SLA
+//         timer, and resume the exact same GitHubCopilotAgentSession.SessionId
+//         for Turn 2.
+// ---------------------------------------------------------------------------
+Console.WriteLine();
+Console.WriteLine("[Host 2] Starting new worker host to deliver approval event and resume Copilot session for Turn 2...");
+IHost secondHost = CreateHost(copilotClient, dtsConnectionString);
+await secondHost.StartAsync();
+try
+{
+    DurableTaskClient secondHostClient = secondHost.Services.GetRequiredService<DurableTaskClient>();
+
+    await secondHostClient.RaiseEventAsync(
         instanceId,
         GitHubCopilotDurableDemo.ApprovalEventName,
         approved);
 
-    OrchestrationMetadata completed = await durableClient.WaitForInstanceCompletionAsync(
+    OrchestrationMetadata completed = await secondHostClient.WaitForInstanceCompletionAsync(
         instanceId,
         getInputsAndOutputs: true);
 
     CopilotIncidentResult? result = completed.ReadOutputAs<CopilotIncidentResult>();
-    Console.WriteLine($"Orchestration completed with status: {completed.RuntimeStatus}");
+    Console.WriteLine($"[Host 2] Orchestration completed with status: {completed.RuntimeStatus}");
     Console.WriteLine($"Turn 1 Proposed Plan: {result?.ProposedPlan}");
-    Console.WriteLine($"Approved: {result?.Approved}");
+    Console.WriteLine($"Approved: {result?.Approved} (TimedOut: {result?.TimedOut})");
     Console.WriteLine($"Turn 2 Final Resolution: {result?.FinalResolution}");
 }
 finally

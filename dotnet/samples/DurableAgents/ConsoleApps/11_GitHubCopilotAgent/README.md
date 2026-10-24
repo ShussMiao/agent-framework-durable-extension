@@ -1,10 +1,16 @@
 # 11 — Durable GitHub Copilot Agent
 
-This sample demonstrates how to host Microsoft Agent Framework's `GitHubCopilotAgent` (`Microsoft.Agents.AI.GitHub.Copilot` / `GitHub.Copilot.SDK`) inside `Microsoft.Agents.AI.DurableTask` for:
+This sample demonstrates capabilities that **only** `Microsoft.Agents.AI.DurableTask` adds on top of Microsoft Agent Framework's `GitHubCopilotAgent` (`Microsoft.Agents.AI.GitHub.Copilot` / `GitHub.Copilot.SDK`):
 
-1. **Multi-turn Durable Agent sessions across host restarts** (`ConfigureDurableAgents`, cold restoration of `GitHubCopilotAgentSession.SessionId`).
-2. **Durable Task orchestrations with Human-in-the-Loop (HITL) approval** (`context.GetAgent("CopilotAgent")` + `context.WaitForExternalEvent<bool>("Approval")`).
-3. **Durable Workflows** (`ConfigureDurableWorkflows` / `WorkflowBuilder` with a `GitHubCopilotAgent` executor node).
+1. **Scenario 1 — Concurrent Webhook / Alert Bursts Serialized by the Durable Agent Mailbox (`Task.WhenAll` on the same `AgentSession`):**
+   - In raw `GitHub.Copilot.SDK`, calling `SendAsync` concurrently on the same session is unsupported and requires custom distributed locks (such as Redis).
+   - With `ConfigureDurableAgents`, firing `Task.WhenAll(durableAgent.RunAsync(alert1, session), durableAgent.RunAsync(alert2, session))` at the same `DurableAgentSession` automatically queues and executes each turn strictly one at a time inside the Durable Entity mailbox (`@dafx-v2-copilotagent@{key}`) on the same underlying `GitHubCopilotAgentSession.SessionId`.
+2. **Scenario 2 — Long-Running HITL Orchestration with SLA Timer (`Task.WhenAny(WaitForExternalEvent, CreateTimer)`) + Full Worker Shutdown While Paused:**
+   - Starts `RunIncidentOrchestrationAsync` on **Host 1**, runs Turn 1 on `context.GetAgent("CopilotAgent")` to propose a remediation plan, and pauses waiting for `"Approval"` bounded by a durable SLA timer (`context.CreateTimer`).
+   - **Stops and disposes Host 1 completely** while the orchestration is waiting—holding zero processes, sockets, or memory open during human review.
+   - Starts **Host 2**, raises the `"Approval"` event, replays the orchestration, cancels the SLA timer, rehydrates `@dafx-v2-copilotagent@{key}`, and resumes the **exact same `GitHubCopilotAgentSession.SessionId`** for Turn 2.
+3. **Scenario 3 — Durable Workflows (`ConfigureDurableWorkflows` / `WorkflowBuilder`):**
+   - Executes `GitHubCopilotAgent` as a stateful node inside a Durable Workflow superstep graph.
 
 ---
 

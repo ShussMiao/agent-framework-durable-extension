@@ -22,10 +22,12 @@ public sealed record CopilotIncidentInput(
 /// </summary>
 /// <param name="ProposedPlan">Initial remediation plan proposed on Turn 1.</param>
 /// <param name="Approved">Whether the human operator approved the remediation plan.</param>
-/// <param name="FinalResolution">Final execution summary from Turn 2 (or cancellation message if rejected).</param>
+/// <param name="TimedOut">Whether the human approval step exceeded the configured SLA timer.</param>
+/// <param name="FinalResolution">Final execution summary from Turn 2 (or cancellation/timeout message).</param>
 public sealed record CopilotIncidentResult(
     string ProposedPlan,
     bool Approved,
+    bool TimedOut,
     string FinalResolution);
 
 /// <summary>
@@ -165,6 +167,40 @@ public static class GitHubCopilotDurableDemo
     }
 
     /// <summary>
+    /// Fires two concurrent alert updates at the same <see cref="AgentSession"/> using <see cref="Task.WhenAll(Task[])"/>.
+    /// </summary>
+    /// <remarks>
+    /// In raw <c>GitHub.Copilot.SDK</c>, calling <c>SendAsync</c> concurrently on the same session is unsupported
+    /// and requires an external distributed lock (such as Redis). When hosted as a Durable Agent, the entity
+    /// mailbox (<c>@dafx-v2-copilotagent@{key}</c>) automatically serializes concurrent turns one at a time on
+    /// the same underlying <c>GitHubCopilotAgentSession.SessionId</c>.
+    /// </remarks>
+    /// <param name="durableAgent">The durable agent proxy.</param>
+    /// <param name="session">The shared durable agent session receiving concurrent requests.</param>
+    /// <param name="firstAlert">First concurrent alert payload.</param>
+    /// <param name="secondAlert">Second concurrent alert payload.</param>
+    /// <param name="cancellationToken">Optional cancellation token.</param>
+    /// <returns>The two completed <see cref="AgentResponse"/> instances.</returns>
+    public static async Task<(AgentResponse First, AgentResponse Second)> RunConcurrentAlertBurstAsync(
+        AIAgent durableAgent,
+        AgentSession session,
+        string firstAlert,
+        string secondAlert,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(durableAgent);
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentException.ThrowIfNullOrWhiteSpace(firstAlert);
+        ArgumentException.ThrowIfNullOrWhiteSpace(secondAlert);
+
+        Task<AgentResponse> firstTurnTask = durableAgent.RunAsync(firstAlert, session, cancellationToken: cancellationToken);
+        Task<AgentResponse> secondTurnTask = durableAgent.RunAsync(secondAlert, session, cancellationToken: cancellationToken);
+
+        AgentResponse[] responses = await Task.WhenAll(firstTurnTask, secondTurnTask);
+        return (responses[0], responses[1]);
+    }
+
+    /// <summary>
     /// Builds a single-node <see cref="Workflow"/> backed by the Copilot <see cref="AIAgent"/>.
     /// </summary>
     /// <param name="copilotAgent">The Copilot <see cref="AIAgent"/>.</param>
@@ -180,7 +216,8 @@ public static class GitHubCopilotDurableDemo
 
     /// <summary>
     /// Durable orchestration that runs a two-turn incident remediation conversation on a single
-    /// <see cref="AgentSession"/>, pausing between turns for human approval via <see cref="ApprovalEventName"/>.
+    /// <see cref="AgentSession"/>, pausing between turns for human approval via <see cref="ApprovalEventName"/>
+    /// bounded by a durable SLA timer (<see cref="TaskOrchestrationContext.CreateTimer(DateTime, CancellationToken)"/>).
     /// </summary>
     /// <param name="context">The task orchestration context.</param>
     /// <param name="input">The incident remediation input.</param>
@@ -202,9 +239,28 @@ public static class GitHubCopilotDurableDemo
             $"Diagnose this incident and propose a step-by-step remediation plan: {input.IncidentSummary}",
             session);
 
-        context.SetCustomStatus($"Waiting for human approval ({ApprovalEventName})...");
+        int slaMinutes = Math.Max(1, input.ApprovalTimeoutMinutes);
+        context.SetCustomStatus(
+            $"Waiting for human approval ({ApprovalEventName}) within {slaMinutes}m SLA. Proposed plan: {planResponse.Text}");
 
-        bool approved = await context.WaitForExternalEvent<bool>(ApprovalEventName);
+        using CancellationTokenSource timerCts = new();
+        Task<bool> approvalTask = context.WaitForExternalEvent<bool>(ApprovalEventName);
+        DateTime slaDeadline = context.CurrentUtcDateTime.AddMinutes(slaMinutes);
+        Task timeoutTask = context.CreateTimer(slaDeadline, timerCts.Token);
+
+        Task winner = await Task.WhenAny(approvalTask, timeoutTask);
+        if (ReferenceEquals(winner, timeoutTask))
+        {
+            context.SetCustomStatus($"Approval SLA expired after {slaMinutes}m.");
+            return new CopilotIncidentResult(
+                ProposedPlan: planResponse.Text,
+                Approved: false,
+                TimedOut: true,
+                FinalResolution: $"Remediation timed out after {slaMinutes} minutes waiting for operator approval.");
+        }
+
+        await timerCts.CancelAsync();
+        bool approved = await approvalTask;
 
         if (!approved)
         {
@@ -212,12 +268,13 @@ public static class GitHubCopilotDurableDemo
             return new CopilotIncidentResult(
                 ProposedPlan: planResponse.Text,
                 Approved: false,
+                TimedOut: false,
                 FinalResolution: "Remediation cancelled by human operator.");
         }
 
         context.SetCustomStatus("Approved. Executing Turn 2 on the same Copilot session...");
 
-        // Turn 2: Resume the same Copilot session to generate the post-approval execution commands.
+        // Turn 2: Resume the same Copilot session (even if the worker restarted while waiting for approval).
         AgentResponse executionResponse = await agent.RunAsync(
             "The operator approved the remediation plan. Provide the exact verification steps for the approved plan.",
             session);
@@ -227,6 +284,7 @@ public static class GitHubCopilotDurableDemo
         return new CopilotIncidentResult(
             ProposedPlan: planResponse.Text,
             Approved: true,
+            TimedOut: false,
             FinalResolution: executionResponse.Text);
     }
 }

@@ -14,6 +14,7 @@ using Microsoft.Agents.AI.DurableTask;
 using Microsoft.Agents.AI.Workflows;
 using Microsoft.DurableTask;
 using Microsoft.DurableTask.Client;
+using Microsoft.DurableTask.Client.Entities;
 using Microsoft.DurableTask.Entities;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -26,6 +27,89 @@ namespace GitHubCopilotDurableAgentTests;
 
 public sealed class GitHubCopilotSampleTests
 {
+    [Fact]
+    public async Task ConcurrentAlertBurst_SameDurableSession_SerializesTurnsOnSingleCopilotSessionAsync()
+    {
+        await using FakeCopilotJsonRpcServer server = new();
+        await using CopilotClient copilotClient = new(
+            GitHubCopilotDurableDemo.CreateClientOptions(server.Endpoint));
+        AIAgent copilotAgent = GitHubCopilotDurableDemo.CreateCopilotAgent(copilotClient);
+
+        // Simulate the Durable Entity single-threaded actor mailbox backing IDurableAgentClient.
+        using SemaphoreSlim entityMailboxLock = new(1, 1);
+        string? currentEntityStateJson = null;
+        ServiceProvider? activeServices = null;
+
+        Mock<DurableTaskClient> durableClientMock = new("test");
+        Mock<DurableEntityClient> entityClientMock = new("test");
+        durableClientMock.SetupGet(c => c.Entities).Returns(entityClientMock.Object);
+
+        entityClientMock
+            .Setup(e => e.SignalEntityAsync(
+                It.IsAny<EntityInstanceId>(),
+                It.IsAny<string>(),
+                It.IsAny<object?>(),
+                It.IsAny<SignalEntityOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(async (EntityInstanceId id, string _, object? input, SignalEntityOptions? _, CancellationToken ct) =>
+            {
+                await entityMailboxLock.WaitAsync(ct);
+                try
+                {
+                    (_, currentEntityStateJson) = await ExecuteEntityRequestObjectAsync(
+                        activeServices!,
+                        id,
+                        currentEntityStateJson,
+                        input!);
+                }
+                finally
+                {
+                    entityMailboxLock.Release();
+                }
+            });
+
+        entityClientMock
+            .Setup(e => e.GetEntityAsync<object>(
+                It.IsAny<EntityInstanceId>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(new InvocationFunc(invocation =>
+            {
+                EntityInstanceId id = (EntityInstanceId)invocation.Arguments[0];
+                MethodInfo genericMethod = invocation.Method;
+                Type stateType = genericMethod.GetGenericArguments()[0];
+                return CreateEntityMetadataTask(id, stateType, currentEntityStateJson);
+            }));
+
+        using ServiceProvider services = CreateServiceProvider(
+            options => GitHubCopilotDurableDemo.RegisterCopilotAgent(options.Agents, copilotAgent),
+            durableClientMock.Object);
+        activeServices = services;
+
+        AIAgent durableAgent = services.GetDurableAgentProxy(GitHubCopilotDurableDemo.AgentName);
+        AgentSession sharedSession = await durableAgent.CreateSessionAsync();
+
+        (AgentResponse firstResponse, AgentResponse secondResponse) =
+            await GitHubCopilotDurableDemo.RunConcurrentAlertBurstAsync(
+                durableAgent,
+                sharedSession,
+                "Alert #1: checkout-service p99 latency spike",
+                "Alert #2: checkout-service connection pool reduced");
+
+        Assert.Equal("Reply to: Alert #1: checkout-service p99 latency spike", firstResponse.Text);
+        Assert.Equal("Reply to: Alert #2: checkout-service connection pool reduced", secondResponse.Text);
+
+        // Verify the entity mailbox serialized both turns strictly one at a time on the same CopilotSession!
+        Assert.Equal(1, server.MaxConcurrentSends);
+        Assert.Single(server.CreatedSessionIds);
+        Assert.Equal([server.CreatedSessionIds[0]], server.ResumedSessionIds);
+        Assert.Equal(
+            [
+                "Alert #1: checkout-service p99 latency spike",
+                "Alert #2: checkout-service connection pool reduced",
+            ],
+            server.SentPrompts);
+    }
+
     [Fact]
     public async Task MultiTurn_CurrentRequestOnlyWithProviderKey_PreservesSessionIdWithoutDuplicatingHistoryAsync()
     {
@@ -99,78 +183,200 @@ public sealed class GitHubCopilotSampleTests
     }
 
     [Fact]
-    public async Task IncidentOrchestration_WithHumanInTheLoopApproval_ReusesSameDurableSessionAcrossTurnsAsync()
+    public async Task IncidentOrchestration_ApprovalAfterWorkerRestartAndSlaTimeout_VerifiesBothPathsAsync()
     {
         await using FakeCopilotJsonRpcServer server = new();
         await using CopilotClient copilotClient = new(
             GitHubCopilotDurableDemo.CreateClientOptions(server.Endpoint));
-        AIAgent copilotAgent = GitHubCopilotDurableDemo.CreateCopilotAgent(copilotClient);
-
-        using ServiceProvider services = CreateServiceProvider(options =>
-            GitHubCopilotDurableDemo.RegisterCopilotAgent(options.Agents, copilotAgent));
 
         string? persistedEntityStateJson = null;
-        List<EntityInstanceId> invokedEntityIds = [];
-        List<string> customStatuses = [];
+        AgentResponse? turn1CachedResponse = null;
+        List<EntityInstanceId> host1EntityIds = [];
+        List<EntityInstanceId> host2EntityIds = [];
 
-        Mock<TaskOrchestrationEntityFeature> entityFeature = new();
-        entityFeature
-            .Setup(e => e.CallEntityAsync<AgentResponse>(
-                It.IsAny<EntityInstanceId>(),
-                It.IsAny<string>(),
-                It.IsAny<object?>(),
-                It.IsAny<CallEntityOptions?>()))
-            .Returns(async (EntityInstanceId entityId, string _, object? requestObj, CallEntityOptions? _) =>
-            {
-                invokedEntityIds.Add(entityId);
-                (AgentResponse response, string nextStateJson) = await ExecuteEntityRequestObjectAsync(
-                    services,
-                    entityId,
-                    persistedEntityStateJson,
-                    requestObj!);
-                persistedEntityStateJson = nextStateJson;
-                return response;
-            });
+        // ---------------------------------------------------------------------------
+        // Part 1A (Host 1): Start orchestration, execute Turn 1, pause at WaitForExternalEvent,
+        //                   then dispose Host 1 completely while waiting for human approval!
+        // ---------------------------------------------------------------------------
+        TaskCompletionSource<bool> neverCompletesOnHost1 = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource turn1ReachedWait = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        Mock<TaskOrchestrationContext> context = new();
-        context.SetupGet(c => c.Entities).Returns(entityFeature.Object);
-        context.SetupGet(c => c.InstanceId).Returns("incident-orch-1");
-        context.SetupGet(c => c.IsReplaying).Returns(false);
-        context.Setup(c => c.NewGuid()).Returns(Guid.Parse("11111111-2222-3333-4444-555555555555"));
-        context.Setup(c => c.SetCustomStatus(It.IsAny<object?>()))
-            .Callback<object?>(status =>
-            {
-                if (status is string text)
+        using (ServiceProvider host1Services = CreateServiceProvider(options =>
+            GitHubCopilotDurableDemo.RegisterCopilotAgent(
+                options.Agents,
+                GitHubCopilotDurableDemo.CreateCopilotAgent(copilotClient))))
+        {
+            Mock<TaskOrchestrationEntityFeature> host1Entities = new();
+            host1Entities
+                .Setup(e => e.CallEntityAsync<AgentResponse>(
+                    It.IsAny<EntityInstanceId>(),
+                    It.IsAny<string>(),
+                    It.IsAny<object?>(),
+                    It.IsAny<CallEntityOptions?>()))
+                .Returns(async (EntityInstanceId entityId, string _, object? requestObj, CallEntityOptions? _) =>
                 {
-                    customStatuses.Add(text);
-                }
-            });
-        context.Setup(c => c.WaitForExternalEvent<bool>(
-                GitHubCopilotDurableDemo.ApprovalEventName,
-                It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
+                    host1EntityIds.Add(entityId);
+                    (AgentResponse response, string nextStateJson) = await ExecuteEntityRequestObjectAsync(
+                        host1Services,
+                        entityId,
+                        persistedEntityStateJson,
+                        requestObj!);
+                    persistedEntityStateJson = nextStateJson;
+                    turn1CachedResponse = response;
+                    return response;
+                });
 
-        CopilotIncidentResult result = await GitHubCopilotDurableDemo.RunIncidentOrchestrationAsync(
-            context.Object,
-            new CopilotIncidentInput("HTTP 503 spike on checkout-service", ApprovalTimeoutMinutes: 15));
+            Mock<TaskOrchestrationContext> host1Context = new();
+            host1Context.SetupGet(c => c.Entities).Returns(host1Entities.Object);
+            host1Context.SetupGet(c => c.InstanceId).Returns("incident-orch-1");
+            host1Context.SetupGet(c => c.IsReplaying).Returns(false);
+            host1Context.SetupGet(c => c.CurrentUtcDateTime).Returns(new DateTime(2026, 10, 24, 12, 0, 0, DateTimeKind.Utc));
+            host1Context.Setup(c => c.NewGuid()).Returns(Guid.Parse("11111111-2222-3333-4444-555555555555"));
+            host1Context.Setup(c => c.WaitForExternalEvent<bool>(
+                    GitHubCopilotDurableDemo.ApprovalEventName,
+                    It.IsAny<CancellationToken>()))
+                .Returns(() =>
+                {
+                    turn1ReachedWait.TrySetResult();
+                    return neverCompletesOnHost1.Task;
+                });
+            host1Context.Setup(c => c.CreateTimer(It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
+                .Returns(new TaskCompletionSource().Task);
 
-        Assert.True(result.Approved);
-        Assert.Equal(
-            "Reply to: Diagnose this incident and propose a step-by-step remediation plan: HTTP 503 spike on checkout-service",
-            result.ProposedPlan);
-        Assert.Equal(
-            "Reply to: The operator approved the remediation plan. Provide the exact verification steps for the approved plan.",
-            result.FinalResolution);
+            Task<CopilotIncidentResult> pausedHost1Orchestration = GitHubCopilotDurableDemo.RunIncidentOrchestrationAsync(
+                host1Context.Object,
+                new CopilotIncidentInput("HTTP 503 spike on checkout-service", ApprovalTimeoutMinutes: 15));
 
-        // Both turns targeted the exact same Durable Entity instance and the same underlying Copilot session.
-        Assert.Equal(2, invokedEntityIds.Count);
-        Assert.Equal(invokedEntityIds[0], invokedEntityIds[1]);
-        Assert.Single(server.CreatedSessionIds);
-        Assert.Equal([server.CreatedSessionIds[0]], server.ResumedSessionIds);
-        Assert.Equal(2, server.SentPrompts.Count);
-        Assert.Contains(
-            customStatuses,
-            status => status.Contains(GitHubCopilotDurableDemo.ApprovalEventName, StringComparison.Ordinal));
+            await turn1ReachedWait.Task;
+            Assert.False(pausedHost1Orchestration.IsCompleted);
+            Assert.Single(host1EntityIds);
+            Assert.Single(server.CreatedSessionIds);
+            Assert.Empty(server.ResumedSessionIds);
+        }
+
+        // ---------------------------------------------------------------------------
+        // Part 1B (Host 2): Host 1 is now disposed. Start Host 2, replay orchestration
+        //                   with Approval=true, cancel SLA timer, and execute Turn 2 on Host 2!
+        // ---------------------------------------------------------------------------
+        bool timerTokenCancelled = false;
+        using (ServiceProvider host2Services = CreateServiceProvider(options =>
+            GitHubCopilotDurableDemo.RegisterCopilotAgent(
+                options.Agents,
+                GitHubCopilotDurableDemo.CreateCopilotAgent(copilotClient))))
+        {
+            int callIndex = 0;
+            Mock<TaskOrchestrationEntityFeature> host2Entities = new();
+            host2Entities
+                .Setup(e => e.CallEntityAsync<AgentResponse>(
+                    It.IsAny<EntityInstanceId>(),
+                    It.IsAny<string>(),
+                    It.IsAny<object?>(),
+                    It.IsAny<CallEntityOptions?>()))
+                .Returns(async (EntityInstanceId entityId, string _, object? requestObj, CallEntityOptions? _) =>
+                {
+                    host2EntityIds.Add(entityId);
+                    callIndex++;
+                    if (callIndex == 1)
+                    {
+                        // Orchestration history replay of Turn 1 returns the recorded Turn 1 response without re-invoking the entity.
+                        return turn1CachedResponse!;
+                    }
+
+                    // Turn 2 executes live on Host 2 against the rehydrated entity state from Host 1!
+                    (AgentResponse response, string nextStateJson) = await ExecuteEntityRequestObjectAsync(
+                        host2Services,
+                        entityId,
+                        persistedEntityStateJson,
+                        requestObj!);
+                    persistedEntityStateJson = nextStateJson;
+                    return response;
+                });
+
+            Mock<TaskOrchestrationContext> host2Context = new();
+            host2Context.SetupGet(c => c.Entities).Returns(host2Entities.Object);
+            host2Context.SetupGet(c => c.InstanceId).Returns("incident-orch-1");
+            host2Context.SetupGet(c => c.IsReplaying).Returns(() => callIndex == 0);
+            host2Context.SetupGet(c => c.CurrentUtcDateTime).Returns(new DateTime(2026, 10, 24, 12, 0, 0, DateTimeKind.Utc));
+            host2Context.Setup(c => c.NewGuid()).Returns(Guid.Parse("11111111-2222-3333-4444-555555555555"));
+            host2Context.Setup(c => c.WaitForExternalEvent<bool>(
+                    GitHubCopilotDurableDemo.ApprovalEventName,
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+            host2Context.Setup(c => c.CreateTimer(It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
+                .Callback<DateTime, CancellationToken>((_, ct) => ct.Register(() => timerTokenCancelled = true))
+                .Returns(new TaskCompletionSource().Task);
+
+            CopilotIncidentResult approvedResult = await GitHubCopilotDurableDemo.RunIncidentOrchestrationAsync(
+                host2Context.Object,
+                new CopilotIncidentInput("HTTP 503 spike on checkout-service", ApprovalTimeoutMinutes: 15));
+
+            Assert.True(approvedResult.Approved);
+            Assert.False(approvedResult.TimedOut);
+            Assert.True(timerTokenCancelled);
+            Assert.Equal(
+                "Reply to: Diagnose this incident and propose a step-by-step remediation plan: HTTP 503 spike on checkout-service",
+                approvedResult.ProposedPlan);
+            Assert.Equal(
+                "Reply to: The operator approved the remediation plan. Provide the exact verification steps for the approved plan.",
+                approvedResult.FinalResolution);
+
+            // Host 2 resumed the exact same Durable Entity ID and CopilotSession.SessionId created on Host 1!
+            Assert.Equal(host1EntityIds[0], host2EntityIds[0]);
+            Assert.Equal(host1EntityIds[0], host2EntityIds[1]);
+            Assert.Single(server.CreatedSessionIds);
+            Assert.Equal([server.CreatedSessionIds[0]], server.ResumedSessionIds);
+            Assert.Equal(2, server.SentPrompts.Count);
+        }
+
+        // ---------------------------------------------------------------------------
+        // Part 2: Verify SLA timer expiration path (timeoutTask wins Task.WhenAny)
+        // ---------------------------------------------------------------------------
+        using (ServiceProvider timeoutServices = CreateServiceProvider(options =>
+            GitHubCopilotDurableDemo.RegisterCopilotAgent(
+                options.Agents,
+                GitHubCopilotDurableDemo.CreateCopilotAgent(copilotClient))))
+        {
+            int timeoutEntityCalls = 0;
+            Mock<TaskOrchestrationEntityFeature> timeoutEntities = new();
+            timeoutEntities
+                .Setup(e => e.CallEntityAsync<AgentResponse>(
+                    It.IsAny<EntityInstanceId>(),
+                    It.IsAny<string>(),
+                    It.IsAny<object?>(),
+                    It.IsAny<CallEntityOptions?>()))
+                .Returns(async (EntityInstanceId entityId, string _, object? requestObj, CallEntityOptions? _) =>
+                {
+                    timeoutEntityCalls++;
+                    (AgentResponse response, _) = await ExecuteEntityRequestObjectAsync(
+                        timeoutServices,
+                        entityId,
+                        persistedStateJson: null,
+                        requestObj!);
+                    return response;
+                });
+
+            Mock<TaskOrchestrationContext> timeoutContext = new();
+            timeoutContext.SetupGet(c => c.Entities).Returns(timeoutEntities.Object);
+            timeoutContext.SetupGet(c => c.InstanceId).Returns("incident-orch-timeout");
+            timeoutContext.SetupGet(c => c.IsReplaying).Returns(false);
+            timeoutContext.SetupGet(c => c.CurrentUtcDateTime).Returns(new DateTime(2026, 10, 24, 12, 0, 0, DateTimeKind.Utc));
+            timeoutContext.Setup(c => c.NewGuid()).Returns(Guid.Parse("22222222-3333-4444-5555-666666666666"));
+            timeoutContext.Setup(c => c.WaitForExternalEvent<bool>(
+                    GitHubCopilotDurableDemo.ApprovalEventName,
+                    It.IsAny<CancellationToken>()))
+                .Returns(new TaskCompletionSource<bool>().Task);
+            timeoutContext.Setup(c => c.CreateTimer(It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            CopilotIncidentResult timeoutResult = await GitHubCopilotDurableDemo.RunIncidentOrchestrationAsync(
+                timeoutContext.Object,
+                new CopilotIncidentInput("Database failover stalled", ApprovalTimeoutMinutes: 10));
+
+            Assert.False(timeoutResult.Approved);
+            Assert.True(timeoutResult.TimedOut);
+            Assert.Equal(1, timeoutEntityCalls);
+            Assert.Contains("timed out after 10 minutes", timeoutResult.FinalResolution, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -239,11 +445,13 @@ public sealed class GitHubCopilotSampleTests
         Assert.Equal(["Investigate high CPU on worker-node-3"], server.SentPrompts);
     }
 
-    private static ServiceProvider CreateServiceProvider(Action<DurableOptions> configure)
+    private static ServiceProvider CreateServiceProvider(
+        Action<DurableOptions> configure,
+        DurableTaskClient? clientOverride = null)
     {
         ServiceCollection services = new();
         services.AddLogging();
-        services.AddSingleton(new Mock<DurableTaskClient>("test").Object);
+        services.AddSingleton(clientOverride ?? new Mock<DurableTaskClient>("test").Object);
         services.AddSingleton(
             Mock.Of<IHostApplicationLifetime>(
                 lifetime => lifetime.ApplicationStopping == CancellationToken.None));
@@ -254,6 +462,37 @@ public sealed class GitHubCopilotSampleTests
             clientBuilder: _ => { });
 
         return services.BuildServiceProvider();
+    }
+
+    private static object CreateEntityMetadataTask(
+        EntityInstanceId id,
+        Type stateType,
+        string? persistedStateJson)
+    {
+        Assembly durableAssembly = typeof(DurableAgentsOptions).Assembly;
+        Type jsonContextType = durableAssembly.GetType(
+            "Microsoft.Agents.AI.DurableTask.State.DurableAgentStateJsonContext",
+            throwOnError: true)!;
+        object defaultContext = jsonContextType
+            .GetProperty("Default", BindingFlags.Public | BindingFlags.Static)!
+            .GetValue(null)!;
+        JsonSerializerOptions stateJsonOptions = (JsonSerializerOptions)jsonContextType
+            .GetProperty("Options", BindingFlags.Public | BindingFlags.Instance)!
+            .GetValue(defaultContext)!;
+
+        object? hydratedState = persistedStateJson is null
+            ? null
+            : JsonSerializer.Deserialize(persistedStateJson, stateType, stateJsonOptions);
+
+        Type metadataType = typeof(EntityMetadata<>).MakeGenericType(stateType);
+        object? metadata = hydratedState is null
+            ? Activator.CreateInstance(metadataType, id)
+            : Activator.CreateInstance(metadataType, id, hydratedState);
+
+        return typeof(Task)
+            .GetMethod(nameof(Task.FromResult))!
+            .MakeGenericMethod(metadataType)
+            .Invoke(null, [metadata])!;
     }
 
     private static async Task<(AgentResponse Response, string SerializedState)> ExecuteEntityTurnAsync(
@@ -360,6 +599,8 @@ public sealed class GitHubCopilotSampleTests
         private readonly CancellationTokenSource _cts = new();
         private readonly Task _acceptLoopTask;
         private int _messageCounter;
+        private int _activeSends;
+        private int _maxConcurrentSends;
 
         public FakeCopilotJsonRpcServer()
         {
@@ -371,6 +612,8 @@ public sealed class GitHubCopilotSampleTests
         }
 
         public string Endpoint { get; }
+
+        public int MaxConcurrentSends => Volatile.Read(ref this._maxConcurrentSends);
 
         public List<string> CreatedSessionIds { get; } = [];
 
@@ -451,82 +694,101 @@ public sealed class GitHubCopilotSampleTests
 
                         case "session.send":
                         {
-                            string sessionId = @params.GetProperty("sessionId").GetString()!;
-                            string prompt = @params.GetProperty("prompt").GetString()!;
-                            this.SentPrompts.Add(prompt);
-                            int msgNum = Interlocked.Increment(ref this._messageCounter);
-                            string msgId = $"msg-{msgNum}";
-                            string replyText = $"Reply to: {prompt}";
+                            int active = Interlocked.Increment(ref this._activeSends);
+                            int observedMax;
+                            do
+                            {
+                                observedMax = Volatile.Read(ref this._maxConcurrentSends);
+                            }
+                            while (active > observedMax &&
+                                Interlocked.CompareExchange(ref this._maxConcurrentSends, active, observedMax) != observedMax);
 
-                            await WriteRpcMessageAsync(
-                                stream,
-                                JsonSerializer.Serialize(new
-                                {
-                                    jsonrpc = "2.0",
-                                    id,
-                                    result = new { messageId = msgId },
-                                }),
-                                ct);
+                            try
+                            {
+                                string sessionId = @params.GetProperty("sessionId").GetString()!;
+                                string prompt = @params.GetProperty("prompt").GetString()!;
+                                this.SentPrompts.Add(prompt);
+                                int msgNum = Interlocked.Increment(ref this._messageCounter);
+                                string msgId = $"msg-{msgNum}";
+                                string replyText = $"Reply to: {prompt}";
 
-                            await WriteRpcMessageAsync(
-                                stream,
-                                JsonSerializer.Serialize(new
-                                {
-                                    jsonrpc = "2.0",
-                                    method = "session.event",
-                                    @params = new
+                                await Task.Delay(TimeSpan.FromMilliseconds(20), ct);
+
+                                await WriteRpcMessageAsync(
+                                    stream,
+                                    JsonSerializer.Serialize(new
                                     {
-                                        sessionId,
-                                        @event = new
+                                        jsonrpc = "2.0",
+                                        id,
+                                        result = new { messageId = msgId },
+                                    }),
+                                    ct);
+
+                                await WriteRpcMessageAsync(
+                                    stream,
+                                    JsonSerializer.Serialize(new
+                                    {
+                                        jsonrpc = "2.0",
+                                        method = "session.event",
+                                        @params = new
                                         {
+                                            sessionId,
+                                            @event = new
+                                            {
                                             type = "assistant.message_delta",
                                             id = "00000000-0000-0000-0000-000000000001",
                                             timestamp = "2026-10-24T00:00:00Z",
                                             data = new { messageId = msgId, deltaContent = replyText },
+                                            },
                                         },
-                                    },
-                                }),
-                                ct);
+                                    }),
+                                    ct);
 
-                            await WriteRpcMessageAsync(
-                                stream,
-                                JsonSerializer.Serialize(new
-                                {
-                                    jsonrpc = "2.0",
-                                    method = "session.event",
-                                    @params = new
+                                await WriteRpcMessageAsync(
+                                    stream,
+                                    JsonSerializer.Serialize(new
                                     {
-                                        sessionId,
-                                        @event = new
+                                        jsonrpc = "2.0",
+                                        method = "session.event",
+                                        @params = new
                                         {
+                                            sessionId,
+                                            @event = new
+                                            {
                                             type = "assistant.message",
                                             id = "00000000-0000-0000-0000-000000000002",
                                             timestamp = "2026-10-24T00:00:01Z",
                                             data = new { messageId = msgId, content = replyText },
+                                            },
                                         },
-                                    },
-                                }),
-                                ct);
+                                    }),
+                                    ct);
 
-                            await WriteRpcMessageAsync(
-                                stream,
-                                JsonSerializer.Serialize(new
-                                {
-                                    jsonrpc = "2.0",
-                                    method = "session.event",
-                                    @params = new
+                                await WriteRpcMessageAsync(
+                                    stream,
+                                    JsonSerializer.Serialize(new
                                     {
-                                        sessionId,
-                                        @event = new
+                                        jsonrpc = "2.0",
+                                        method = "session.event",
+                                        @params = new
                                         {
+                                            sessionId,
+                                            @event = new
+                                            {
                                             type = "session.idle",
                                             id = "00000000-0000-0000-0000-000000000003",
                                             timestamp = "2026-10-24T00:00:02Z",
                                             data = new { },
+                                            },
                                         },
-                                    },
-                                }),
-                                ct);
+                                    }),
+                                    ct);
+                            }
+                            finally
+                            {
+                                Interlocked.Decrement(ref this._activeSends);
+                            }
+
                             break;
                         }
 
