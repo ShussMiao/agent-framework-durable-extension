@@ -84,16 +84,20 @@ public static class GitHubCopilotDurableDemo
         string? runtimeUrl = null,
         string? baseDirectory = null)
     {
+        // Use CopilotClientMode.Empty so session tool access is explicitly controlled by SessionConfig.
         CopilotClientOptions clientOptions = new()
         {
             Mode = CopilotClientMode.Empty,
         };
 
+        // Connect to a remote/shared Copilot runtime endpoint when COPILOT_RUNTIME_URL is configured;
+        // otherwise CopilotClient launches and communicates with the local `copilot` CLI binary.
         if (!string.IsNullOrWhiteSpace(runtimeUrl))
         {
             clientOptions.Connection = RuntimeConnection.ForUri(runtimeUrl);
         }
 
+        // Optional shared filesystem path for COPILOT_HOME/session-state/{sessionId} in multi-worker hosts.
         if (!string.IsNullOrWhiteSpace(baseDirectory))
         {
             clientOptions.BaseDirectory = baseDirectory;
@@ -115,6 +119,7 @@ public static class GitHubCopilotDurableDemo
     {
         ArgumentNullException.ThrowIfNull(copilotClient);
 
+        // CopilotClientMode.Empty requires AvailableTools to be explicitly initialized on SessionConfig.
         SessionConfig sessionConfig = new()
         {
             Streaming = true,
@@ -128,8 +133,8 @@ public static class GitHubCopilotDurableDemo
                 },
         };
 
-        // Leave id: null so AIAgent generates a 32-hex GUID that WorkflowNamingHelper.GetExecutorName
-        // can strip cleanly when the agent is used inside a Durable Workflow.
+        // Use a single-word alphanumeric name ("CopilotAgent") and leave id: null so AIAgent generates
+        // a 32-hex GUID that WorkflowNamingHelper.GetExecutorName can strip cleanly in Durable Workflows.
         return copilotClient.AsAIAgent(
             sessionConfig: sessionConfig,
             ownsClient: false,
@@ -155,7 +160,8 @@ public static class GitHubCopilotDurableDemo
 
         // GitHubCopilotAgent persists GitHubCopilotAgentSession.SessionId in durable entity state
         // and calls CopilotClient.ResumeSessionAsync(sessionId) on subsequent turns.
-        // Using CurrentRequestOnly prevents AgentEntity from also prepending prior turns into the prompt.
+        // Setting ReplayMode = CurrentRequestOnly with an explicit ProviderKey ensures AgentEntity
+        // sends only the new turn's prompt instead of prepending prior turns into the prompt.
         options.AddAIAgent(
             copilotAgent,
             timeToLive: timeToLive ?? TimeSpan.FromHours(1),
@@ -193,6 +199,8 @@ public static class GitHubCopilotDurableDemo
         ArgumentException.ThrowIfNullOrWhiteSpace(firstAlert);
         ArgumentException.ThrowIfNullOrWhiteSpace(secondAlert);
 
+        // Issue both requests concurrently against the same DurableAgentSession.
+        // The backing Durable Entity queues and executes them sequentially.
         Task<AgentResponse> firstTurnTask = durableAgent.RunAsync(firstAlert, session, cancellationToken: cancellationToken);
         Task<AgentResponse> secondTurnTask = durableAgent.RunAsync(secondAlert, session, cancellationToken: cancellationToken);
 
@@ -229,16 +237,22 @@ public static class GitHubCopilotDurableDemo
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(input);
 
+        // Step 1: Obtain the durable CopilotAgent proxy and create a deterministic DurableAgentSession.
+        // All turns using this session route to the same @dafx-v2-copilotagent@{key} entity instance.
         DurableAIAgent agent = context.GetAgent(AgentName);
         AgentSession session = await agent.CreateSessionAsync();
 
         context.SetCustomStatus($"Diagnosing incident: {input.IncidentSummary}");
 
-        // Turn 1: Ask Copilot to diagnose the incident and propose a remediation plan.
+        // Step 2 (Turn 1): Ask Copilot to diagnose the incident and propose a remediation plan.
+        // AgentEntity creates the underlying CopilotSession and persists its SessionId in entity state.
         AgentResponse planResponse = await agent.RunAsync(
             $"Diagnose this incident and propose a step-by-step remediation plan: {input.IncidentSummary}",
             session);
 
+        // Step 3: Publish the proposed plan via custom status and pause for human approval,
+        // racing the external "Approval" event against a durable SLA timer.
+        // While waiting here, the orchestration is dehydrated to storage and requires zero active workers.
         int slaMinutes = Math.Max(1, input.ApprovalTimeoutMinutes);
         context.SetCustomStatus(
             $"Waiting for human approval ({ApprovalEventName}) within {slaMinutes}m SLA. Proposed plan: {planResponse.Text}");
@@ -251,6 +265,7 @@ public static class GitHubCopilotDurableDemo
         Task winner = await Task.WhenAny(approvalTask, timeoutTask);
         if (ReferenceEquals(winner, timeoutTask))
         {
+            // The SLA timer fired before an operator responded; exit cleanly without running Turn 2.
             context.SetCustomStatus($"Approval SLA expired after {slaMinutes}m.");
             return new CopilotIncidentResult(
                 ProposedPlan: planResponse.Text,
@@ -259,11 +274,13 @@ public static class GitHubCopilotDurableDemo
                 FinalResolution: $"Remediation timed out after {slaMinutes} minutes waiting for operator approval.");
         }
 
+        // Step 4: Approval event arrived first—cancel the outstanding durable SLA timer.
         await timerCts.CancelAsync();
         bool approved = await approvalTask;
 
         if (!approved)
         {
+            // Operator rejected the proposed remediation plan; skip Turn 2.
             context.SetCustomStatus("Remediation plan rejected by operator.");
             return new CopilotIncidentResult(
                 ProposedPlan: planResponse.Text,
@@ -274,7 +291,8 @@ public static class GitHubCopilotDurableDemo
 
         context.SetCustomStatus("Approved. Executing Turn 2 on the same Copilot session...");
 
-        // Turn 2: Resume the same Copilot session (even if the worker restarted while waiting for approval).
+        // Step 5 (Turn 2): Resume the exact same Copilot session (even if the worker host was stopped
+        // and replaced while waiting for approval) to produce the post-approval verification steps.
         AgentResponse executionResponse = await agent.RunAsync(
             "The operator approved the remediation plan. Provide the exact verification steps for the approved plan.",
             session);

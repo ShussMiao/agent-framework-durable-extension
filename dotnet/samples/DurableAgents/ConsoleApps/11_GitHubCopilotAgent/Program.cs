@@ -13,6 +13,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
+// Read the Durable Task Scheduler (DTS) connection string and optional Copilot runtime settings.
 string dtsConnectionString = Environment.GetEnvironmentVariable("DURABLE_TASK_SCHEDULER_CONNECTION_STRING")
     ?? "Endpoint=http://localhost:8080;TaskHub=default;Authentication=None";
 string? copilotRuntimeUrl = Environment.GetEnvironmentVariable("COPILOT_RUNTIME_URL");
@@ -25,6 +26,7 @@ Console.WriteLine($"History ProviderKey: {GitHubCopilotDurableDemo.HistoryProvid
 Console.WriteLine($"Copilot Connection: {(string.IsNullOrWhiteSpace(copilotRuntimeUrl) ? "Local Copilot CLI" : copilotRuntimeUrl)}");
 Console.WriteLine();
 
+// Create the GitHub Copilot SDK client (connects to a shared COPILOT_RUNTIME_URL server or local Copilot CLI).
 await using CopilotClient copilotClient = new(
     GitHubCopilotDurableDemo.CreateClientOptions(copilotRuntimeUrl, copilotBaseDirectory));
 
@@ -45,14 +47,21 @@ try
         IncidentSummary: "Elevated HTTP 503 errors on checkout-service after deployment v2.4.1",
         ApprovalTimeoutMinutes: 30);
 
+    // Schedule the durable orchestration on Host 1.
     instanceId = await firstHostClient.ScheduleNewOrchestrationInstanceAsync(
         nameof(GitHubCopilotDurableDemo.RunIncidentOrchestrationAsync),
         incidentInput);
     Console.WriteLine($"[Host 1] Started orchestration '{instanceId}'. Waiting for Turn 1 remediation plan...");
 
+    // Poll orchestration metadata until Turn 1 (Copilot incident diagnosis) has completed
+    // and the orchestration has checkpointed at WaitForExternalEvent("Approval").
     while (true)
     {
         OrchestrationMetadata? metadata = await firstHostClient.GetInstanceAsync(instanceId, getInputsAndOutputs: true);
+
+        // Check custom status published by the orchestration after Turn 1 finishes.
+        // Once the status contains the "Approval" event name, the orchestration is durably
+        // suspended waiting for operator input and the Turn 1 Copilot session ID is saved.
         string? customStatus = metadata?.ReadCustomStatusAs<string>();
         if (customStatus?.Contains(GitHubCopilotDurableDemo.ApprovalEventName, StringComparison.Ordinal) is true)
         {
@@ -60,6 +69,7 @@ try
             break;
         }
 
+        // Guard against unexpected early termination (e.g., if Turn 1 faulted or timed out).
         if (metadata?.RuntimeStatus is OrchestrationRuntimeStatus.Completed
             or OrchestrationRuntimeStatus.Failed
             or OrchestrationRuntimeStatus.Terminated)
@@ -72,6 +82,10 @@ try
 }
 finally
 {
+    // Once the orchestration has checkpointed at WaitForExternalEvent, both the orchestration
+    // history and the DurableAgentSession (including GitHubCopilotAgentSession.SessionId) are
+    // durably persisted in DTS. We can shut down and dispose Host 1 completely so zero worker
+    // processes, threads, or memory are held open while waiting for the human operator.
     await StopAndDisposeHostAsync(firstHost);
 }
 
@@ -96,11 +110,15 @@ try
 {
     DurableTaskClient secondHostClient = secondHost.Services.GetRequiredService<DurableTaskClient>();
 
+    // Deliver the operator's approval decision to the paused orchestration instance.
     await secondHostClient.RaiseEventAsync(
         instanceId,
         GitHubCopilotDurableDemo.ApprovalEventName,
         approved);
 
+    // Host 2 picks up the raised event, replays the orchestration past Turn 1 without re-calling
+    // Copilot, cancels the SLA timer, rehydrates the @dafx-v2-copilotagent@{key} entity state
+    // (restoring GitHubCopilotAgentSession.SessionId), and resumes that exact Copilot session for Turn 2.
     OrchestrationMetadata completed = await secondHostClient.WaitForInstanceCompletionAsync(
         instanceId,
         getInputsAndOutputs: true);
@@ -116,6 +134,7 @@ finally
     await StopAndDisposeHostAsync(secondHost);
 }
 
+// Helper to configure and build a worker + client host with the durable CopilotAgent and orchestration.
 static IHost CreateHost(CopilotClient copilotClient, string dtsConnectionString)
 {
     AIAgent copilotAgent = GitHubCopilotDurableDemo.CreateCopilotAgent(copilotClient);
