@@ -61,11 +61,12 @@ class Registration:
     _manifest: Path = field(repr=False)
 
     def load_workflow(self, *, continuation_profile: str = "activity-only") -> Any:
-        """Call only after checkpoint authentication and runtime input binding.
+        """Load trusted deployment code after its bundle and release are verified.
 
         Customer code is trusted arbitrary Python, not a sandbox. Declared bytes
         are rechecked and compiled directly so stale pyc files cannot substitute
-        a different implementation.
+        a different implementation. All declared modules are loaded while the
+        verified finder is active so deferred handler imports remain available.
         """
         fresh = validate_registration(self._manifest)
         if fresh != self:

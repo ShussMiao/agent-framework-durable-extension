@@ -40,6 +40,7 @@ from ._authority import BackendBinding, verify_checkpoint
 from ._bundle import verify_checkpoint_bundle
 from ._continuation import continue_checkpoint
 from ._format import JOIN_CONTRACT, decode_checkpoint_document
+from ._native_prefix import prefix_values_equal
 from ._registration import Registration
 from ._types import is_json_object, is_list, is_string_keyed_dict
 
@@ -229,10 +230,10 @@ def register_current_handlers(
             validate_join_contract(authorized)
             contract = authorized.get("contract")
             if contract == "checkpoint-only-start/1":
-                if authorized != value:
+                if not prefix_values_equal(authorized, value):
                     raise ValueError("Runtime input differs from the operator-authorized semantic cut.")
             elif contract == "checkpoint-only-prefix/1":
-                if authorized["input"] != value:
+                if not prefix_values_equal(authorized["input"], value):
                     raise ValueError("Same-execution prefix requires its signed original input.")
                 prefix = authorized["prefix"]
                 if not is_json_object(prefix):

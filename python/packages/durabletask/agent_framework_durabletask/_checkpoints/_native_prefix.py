@@ -136,6 +136,7 @@ import math
 from copy import deepcopy
 from typing import Any, Generator, Mapping
 
+from .._json_payload import JsonPayload
 from ._types import is_list, is_string_keyed_dict
 
 CONTRACT = "mechanical-native-prefix/1"
@@ -324,7 +325,7 @@ def _replay_native_prefix(
             tasks = [
                 context.call_activity(item["name"], input=argument)
                 if item["kind"] == "activity"
-                else context.wait_for_external_event(item["event_name"])
+                else context.wait_for_external_event(item["event_name"], data_type=JsonPayload)
                 if item["kind"] == "external_wait"
                 else context.call_sub_orchestrator(item["name"], input=argument, instance_id=item["instance"])
                 if item["kind"] == "child"

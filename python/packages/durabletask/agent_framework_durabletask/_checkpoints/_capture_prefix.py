@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from durabletask.entities import EntityInstanceId
 from durabletask.task import when_all
 
+from .._json_payload import JsonPayload
 from .._models import RunRequest
 from .._workflows.protocol import WORKFLOW_ENGINE_VERSION, unwrap_workflow_input, wrap_workflow_input
 from ._native_prefix import (
@@ -177,7 +178,7 @@ def _dispatch(context: Any, item: dict[str, Any], argument: Any, profile: str) -
     if item["kind"] == "child":
         return context.call_sub_orchestrator(item["name"], input=argument, instance_id=item["instance"])
     if item["kind"] == "external_wait":
-        return context.wait_for_external_event(item["event_name"])
+        return context.wait_for_external_event(item["event_name"], data_type=JsonPayload)
     if context.new_uuid() != item["correlation_id"]:
         raise ValueError("Original public correlation UUID changed.")
     if profile == CLASSIC:

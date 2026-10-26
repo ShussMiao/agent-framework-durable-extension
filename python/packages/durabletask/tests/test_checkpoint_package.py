@@ -19,6 +19,7 @@ from unittest.mock import Mock, patch
 import pytest
 from agent_framework import Executor, WorkflowBuilder, WorkflowContext, WorkflowExecutor, handler
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from durabletask import task
 from durabletask.internal import helpers, type_discovery
 from durabletask.serialization import JsonDataConverter
 from durabletask.worker import TaskHubGrpcWorker, _OrchestrationExecutor
@@ -384,6 +385,7 @@ class Context:
 
 async def main():
     registration = validate_registration(Path('customer/registration.json'))
+    assert 'helper' not in sys.modules
     workflow = registration.load_workflow(continuation_profile='published-checkpoint')
     assert 'helper' in sys.modules
     context = Context()
@@ -604,5 +606,104 @@ def test_public_registration_uses_committed_exact_execution_authority(
             assert json.loads(admission)["address"]["root_instance_id"] == "original"
         else:
             assert admission is None
+    finally:
+        sys.modules.pop("customer", None)
+
+
+@pytest.mark.parametrize("contract", ["checkpoint-only-start/1", "checkpoint-only-prefix/1"])
+def test_runtime_checkpoint_input_binding_rejects_bool_integer_equivalence(
+    tmp_path: Path,
+    contract: str,
+) -> None:
+    if (
+        "execution_id" not in inspect.signature(_OrchestrationExecutor.execute).parameters
+        or not hasattr(task, "ReplayProfile")
+    ):
+        pytest.skip("Requires the proposed SDK execution-identity and replay-profile APIs.")
+
+    manifest = _customer(tmp_path / "customer")
+    registration = validate_registration(manifest)
+    cold = tmp_path / "cold"
+    digest = build_checkpoint_bundle(cold, manifest.parent, customer_files=["customer.py", "registration.json"])
+    scope = CheckpointScope("local", "owned", registration.definition_digest)
+    store = CheckpointStore(tmp_path / "protected" / "authority.db", create=True)
+    store.prepare(scope, "release", bundle_sha256=digest)
+    private = Ed25519PrivateKey.generate()
+
+    if contract == "checkpoint-only-start/1":
+        payload = {"contract": contract, "state": serialize_value(_state())}
+        checkpoint_bytes = encode_checkpoint_document(payload)
+        runtime_document = json.loads(checkpoint_bytes)
+        runtime_document["formatVersion"] = True
+        runtime_input = json.dumps(runtime_document)
+        expected_error = "Runtime input differs from the operator-authorized semantic cut."
+    else:
+        prefix = {
+            "contract": "mechanical-native-prefix/4",
+            "source_transport_profile": "native-sdk-v1",
+            "operation_batches": [],
+            "children": [],
+        }
+        payload = {
+            "contract": contract,
+            "input": True,
+            "state": serialize_value(_state()),
+            "prefix": prefix,
+        }
+        checkpoint_bytes = encode_checkpoint_document(payload)
+        runtime_input = "1"
+        expected_error = "Same-execution prefix requires its signed original input."
+
+    envelope = issue_checkpoint(
+        key_id="operator",
+        operator_private_key=private,
+        binding=BackendBinding(
+            "local", "owned", "original", "native-execution", registration.definition_digest
+        ),
+        checkpoint_bytes=checkpoint_bytes,
+    )
+    store.put(
+        scope,
+        "release",
+        kind="capability",
+        instance="original",
+        execution="native-execution",
+        payload=envelope,
+    )
+    store.activate(scope, "release", expected_active=None, stop_attestation=b"all old workers stopped")
+    native = TaskHubGrpcWorker(emit_trace_spans=False)
+    try:
+        register_current_worker(
+            native,
+            registration,
+            backend_id="local",
+            hub="owned",
+            keys={"operator": public_key_bytes(private.public_key())},
+            store=store,
+            generation="release",
+            bundle_sha256=digest,
+            bundle_directory=cold,
+        )
+        start = helpers.new_execution_started_event("dafx-package-proof", "original")
+        start.executionStarted.orchestrationInstance.executionId.value = "native-execution"
+        start.executionStarted.input.value = runtime_input
+        executor = _OrchestrationExecutor(
+            native._registry, logging.getLogger("checkpoint-input-binding"), native._data_converter
+        )
+        result = _execute_with_proposed_execution_identity(
+            executor,
+            "original",
+            "native-execution",
+            [helpers.new_orchestrator_started_event(), start],
+        )
+        terminals = [
+            action.completeOrchestration
+            for action in result.actions
+            if action.HasField("completeOrchestration")
+        ]
+        assert len(terminals) == 1, result.actions
+        terminal = terminals[0]
+        assert expected_error in terminal.failureDetails.errorMessage
+        assert not any(action.HasField("scheduleTask") for action in result.actions)
     finally:
         sys.modules.pop("customer", None)

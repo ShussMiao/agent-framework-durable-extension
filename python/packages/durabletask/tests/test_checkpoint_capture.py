@@ -33,7 +33,7 @@ from datetime import timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Callable, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from agent_framework import AgentExecutor, WorkflowBuilder, WorkflowExecutor
@@ -41,7 +41,7 @@ from durabletask import task, worker
 from durabletask.entities import EntityInstanceId
 from durabletask.internal import helpers
 from durabletask.internal import orchestrator_service_pb2 as pb
-from durabletask.serialization import DEFAULT_DATA_CONVERTER
+from durabletask.serialization import DEFAULT_DATA_CONVERTER, JsonDataConverter
 from google.protobuf.json_format import ParseDict  # type: ignore[import-untyped]
 
 from agent_framework_durabletask._checkpoints._capture_prefix import (
@@ -49,7 +49,8 @@ from agent_framework_durabletask._checkpoints._capture_prefix import (
     replay_checkpoint_prefix,
 )
 from agent_framework_durabletask._checkpoints._continuation import continue_checkpoint
-from agent_framework_durabletask._json_payload import install_json_payload_converter
+from agent_framework_durabletask._checkpoints._native_prefix import replay_native_prefix
+from agent_framework_durabletask._json_payload import JsonPayload, install_json_payload_converter
 from agent_framework_durabletask._workflows.dt_context import DurableTaskWorkflowContext
 from agent_framework_durabletask.checkpoint_migration import (
     PINS,
@@ -238,7 +239,115 @@ def consume(captured, trusted, history, profile="classic-functions-v1"):
         ),
     )
     executor = worker._OrchestrationExecutor(native._registry, logging.getLogger("capture"), native._data_converter)
-    return _execute_with_proposed_identity(executor, instance, native_events(history), execution_id=execution)
+    events = native_events(history)
+    dispatch_start = max(
+        (index for index, event in enumerate(events) if event.HasField("orchestratorStarted")),
+        default=-1,
+    )
+    if dispatch_start < 0 or not any(event.HasField("executionStarted") for event in events):
+        raise AssertionError("Captured replay history must include a start and current dispatch boundary.")
+    execute = cast(Callable[..., Any], executor.execute)
+    return execute(
+        instance,
+        events[:dispatch_start],
+        events[dispatch_start:],
+        execution_id=execution,
+    )
+
+
+@pytest.mark.parametrize("prefix_kind", ["capture", "native"])
+def test_external_wait_prefix_keeps_marker_payload_as_plain_json(prefix_kind):
+    profiles = getattr(task, "ReplayProfile", None)
+    if profiles is None:
+        pytest.skip("Requires the proposed SDK replay profile API.")
+
+    value = {"$type": "customer-marker", "value": "preserve-json"}
+    wire = json.dumps(value)
+
+    class MarkerAwareConverter(JsonDataConverter):
+        def deserialize(self, data, target_type=None):
+            if data and target_type is None:
+                decoded = json.loads(data)
+                if isinstance(decoded, dict) and decoded.get("$type") == "customer-marker":
+                    return SimpleNamespace(value=decoded["value"])
+            return super().deserialize(data, target_type)
+
+    worker_instance = worker.TaskHubGrpcWorker(
+        channel=Mock(),
+        data_converter=MarkerAwareConverter(),
+        emit_trace_spans=False,
+    )
+    install_json_payload_converter(worker_instance)
+    assert isinstance(worker_instance._data_converter.deserialize(wire), SimpleNamespace)
+    assert worker_instance._data_converter.deserialize(wire, JsonPayload) == value
+
+    if prefix_kind == "capture":
+        prefix = {
+            "contract": "mechanical-native-prefix/4",
+            "source_transport_profile": "classic-functions-v1",
+            "operation_batches": [[{
+                "kind": "external_wait",
+                "wait_id": "approval-1",
+                "event_name": "approval",
+                "source_result": wire,
+            }]],
+            "children": [],
+        }
+    else:
+        prefix = {
+            "contract": "mechanical-native-prefix/2",
+            "operation_batches": [[{
+                "kind": "external_wait",
+                "wait_id": "approval-1",
+                "event_name": "approval",
+                "source_result": wire,
+            }]],
+            "children": [],
+        }
+    checkpoint = {"phase": "prepare", "children": []}
+    instance_id = f"external-wait-{prefix_kind}"
+    execution_id = f"execution-{prefix_kind}"
+
+    def resume(context, _: Any):
+        if prefix_kind == "capture":
+            return (
+                yield from replay_checkpoint_prefix(
+                    context, prefix, checkpoint, instance_id=instance_id, execution_id=execution_id
+                )
+            )
+        return (  # noqa: B901
+            yield from replay_native_prefix(
+                context, prefix, checkpoint, instance_id=instance_id, execution_id=execution_id
+            )
+        )
+
+    resume.__name__ = f"external_wait_{prefix_kind}"
+    cast(Callable[..., Any], worker_instance.add_orchestrator)(
+        resume,
+        replay_profile=profiles.CLASSIC_FUNCTIONS_V1,
+    )
+    executor = worker._OrchestrationExecutor(
+        worker_instance._registry,
+        logging.getLogger("checkpoint-external-wait"),
+        worker_instance._data_converter,
+    )
+    execute = cast(Callable[..., Any], executor.execute)
+    start = helpers.new_execution_started_event(resume.__name__, instance_id, "null")
+    start.executionStarted.orchestrationInstance.executionId.value = execution_id
+    first = [helpers.new_orchestrator_started_event(), start]
+    waiting = execute(instance_id, [], first, execution_id=execution_id)
+    assert waiting.actions == []
+
+    result = execute(
+        instance_id,
+        first,
+        [helpers.new_orchestrator_started_event(), helpers.new_event_raised_event("approval", wire)],
+        execution_id=execution_id,
+    )
+    completion = next(
+        action.completeOrchestration for action in result.actions if action.HasField("completeOrchestration")
+    )
+    assert completion.orchestrationStatus == pb.ORCHESTRATION_STATUS_COMPLETED, completion
 
 
 def test_future_child_dispatch_wraps_new_input_and_preserves_acquired_inputs():
@@ -488,7 +597,7 @@ def test_recorded_source_return_before_native_commit_preserves_original_envelope
     assert json.loads(native.actions[0].completeOrchestration.result.value) == expected
 
 
-def test_later_failed_child_preserves_native_first_failure_and_null_details(assets):
+def test_later_failed_child_waits_for_siblings_then_preserves_first_failure(assets):
     trusted = definition("suspended_prefix_child_fixture")
     suspended = rows(assets.child, "parent-suspended-after-child-outcome-history.json")
     captured = compile_case(assets, trusted, suspended)
@@ -501,6 +610,17 @@ def test_later_failed_child_preserves_native_first_failure_and_null_details(asse
     captured = compile_case(assets, trusted, resumed)
     assert captured.evidence["failure_order"][0]["event"]["task_scheduled_id"] == 3
     native = consume(captured, trusted, resumed)
+    assert native.actions == []
+    settled = deepcopy(resumed)
+    settled.append({"type": "OrchestratorStartedEvent", "event_id": -1, "timestamp": settled[-1]["timestamp"]})
+    settled.append({
+        "type": "SubOrchestrationInstanceFailedEvent",
+        "event_id": -1,
+        "timestamp": settled[-1]["timestamp"],
+        "task_scheduled_id": 2,
+        "failure_details": None,
+    })
+    native = consume(captured, trusted, settled)
     assert len(native.actions) == 1
     assert native.actions[0].completeOrchestration.orchestrationStatus == 3
     assert "task #3 failed" in native.actions[0].completeOrchestration.failureDetails.errorMessage
@@ -817,6 +937,17 @@ def test_mixed_batch_first_failure_is_actual_arrival_not_task_list_order(assets)
             "failure_details": None,
         })
     result = consume(captured, trusted, modeled)
+    assert result.actions == []
+    settled = deepcopy(modeled)
+    settled.append({"type": "OrchestratorStartedEvent", "event_id": -1, "timestamp": settled[-1]["timestamp"]})
+    settled.append({
+        "type": "SubOrchestrationInstanceFailedEvent",
+        "event_id": -1,
+        "timestamp": settled[-1]["timestamp"],
+        "task_scheduled_id": 2,
+        "failure_details": None,
+    })
+    result = consume(captured, trusted, settled)
     assert len(result.actions) == 1
     terminal = result.actions[0].completeOrchestration
     assert terminal.orchestrationStatus == 3
@@ -913,7 +1044,7 @@ def test_original_agent_between_steps_and_unaccepted_sequential_tail(assets):
         assert captured.boundary == "prepare"
         assert captured.state["outputs"] == ["prior"]
         native = consume(captured, trusted, history)
-        assert [a.id for a in native.actions if a.HasField("scheduleTask")] == [2]
+        assert [a.id for a in native.actions if a.HasField("scheduleTask")] == [2], native.actions
         # Independent model of two sequential source messages, one already done.
         modeled = deepcopy(history)
         begin = next(row for row in modeled if row["type"] == "TaskCompletedEvent" and row["task_scheduled_id"] == 0)

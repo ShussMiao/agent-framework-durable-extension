@@ -159,11 +159,11 @@ worker without the required public configuration surfaces.
 Use `agent_framework_durabletask.checkpoint.validate_registration` on an explicit
 trusted source manifest. Its `module:factory` entry point is deployment-owned,
 not selected by a workflow start. Source paths use forward slashes, including
-for nested package modules, on every operating system. After authentication,
-registration verifies and loads every declared module, including helpers imported
-only when a handler runs. This keeps deferred imports bound to the pinned module
-cache without adding the customer directory to the worker's global import path.
-Then build a new directory.
+for nested package modules, on every operating system. After verifying the
+active release and cold bundle, registration verifies and loads every declared
+module, including helpers imported only when a handler runs. This keeps deferred
+imports bound to the pinned module cache without adding the customer directory
+to the worker's global import path. Then build a new directory.
 
 ```python
 from agent_framework_durabletask.checkpoint import (
