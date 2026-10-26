@@ -205,6 +205,16 @@ def test_unsigned_root_type_marker_uses_native_json_payload_boundary(tmp_path: P
         assert not isinstance(decoded, CustomerMarker)
         assert CustomerMarker.decoded == 0
 
+        context: Any = SimpleNamespace(
+            instance_id="unsigned-root",
+            execution_id="native-execution",
+            parent_instance_id=None,
+            parent_execution_id=None,
+        )
+        with pytest.raises(ValueError, match="Migration-only roots require a bound operator capability"):
+            next(orchestrator(context, decoded))
+        assert CustomerMarker.decoded == 0
+
         start = helpers.new_execution_started_event(orchestrator.__name__, "unsigned-root")
         start.executionStarted.input.value = marker_wire
         result = _OrchestrationExecutor(
