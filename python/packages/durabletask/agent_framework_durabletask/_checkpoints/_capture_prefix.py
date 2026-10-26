@@ -174,9 +174,11 @@ def _preflight(context: Any, operations: list[dict[str, Any]], profile: str) -> 
 
 def _dispatch(context: Any, item: dict[str, Any], argument: Any, profile: str) -> Any:
     if item["kind"] == "activity":
-        return context.call_activity(item["name"], input=argument)
+        return context.call_activity(item["name"], input=argument, return_type=JsonPayload)
     if item["kind"] == "child":
-        return context.call_sub_orchestrator(item["name"], input=argument, instance_id=item["instance"])
+        return context.call_sub_orchestrator(
+            item["name"], input=argument, instance_id=item["instance"], return_type=JsonPayload
+        )
     if item["kind"] == "external_wait":
         return context.wait_for_external_event(item["event_name"], data_type=JsonPayload)
     if context.new_uuid() != item["correlation_id"]:
@@ -187,8 +189,11 @@ def _dispatch(context: Any, item: dict[str, Any], argument: Any, profile: str) -
             item["operation"],
             input=argument,
             request_id=item["native_request_id"],
+            return_type=JsonPayload,
         )
-    return context.call_entity(EntityInstanceId.parse(item["entity"]), item["operation"], input=argument)
+    return context.call_entity(
+        EntityInstanceId.parse(item["entity"]), item["operation"], input=argument, return_type=JsonPayload
+    )
 
 
 def _prepare_future(item: dict[str, Any], instance: str, tokens: set[str]) -> None:
@@ -321,7 +326,7 @@ def _dispatch_future(
 ) -> Any:
     kind = item["kind"]
     if kind == "activity":
-        return context.call_activity(item["name"], input=item["python_input"])
+        return context.call_activity(item["name"], input=item["python_input"], return_type=JsonPayload)
     if kind == "child":
         row = known.get(item["task_id"])
         argument = (
@@ -329,7 +334,9 @@ def _dispatch_future(
             if row is not None
             else wrap_workflow_input(item["python_input"])
         )
-        return context.call_sub_orchestrator(item["name"], input=argument, instance_id=item["instance"])
+        return context.call_sub_orchestrator(
+            item["name"], input=argument, instance_id=item["instance"], return_type=JsonPayload
+        )
     correlation = context.new_uuid()
     row = known.get(item["task_id"])
     if row is not None:
@@ -345,8 +352,11 @@ def _dispatch_future(
                 "run",
                 input=argument,
                 request_id=row["request_id"],
+                return_type=JsonPayload,
             )
-        return context.call_entity(EntityInstanceId.parse(item["entity"]), "run", input=argument)
+        return context.call_entity(
+            EntityInstanceId.parse(item["entity"]), "run", input=argument, return_type=JsonPayload
+        )
     request = RunRequest(
         message=item["message"],
         correlation_id=correlation,
@@ -354,7 +364,9 @@ def _dispatch_future(
         created_at=context.current_utc_datetime,
     )
     argument = request.to_dict()
-    return context.call_entity(EntityInstanceId.parse(item["entity"]), "run", input=argument)
+    return context.call_entity(
+        EntityInstanceId.parse(item["entity"]), "run", input=argument, return_type=JsonPayload
+    )
 
 
 def _replay(

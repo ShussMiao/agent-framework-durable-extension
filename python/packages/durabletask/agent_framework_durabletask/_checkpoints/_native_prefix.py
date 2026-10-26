@@ -323,17 +323,20 @@ def _replay_native_prefix(
                 if item["kind"] == "entity" and context.new_uuid() != item["correlation_id"]:
                     raise ValueError("Original public correlation UUID changed.")
             tasks = [
-                context.call_activity(item["name"], input=argument)
+                context.call_activity(item["name"], input=argument, return_type=JsonPayload)
                 if item["kind"] == "activity"
                 else context.wait_for_external_event(item["event_name"], data_type=JsonPayload)
                 if item["kind"] == "external_wait"
-                else context.call_sub_orchestrator(item["name"], input=argument, instance_id=item["instance"])
+                else context.call_sub_orchestrator(
+                    item["name"], input=argument, instance_id=item["instance"], return_type=JsonPayload
+                )
                 if item["kind"] == "child"
                 else context.call_entity(
                     EntityInstanceId.parse(item["entity"]),
                     item["operation"],
                     input=argument,
                     request_id=item["native_request_id"],
+                    return_type=JsonPayload,
                 )
                 for item, argument, _ in batch
             ]
@@ -344,7 +347,7 @@ def _replay_native_prefix(
                     raise ValueError(f"Actual native {label} result does not match authenticated prefix.")
         return {  # noqa: B901
             child["instance"]: context.call_sub_orchestrator(
-                child["name"], input=argument, instance_id=child["instance"]
+                child["name"], input=argument, instance_id=child["instance"], return_type=JsonPayload
             )
             for child, argument in prepared_children
         }
@@ -597,15 +600,18 @@ def replay_native_frontier(
             if item["kind"] == "entity" and context.new_uuid() != item["correlation_id"]:
                 raise ValueError("Original public correlation UUID changed.")
         batch = [
-            context.call_activity(item["name"], input=argument)
+            context.call_activity(item["name"], input=argument, return_type=JsonPayload)
             if item["kind"] == "activity"
-            else context.call_sub_orchestrator(item["name"], input=argument, instance_id=item["instance"])
+            else context.call_sub_orchestrator(
+                item["name"], input=argument, instance_id=item["instance"], return_type=JsonPayload
+            )
             if item["kind"] == "child"
             else context.call_entity(
                 EntityInstanceId.parse(item["entity"]),
                 item["operation"],
                 input=argument,
                 request_id=item["native_request_id"],
+                return_type=JsonPayload,
             )
             for item, argument in prepared
         ]

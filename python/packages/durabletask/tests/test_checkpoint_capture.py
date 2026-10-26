@@ -29,7 +29,7 @@ import subprocess
 import sys
 import zipfile
 from copy import deepcopy
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Callable, cast
@@ -261,23 +261,7 @@ def test_external_wait_prefix_keeps_marker_payload_as_plain_json(prefix_kind):
     if profiles is None:
         pytest.skip("Requires the proposed SDK replay profile API.")
 
-    value = {"$type": "customer-marker", "value": "preserve-json"}
-    wire = json.dumps(value)
-
-    class MarkerAwareConverter(JsonDataConverter):
-        def deserialize(self, data, target_type=None):
-            if data and target_type is None:
-                decoded = json.loads(data)
-                if isinstance(decoded, dict) and decoded.get("$type") == "customer-marker":
-                    return SimpleNamespace(value=decoded["value"])
-            return super().deserialize(data, target_type)
-
-    worker_instance = worker.TaskHubGrpcWorker(
-        channel=Mock(),
-        data_converter=MarkerAwareConverter(),
-        emit_trace_spans=False,
-    )
-    install_json_payload_converter(worker_instance)
+    worker_instance, value, wire = _marker_aware_worker()
     assert isinstance(worker_instance._data_converter.deserialize(wire), SimpleNamespace)
     assert worker_instance._data_converter.deserialize(wire, JsonPayload) == value
 
@@ -350,6 +334,314 @@ def test_external_wait_prefix_keeps_marker_payload_as_plain_json(prefix_kind):
     assert completion.orchestrationStatus == pb.ORCHESTRATION_STATUS_COMPLETED, completion
 
 
+def _marker_aware_worker():
+    value = {"$type": "customer-marker", "value": "preserve-json"}
+    wire = json.dumps(value)
+
+    class MarkerAwareConverter(JsonDataConverter):
+        def deserialize(self, data, target_type=None):
+            if data and target_type is None:
+                decoded = json.loads(data)
+                if isinstance(decoded, dict) and decoded.get("$type") == "customer-marker":
+                    return SimpleNamespace(value=decoded["value"])
+            return super().deserialize(data, target_type)
+
+    worker_instance = worker.TaskHubGrpcWorker(
+        channel=Mock(),
+        data_converter=MarkerAwareConverter(),
+        emit_trace_spans=False,
+    )
+    install_json_payload_converter(worker_instance)
+    return worker_instance, value, wire
+
+
+@pytest.mark.parametrize("prefix_kind", ["capture", "native"])
+def test_completed_activity_prefix_keeps_marker_result_as_plain_json(prefix_kind):
+    profiles = getattr(task, "ReplayProfile", None)
+    if profiles is None:
+        pytest.skip("Requires the proposed SDK replay profile API.")
+
+    worker_instance, value, wire = _marker_aware_worker()
+    instance_id = f"marker-result-{prefix_kind}"
+    execution_id = f"execution-{prefix_kind}"
+    argument = "source-input"
+    operation = {
+        "kind": "activity",
+        "task_id": 0,
+        "name": "marker-activity",
+        "python_input": argument,
+        "source_input": json.dumps([json.dumps(argument)]),
+        "source_result": wire,
+        "runtime_input_policy": "classic-host-omits-scheduled-input/1",
+    }
+    if prefix_kind == "capture":
+        prefix = {
+            "contract": "mechanical-native-prefix/4",
+            "source_transport_profile": "classic-functions-v1",
+            "operation_batches": [[operation]],
+            "children": [],
+        }
+        checkpoint = {"phase": "prepare", "children": []}
+    else:
+        prefix = {
+            "contract": "mechanical-native-prefix/2",
+            "operation_batches": [[operation]],
+            "children": [],
+        }
+        checkpoint = {"children": []}
+
+    def resume(context, _: Any):
+        if prefix_kind == "capture":
+            yield from replay_checkpoint_prefix(
+                context, prefix, checkpoint, instance_id=instance_id, execution_id=execution_id
+            )
+        else:
+            yield from replay_native_prefix(
+                context, prefix, checkpoint, instance_id=instance_id, execution_id=execution_id
+            )
+        return None  # noqa: B901
+
+    resume.__name__ = f"marker_activity_{prefix_kind}"
+    cast(Callable[..., Any], worker_instance.add_orchestrator)(
+        resume,
+        replay_profile=profiles.CLASSIC_FUNCTIONS_V1,
+    )
+    executor = worker._OrchestrationExecutor(
+        worker_instance._registry,
+        logging.getLogger("checkpoint-marker-result"),
+        worker_instance._data_converter,
+    )
+    execute = cast(Callable[..., Any], executor.execute)
+    start = helpers.new_execution_started_event(resume.__name__, instance_id, "null")
+    start.executionStarted.orchestrationInstance.executionId.value = execution_id
+    completed_result = execute(
+        instance_id,
+        [],
+        [
+            helpers.new_orchestrator_started_event(),
+            start,
+            helpers.new_task_scheduled_event(0, "marker-activity", operation["source_input"]),
+            helpers.new_task_completed_event(0, wire),
+        ],
+        execution_id=execution_id,
+    )
+    completion = next(
+        action.completeOrchestration
+        for action in completed_result.actions
+        if action.HasField("completeOrchestration")
+    )
+    assert completion.orchestrationStatus == pb.ORCHESTRATION_STATUS_COMPLETED, completion
+    assert value == json.loads(wire)
+
+
+@pytest.mark.parametrize("kind", ["activity", "child", "entity"])
+@pytest.mark.parametrize("profile", ["classic-functions-v1", "native-sdk-v1"])
+def test_capture_prefix_dispatch_decodes_marker_results_as_plain_json(kind, profile):
+    from agent_framework_durabletask._checkpoints._capture_prefix import CLASSIC, NATIVE, _dispatch
+
+    worker_instance, value, wire = _marker_aware_worker()
+    correlation_id = "00000000-0000-0000-0000-000000000001"
+    request_id = "00000000-0000-0000-0000-000000000002"
+    entity = str(EntityInstanceId(entity="dafx-marker", key="root"))
+
+    class ResultContext:
+        instance_id = "root"
+        execution_id = "execution"
+
+        def __init__(self):
+            self.calls = []
+
+        def new_uuid(self):
+            return correlation_id
+
+        def _result(self, kind, return_type):
+            self.calls.append((kind, return_type))
+            return worker_instance._data_converter.deserialize(wire, return_type)
+
+        def call_activity(self, name, *, input, return_type=None):
+            return self._result("activity", return_type)
+
+        def call_sub_orchestrator(self, name, *, input, instance_id, return_type=None):
+            return self._result("child", return_type)
+
+        def call_entity(self, entity_id, operation, *, input, request_id=None, return_type=None):
+            return self._result("entity", return_type)
+
+    item = {"kind": kind}
+    if kind == "activity":
+        item.update(name="marker-activity")
+    elif kind == "child":
+        item.update(name="marker-child", instance="root::child")
+    else:
+        item.update(
+            entity=entity,
+            operation="run",
+            correlation_id=correlation_id,
+            native_request_id=request_id,
+        )
+    context = ResultContext()
+    result = _dispatch(context, item, "source-input", CLASSIC if profile == CLASSIC else NATIVE)
+    assert result == value
+    assert context.calls == [(kind, JsonPayload)]
+
+
+@pytest.mark.parametrize("kind", ["activity", "child", "entity"])
+@pytest.mark.parametrize("acquired", [False, True], ids=["new", "acquired"])
+@pytest.mark.parametrize("profile", ["classic-functions-v1", "native-sdk-v1"])
+def test_future_prefix_dispatch_decodes_marker_results_as_plain_json(kind, acquired, profile):
+    from agent_framework_durabletask._checkpoints._capture_prefix import CLASSIC, NATIVE, _dispatch_future
+
+    worker_instance, value, wire = _marker_aware_worker()
+    correlation_id = "00000000-0000-0000-0000-000000000001"
+    request_id = "00000000-0000-0000-0000-000000000002"
+    entity = str(EntityInstanceId(entity="dafx-marker", key="root"))
+
+    class ResultContext:
+        instance_id = "root"
+        execution_id = "execution"
+        current_utc_datetime = datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+        def __init__(self):
+            self.calls = []
+
+        def new_uuid(self):
+            return correlation_id
+
+        def _result(self, kind, return_type):
+            self.calls.append((kind, return_type))
+            return worker_instance._data_converter.deserialize(wire, return_type)
+
+        def call_activity(self, name, *, input, return_type=None):
+            return self._result("activity", return_type)
+
+        def call_sub_orchestrator(self, name, *, input, instance_id, return_type=None):
+            return self._result("child", return_type)
+
+        def call_entity(self, entity_id, operation, *, input, request_id=None, return_type=None):
+            return self._result("entity", return_type)
+
+    future = {
+        "authorization": "source-future-operation/1",
+        "kind": kind,
+        "task_id": 4,
+    }
+    known = {}
+    if kind == "activity":
+        future.update(name="marker-activity", python_input="source-input")
+    elif kind == "child":
+        future.update(name="marker-child", instance="root::child", python_input={"value": "source-input"})
+        if acquired:
+            known[4] = {"input": json.dumps({"value": "acquired-input"})}
+    else:
+        future.update(entity=entity, operation="run", message="source-message")
+        if acquired:
+            known[4] = {
+                "input": json.dumps({"correlationId": correlation_id, "message": "source-message"}),
+                "request_id": request_id,
+            }
+
+    context = ResultContext()
+    result = _dispatch_future(context, future, known, CLASSIC if profile == CLASSIC else NATIVE)
+    assert result == value
+    assert context.calls == [(kind, JsonPayload)]
+
+
+def test_native_prefix_dispatches_marker_results_as_plain_json():
+    from agent_framework_durabletask._checkpoints._native_prefix import replay_native_prefix
+
+    worker_instance, value, wire = _marker_aware_worker()
+    correlation_id = "00000000-0000-0000-0000-000000000001"
+    request_id = "00000000-0000-0000-0000-000000000002"
+    entity = str(EntityInstanceId(entity="dafx-marker", key="root"))
+    child_instance = "root::child"
+    request = {"orchestrationId": "root", "correlationId": correlation_id}
+    activity = {
+        "kind": "activity",
+        "task_id": 0,
+        "name": "marker-activity",
+        "python_input": "source-input",
+        "source_input": json.dumps([json.dumps("source-input")]),
+        "source_result": wire,
+        "runtime_input_policy": "classic-host-omits-scheduled-input/1",
+    }
+    entity_operation = {
+        "kind": "entity",
+        "task_id": 1,
+        "entity": entity,
+        "operation": "run",
+        "python_input": request,
+        "source_input": json.dumps(request),
+        "source_result": wire,
+        "native_request_id": request_id,
+        "correlation_id": correlation_id,
+    }
+    child = {
+        "task_id": 2,
+        "name": "marker-child",
+        "instance": child_instance,
+        "input": json.dumps({"value": "source-input"}),
+    }
+    child_authority = {
+        "instance": child_instance,
+        "source_parent": {"instance": "root", "execution": "execution", "task": 2},
+    }
+    prefix = {
+        "contract": "mechanical-native-prefix/2",
+        "operation_batches": [[activity, entity_operation]],
+        "children": [child],
+    }
+    checkpoint = {"children": [child_authority]}
+
+    class ResultContext:
+        instance_id = "root"
+        execution_id = "execution"
+
+        def __init__(self):
+            self.calls = []
+
+        def new_uuid(self):
+            return correlation_id
+
+        def validate_replay_activity(self, *args, **kwargs):
+            pass
+
+        def validate_replay_entity(self, *args, **kwargs):
+            pass
+
+        def validate_replay_child(self, *args, **kwargs):
+            pass
+
+        def _result(self, kind, return_type):
+            self.calls.append((kind, return_type))
+            return worker_instance._data_converter.deserialize(wire, return_type)
+
+        def call_activity(self, name, *, input, return_type=None):
+            return self._result("activity", return_type)
+
+        def call_sub_orchestrator(self, name, *, input, instance_id, return_type=None):
+            return self._result("child", return_type)
+
+        def call_entity(self, entity_id, operation, *, input, request_id=None, return_type=None):
+            return self._result("entity", return_type)
+
+    context = ResultContext()
+    joined = object()
+    with patch("durabletask.task.when_all", return_value=joined):
+        replay = replay_native_prefix(
+            context, prefix, checkpoint, instance_id="root", execution_id="execution"
+        )
+        assert next(replay) is joined
+        with pytest.raises(StopIteration) as completed:
+            replay.send([value, value])
+        result = completed.value.value
+    assert context.calls == [
+        ("activity", JsonPayload),
+        ("entity", JsonPayload),
+        ("child", JsonPayload),
+    ]
+    assert result == {child_instance: value}
+
+
 def test_future_child_dispatch_wraps_new_input_and_preserves_acquired_inputs():
     from agent_framework_durabletask._checkpoints._capture_prefix import (
         CLASSIC,
@@ -390,7 +682,7 @@ def test_future_child_dispatch_wraps_new_input_and_preserves_acquired_inputs():
         def get_acquired_history(self):
             return self.acquired
 
-        def call_sub_orchestrator(self, name, *, input, instance_id):
+        def call_sub_orchestrator(self, name, *, input, instance_id, return_type=None):
             self.call = {"name": name, "input": input, "instance_id": instance_id}
             return self.call
 
