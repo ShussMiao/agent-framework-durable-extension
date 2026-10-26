@@ -176,6 +176,10 @@ class WorkflowOrchestrationContext(Protocol):
         """
         ...
 
+    def create_dispatch_checkpoint(self, input: Any) -> Any:
+        """Create a native continuation checkpoint at a drained dispatch frontier."""
+        ...
+
     def new_uuid(self) -> str:
         """Generate a replay-safe UUID."""
         ...

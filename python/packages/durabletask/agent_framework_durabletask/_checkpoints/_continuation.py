@@ -30,6 +30,8 @@ def continue_checkpoint(
     ctx: WorkflowOrchestrationContext,
     workflow: Workflow,
     checkpoint: dict[str, Any],
+    *,
+    automatic_emission: dict[str, str] | None = None,
     **native_handles: Any,
 ) -> Generator[Any, Any, list[Any] | dict[str, Any]]:
     """Continue sequential future work without replaying already applied results.
@@ -44,9 +46,21 @@ def continue_checkpoint(
         state = deepcopy(checkpoint)
         state["phase"] = "native_batch"
         state["nativeBatch"].pop("accepted_count")
-        return (yield from run(ctx, workflow, state, **native_handles))
+        return (yield from run(
+            ctx,
+            workflow,
+            state,
+            automatic_emission=automatic_emission,
+            **native_handles,
+        ))
     if checkpoint.get("phase") != "sequential_prepare":
-        return (yield from run(ctx, workflow, checkpoint, **native_handles))
+        return (yield from run(
+            ctx,
+            workflow,
+            checkpoint,
+            automatic_emission=automatic_emission,
+            **native_handles,
+        ))
     if native_handles:
         raise ValueError("Unaccepted sequential work cannot have accepted native handles.")
     state = deepcopy(checkpoint)
@@ -136,4 +150,11 @@ def continue_checkpoint(
     state["waiting"] = list(requests) if state["phase"] == "hitl" else []
     if state["phase"] != "hitl":
         state["iteration"] += 1
-    return (yield from run(ctx, workflow, state))  # noqa: B901
+    return (  # noqa: B901
+        yield from run(
+            ctx,
+            workflow,
+            state,
+            automatic_emission=automatic_emission,
+        )
+    )

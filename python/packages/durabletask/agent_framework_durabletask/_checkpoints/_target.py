@@ -34,6 +34,7 @@ from agent_framework_durabletask._workflows.context import WorkflowOrchestration
 from agent_framework_durabletask._workflows.serialization import (
     SUBWORKFLOW_RESULT_KEY,
     deserialize_value,
+    serialize_value,
     strip_pickle_markers,
 )
 
@@ -273,6 +274,7 @@ def run(
     child_result_task: Callable[..., Any] | None = None,
     native_child_tasks: dict[str, Any] | None = None,
     native_batch_tasks: list[Any] | None = None,
+    automatic_emission: dict[str, str] | None = None,
 ) -> Generator[Any, Any, list[Any] | dict[str, Any]]:
     """Continue semantic state after its caller authenticates the runtime binding.
 
@@ -285,6 +287,15 @@ def run(
         raise ValueError("Unsupported checkpoint routing policy.")
     if not isinstance(checkpoint.get("eventStreaming"), bool):
         raise ValueError("Checkpoint requires an explicit source event publication policy.")
+    if automatic_emission is not None and (
+        set(automatic_emission) != {"definition_sha256"}
+        or not isinstance(automatic_emission["definition_sha256"], str)
+        or len(automatic_emission["definition_sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in automatic_emission["definition_sha256"])
+        or checkpoint.get("is_child") is not False
+        or checkpoint.get("children")
+    ):
+        raise ValueError("Automatic native emission requires a root semantic frontier and definition digest.")
     pending: dict[str, list[tuple[Any, Any]]] = {name: list(rows) for name, rows in checkpoint["pending"].items()}
     requests: dict[str, current.PendingHITLRequest] = {}
     for key, record in checkpoint["requests"].items():
@@ -388,6 +399,47 @@ def run(
         if subworkflows:
             value["subworkflows"] = subworkflows
         ctx.set_custom_status(value)
+
+    def emission_snapshot() -> dict[str, Any]:
+        return {
+            "contract": CONTRACT,
+            "routingPolicy": "published-batch-join/1",
+            "phase": phase,
+            "eventStreaming": checkpoint["eventStreaming"],
+            "pending": {executor: list(rows) for executor, rows in pending.items()},
+            "outputs": list(outputs),
+            "iteration": iteration,
+            "child_counter": counter[0],
+            "is_child": False,
+            "address": dict(checkpoint["address"]),
+            "events": list(events),
+            "shared_state": None if shared is None else dict(shared),
+            "requests": {
+                key: {
+                    "contract": "semantic-hitl-request/1",
+                    **{
+                        name: getattr(request, name)
+                        for name in (
+                            "request_id",
+                            "source_executor_id",
+                            "request_data",
+                            "request_type",
+                            "response_type",
+                        )
+                    },
+                }
+                for key, request in requests.items()
+            },
+            "waiting": list(waiting),
+            "admittedReplyKeys": list(checkpoint["admittedReplyKeys"]),
+            "fanBindings": checkpoint["fanBindings"],
+            "fan": {
+                key: {source: list(values) for source, values in fan[group_id].items()}
+                for key, group_id in ids.items()
+            },
+            "children": [],
+            "notify_parent": None,
+        }
 
     if phase == "native_batch":
         frontier = checkpoint.get("nativeBatch")
@@ -622,6 +674,22 @@ def run(
             waiting = list(requests)
         else:
             iteration += 1
+        if automatic_emission is not None and (pending or requests):
+            from ._format import encode_checkpoint_document
+
+            payload = encode_checkpoint_document(
+                {
+                    "contract": "checkpoint-only-start/1",
+                    "state": {
+                        "contract": "native-automatic-checkpoint/1",
+                        "definition_sha256": automatic_emission["definition_sha256"],
+                        "workflow_name": workflow.name,
+                        "semantic": serialize_value(emission_snapshot()),
+                    },
+                }
+            )
+            yield ctx.create_dispatch_checkpoint(json.loads(payload))
+            return outputs
     if checkpoint["is_child"]:
         return {SUBWORKFLOW_RESULT_KEY: True, "outputs": outputs, "events": events}
     return outputs  # noqa: B901

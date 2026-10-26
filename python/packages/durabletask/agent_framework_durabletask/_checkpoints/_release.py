@@ -31,6 +31,7 @@ from agent_framework_durabletask._workflows.naming import (
     workflow_orchestrator_name,
     workflow_scoped_executor_id,
 )
+from agent_framework_durabletask._workflows.protocol import unwrap_workflow_input
 from agent_framework_durabletask._workflows.registration import collect_hosted_workflows, plan_workflow_registration
 from agent_framework_durabletask._workflows.serialization import deserialize_value
 
@@ -39,7 +40,7 @@ from ._admission import AdmissionLedger, CheckpointContext
 from ._authority import BackendBinding, verify_checkpoint
 from ._bundle import verify_checkpoint_bundle
 from ._continuation import continue_checkpoint
-from ._format import JOIN_CONTRACT, decode_checkpoint_document
+from ._format import FORMAT, JOIN_CONTRACT, decode_checkpoint_document
 from ._native_prefix import prefix_values_equal
 from ._registration import Registration
 from ._types import is_json_object, is_list, is_string_keyed_dict
@@ -69,6 +70,91 @@ def _replay_profile(name: str) -> object:
 
 def _normalize_replay_profile(replay_profile: object | None) -> object:
     return _replay_profile("DEFAULT") if replay_profile is None else replay_profile
+
+
+_NATIVE_AUTO_CHECKPOINT_CONTRACT = "native-automatic-checkpoint/1"
+_NATIVE_CONTINUATION_PROFILE = "native-can-v1"
+
+
+def _is_checkpoint_document(value: Any) -> bool:
+    return is_json_object(value) and (
+        value.get("format") == FORMAT
+        or value.get("contract") == "checkpoint-only-start/1"
+    )
+
+
+def _restore_native_checkpoint(
+    value: Any,
+    context: CheckpointContext,
+    registration: Registration,
+    graph: Workflow,
+) -> dict[str, Any]:
+    continuation = getattr(context, "native_continuation", None)
+    if (
+        getattr(context, "native_continuation_profile", None) != _NATIVE_CONTINUATION_PROFILE
+        or continuation is None
+        or context.parent_instance_id is not None
+        or not context.execution_id
+        or continuation.successor_execution_id != context.execution_id
+        or not continuation.predecessor_execution_id
+        or len(continuation.input_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in continuation.input_sha256)
+    ):
+        raise ValueError("Native checkpoint admission requires a verified native CAN fact for this execution.")
+    if not _is_checkpoint_document(value):
+        raise ValueError("A native continuation fact requires its exact checkpoint input.")
+    document = decode_checkpoint_document(
+        json.dumps(value, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    )
+    validate_join_contract(document)
+    if document.get("contract") != "checkpoint-only-start/1":
+        raise ValueError("Native continuation input is not a checkpoint-only start document.")
+    state = document.get("state")
+    if (
+        not is_json_object(state)
+        or set(state) != {"contract", "definition_sha256", "workflow_name", "semantic"}
+        or state.get("contract") != _NATIVE_AUTO_CHECKPOINT_CONTRACT
+        or state.get("definition_sha256") != registration.definition_digest
+        or state.get("workflow_name") != graph.name
+        or not is_json_object(state.get("semantic"))
+    ):
+        raise ValueError("Native checkpoint definition or semantic envelope does not match this worker.")
+    semantic = deserialize_value(state["semantic"])
+    expected_fields = {
+        "contract",
+        "routingPolicy",
+        "phase",
+        "eventStreaming",
+        "pending",
+        "outputs",
+        "iteration",
+        "child_counter",
+        "is_child",
+        "address",
+        "events",
+        "shared_state",
+        "requests",
+        "waiting",
+        "admittedReplyKeys",
+        "fanBindings",
+        "fan",
+        "children",
+        "notify_parent",
+    }
+    address = semantic.get("address") if is_string_keyed_dict(semantic) else None
+    if (
+        not is_string_keyed_dict(semantic)
+        or set(semantic) != expected_fields
+        or semantic.get("phase") not in ("prepare", "hitl")
+        or semantic.get("is_child") is not False
+        or semantic.get("children") != []
+        or not is_string_keyed_dict(address)
+        or address.get("root_instance_id") != context.instance_id
+        or address.get("root_workflow_name") != graph.name
+        or address.get("request_path_prefix") != ""
+    ):
+        raise ValueError("Native checkpoint is not a supported root semantic frontier.")
+    return semantic
 
 
 class _RegistrationSink(Protocol):
@@ -123,6 +209,7 @@ def register_current_handlers(
     bundle_directory: str | Path,
     replay_profile: object | None = None,
     admission_profile: str = "migration-only",
+    emission_profile: str = "disabled",
     supports_event_streaming: bool = True,
 ) -> Workflow:
     """Register trusted deployment code, never a caller-selected definition.
@@ -133,6 +220,16 @@ def register_current_handlers(
     """
     if admission_profile not in ("migration-only", "new-workflows-only"):
         raise ValueError("Unsupported deployment admission profile.")
+    if emission_profile not in ("disabled", _NATIVE_CONTINUATION_PROFILE):
+        raise ValueError("Unsupported checkpoint emission profile.")
+    if emission_profile != "disabled" and admission_profile != "new-workflows-only":
+        raise ValueError("Automatic native emission is available only for new-workflows-only deployments.")
+    if emission_profile != "disabled" and (
+        getattr(durabletask_task, "NATIVE_CONTINUATION_PROFILE", None) != _NATIVE_CONTINUATION_PROFILE
+        or not hasattr(durabletask_task.OrchestrationContext, "native_continuation_profile")
+        or not hasattr(durabletask_task.OrchestrationContext, "native_continuation")
+    ):
+        raise RuntimeError("Automatic native emission requires the matching SDK/provider proposal capability.")
     replay_profile = _normalize_replay_profile(replay_profile)
     verify_checkpoint_bundle(bundle_directory, bundle_sha256=bundle_sha256)
     scope = CheckpointScope(backend_id, hub, registration.definition_digest)
@@ -191,6 +288,25 @@ def register_current_handlers(
                 checkpoint_context.execution_id,
                 registration.definition_digest,
             )
+            continuation = getattr(checkpoint_context, "native_continuation", None)
+            if continuation is not None:
+                if emission_profile != _NATIVE_CONTINUATION_PROFILE or admission_profile != "new-workflows-only":
+                    raise ValueError("Native continuation checkpoints are not enabled for this deployment.")
+                state = _restore_native_checkpoint(value, checkpoint_context, registration, graph)
+                lineage.record(checkpoint_context, graph, state)
+                return (
+                    yield from continue_checkpoint(
+                        DurableTaskWorkflowContext(
+                            context,
+                            supports_event_streaming=supports_event_streaming,
+                            acceptance_response_policy="published-v1",
+                            request_time_policy="orchestration-clock",
+                        ),
+                        graph,
+                        state,
+                        automatic_emission={"definition_sha256": registration.definition_digest},
+                    )
+                )
             envelope = store.get(
                 scope,
                 generation,
@@ -203,6 +319,14 @@ def register_current_handlers(
                 if checkpoint_context.parent_instance_id is None:
                     if admission_profile != "new-workflows-only":
                         raise ValueError("Migration-only roots require a bound operator capability.")
+                    if _is_checkpoint_document(unwrap_workflow_input(value)):
+                        raise ValueError("Copied checkpoint input is not authorized without native CAN lineage.")
+                    if (
+                        emission_profile == _NATIVE_CONTINUATION_PROFILE
+                        and getattr(checkpoint_context, "native_continuation_profile", None)
+                        != _NATIVE_CONTINUATION_PROFILE
+                    ):
+                        raise RuntimeError("The acquired backend does not advertise the native CAN proposal.")
                     state = lineage.admit_new_root(checkpoint_context, graph, value)
                 else:
                     state = lineage.admit_child(checkpoint_context, graph, value, hosted)
@@ -217,6 +341,12 @@ def register_current_handlers(
                         ),
                         graph,
                         state,
+                        automatic_emission=(
+                            {"definition_sha256": registration.definition_digest}
+                            if emission_profile == _NATIVE_CONTINUATION_PROFILE
+                            and checkpoint_context.parent_instance_id is None
+                            else None
+                        ),
                     )
                 )
             if admission_profile == "new-workflows-only":
@@ -299,7 +429,7 @@ def register_current_handlers(
                     "Active children require the authenticated original native prefix, not polled results."
                 )
             lineage.record(checkpoint_context, graph, state)
-            native_handles = {}
+            native_handles: dict[str, Any] = {}
             if child_tasks is not None:
                 native_handles["native_child_tasks"] = child_tasks
             if batch_tasks is not None:
@@ -339,6 +469,7 @@ def register_current_worker(
     bundle_directory: str | Path,
     replay_profile: object | None = None,
     admission_profile: str = "migration-only",
+    emission_profile: str = "disabled",
 ) -> Workflow:
     """Register the current-only native worker using public candidate SDK APIs."""
     if (
@@ -356,6 +487,13 @@ def register_current_worker(
         )
     ):
         raise RuntimeError("Checkpoint registration requires the matching public SDK/host candidate.")
+    if emission_profile != "disabled" and (
+        emission_profile != _NATIVE_CONTINUATION_PROFILE
+        or getattr(durabletask_task, "NATIVE_CONTINUATION_PROFILE", None) != _NATIVE_CONTINUATION_PROFILE
+        or not hasattr(durabletask_task.OrchestrationContext, "native_continuation_profile")
+        or not hasattr(durabletask_task.OrchestrationContext, "native_continuation")
+    ):
+        raise RuntimeError("Automatic native emission requires the matching SDK/provider proposal capability.")
     install_json_payload_converter(worker)
     workflow = register_current_handlers(
         _WorkerRegistrationAdapter(worker),
@@ -369,6 +507,7 @@ def register_current_worker(
         bundle_directory=bundle_directory,
         replay_profile=replay_profile,
         admission_profile=admission_profile,
+        emission_profile=emission_profile,
     )
     worker.use_work_item_filters()
     return workflow

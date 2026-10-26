@@ -94,36 +94,28 @@ digest, and native execution identity. Unknown outer versions and contracts are
 rejected before customer state deserialization. A future format must add an
 explicit migration step; existing semantic state is never silently reinterpreted.
 
-Automatic emission for ordinary executions is not wired into this candidate.
-The reconstructed SDK proposal has a native `create_dispatch_checkpoint`
-replay fence that emits a Continue-As-New completion action only at a drained
-dispatch frontier. Its focused executor tests preserve task IDs and buffered
-event order, and defer the cut while suspended. This is a more appropriate
-native mechanism than writing a marker through an activity or sidecar, but the
-proposal is not in the released Durable Task SDK and has not been exercised
-against a real backend here.
+The current-only candidate has an opt-in `emission_profile="native-can-v1"`
+for `admission_profile="new-workflows-only"`. It snapshots the semantic
+frontier after a completed batch when pending work or approval requests remain,
+then yields the proposal SDK's `create_dispatch_checkpoint` replay fence. The
+fence requests native Continue-As-New only after the dispatch is drained. A
+successor can consume that checkpoint and remains eligible to emit another one.
+The default remains disabled, terminal workflows do not continue-as-new solely
+to write an unused checkpoint, and the migration-only worker cannot enable
+emission.
 
-There is also an admission gap before cold continuation can consume that native
-input. The proposal's acquired `ExecutionStartedEvent` does not identify the
-predecessor execution, so its history alone cannot distinguish a trusted
-Continue-As-New checkpoint from caller-supplied checkpoint-shaped root input.
-Do not accept such input based on shape or execution ID. A future integration
-needs authenticated continuation lineage or a separately validated capability
-that binds the logical instance, definition, predecessor execution and exact
-checkpoint bytes. The native Continue-As-New action, not that capability or a
-sidecar, must remain the checkpoint commit authority. See
-`checkpoint_migration_inventory.json` for the evidence and limits.
-
-An isolated copy of the reconstructed SDK/provider was used to test the minimal
-lineage contract. In that local model, the provider attaches a
-`continued_from_execution_id` only to Continue-As-New starts, strips the
-reserved caller tag, and creates fresh execution IDs. Tests distinguish native
-continuation from a forged root tag, restart with copied checkpoint input, and
-purge followed by a copied root. The proposal tests reported 33 passed and one
-environment-specific deselection. This is not code integrated in DAFX or a
-released SDK, and it does not verify Azure Storage or managed Scheduler
-recovery. The exact upstream contract and its provider mapping remain release
-gates; a protected sidecar digest is not a substitute.
+The local proposal integration exercised a two-step ordinary workflow. The
+test provider generated predecessor/successor identities and the digest of the
+exact checkpoint input only when it accepted the native Continue-As-New action.
+The emitter process was stopped before releasing the successor dispatch; a
+separate process loaded package copies matching the pinned bundle and consumed
+the checkpoint. The independently recorded first-step effect occurred once,
+the successor produced the expected final output, and copied checkpoint input
+was rejected on root start, restart, and purge/recreate without another effect.
+This establishes the local proposal path only. The provider is in-memory and
+the SDK changes are disposable proposal code, not released SDK or service
+support. It does not establish durable storage, process-crash recovery, Azure
+Storage, managed Scheduler, or arbitrary workflow-definition migration.
 
 Capture AST-lowers every yield in the exact published producer into a
 non-dispatching history reduction. It does not inspect generator frames or keep

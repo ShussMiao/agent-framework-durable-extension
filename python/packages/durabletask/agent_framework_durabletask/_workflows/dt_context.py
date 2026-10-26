@@ -134,6 +134,12 @@ class DurableTaskWorkflowContext:
     def set_custom_status(self, status: Any) -> None:
         self._context.set_custom_status(status)
 
+    def create_dispatch_checkpoint(self, input: Any) -> Any:
+        create_checkpoint = getattr(self._context, "create_dispatch_checkpoint", None)
+        if not callable(create_checkpoint):
+            raise RuntimeError("Automatic checkpoint emission requires the native replay-fence SDK proposal.")
+        return create_checkpoint(input)
+
     def new_uuid(self) -> str:
         return self._context.new_uuid()
 

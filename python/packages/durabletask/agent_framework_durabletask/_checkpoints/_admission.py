@@ -43,6 +43,12 @@ class CheckpointContext(Protocol):
     @property
     def parent_execution_id(self) -> str | None: ...
 
+    @property
+    def native_continuation_profile(self) -> str | None: ...
+
+    @property
+    def native_continuation(self) -> Any: ...
+
 
 class AdmissionLedger:
     def __init__(
