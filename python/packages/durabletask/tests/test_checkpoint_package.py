@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from durabletask.internal import helpers
 from durabletask.worker import TaskHubGrpcWorker, _OrchestrationExecutor
 
+from agent_framework_durabletask._checkpoints import _release as checkpoint_release
 from agent_framework_durabletask._checkpoints._admission import AdmissionLedger
 from agent_framework_durabletask._checkpoints._format import encode_checkpoint_document
 from agent_framework_durabletask._checkpoints._registration import RegistrationError, validate_checkpoint
@@ -111,6 +112,16 @@ def test_registration_preserves_nullable_shared_state(tmp_path: Path, shared: di
             validate_checkpoint(graph, {**state, "shared_state": []})
     finally:
         sys.modules.pop("customer", None)
+
+
+def test_omitted_native_replay_profile_uses_sdk_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    default = object()
+    profiles = SimpleNamespace(DEFAULT=default, CLASSIC_FUNCTIONS_V1=object())
+    monkeypatch.setattr(checkpoint_release.durabletask_task, "ReplayProfile", profiles, raising=False)
+
+    assert checkpoint_release._normalize_replay_profile(None) is default
+    explicit = object()
+    assert checkpoint_release._normalize_replay_profile(explicit) is explicit
 
 
 def test_registration_loads_nested_package_with_portable_manifest_paths(tmp_path: Path) -> None:

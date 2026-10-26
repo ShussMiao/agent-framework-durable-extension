@@ -328,6 +328,8 @@ def _execute_with_proposed_identity(
     executor: Any, instance: str, history: list[Any], *, execution_id: str
 ) -> Any:
     execute = cast(Callable[..., Any], executor.execute)
+    if "execution_id" not in inspect.signature(execute).parameters:
+        pytest.skip("Requires the proposed SDK orchestration execution identity API.")
     return execute(instance, [], history, execution_id=execution_id)
 
 

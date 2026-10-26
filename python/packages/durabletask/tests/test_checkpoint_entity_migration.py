@@ -4,8 +4,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
+import marshal
 import os
+import struct
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -14,10 +19,12 @@ from unittest.mock import Mock
 import pytest
 from agent_framework import AgentResponse, Message
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from durabletask.entities import EntityContext
 from durabletask.internal import helpers
 from durabletask.internal import orchestrator_service_pb2 as pb
 from durabletask.worker import TaskHubGrpcWorker
 
+from agent_framework_durabletask import checkpoint_entity_migration as migration
 from agent_framework_durabletask._checkpoint_store import CheckpointScope, CheckpointStore
 from agent_framework_durabletask._checkpoints._agent import create_entity, digest
 from agent_framework_durabletask._checkpoints._authority import verify_capability
@@ -144,6 +151,35 @@ def test_bad_source_pin_and_invalid_usage_do_not_silently_reset(tmp_path: Path) 
         convert_agent_observations(raw, published_reader=reader)
 
 
+def test_original_reader_executes_verified_bytes_not_timestamp_valid_bytecode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = b"reader_value = 'verified source'\n"
+    reader = tmp_path / "reader.py"
+    reader.write_bytes(source)
+    timestamp = int(reader.stat().st_mtime)
+    bytecode = compile("raise AssertionError('unverified cache executed')", str(reader), "exec")
+    cache = Path(importlib.util.cache_from_source(str(reader)))
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(
+        importlib.util.MAGIC_NUMBER
+        + struct.pack("<III", 0, timestamp, len(source))
+        + marshal.dumps(bytecode)
+    )
+    monkeypatch.setattr(migration, "PUBLISHED_READER_SHA256", hashlib.sha256(source).hexdigest())
+    module_name = "agent_framework_durabletask._migration_original_state"
+    previous = sys.modules.pop(module_name, None)
+
+    try:
+        loaded = migration._original_reader(reader)
+        assert loaded.reader_value == "verified source"
+    finally:
+        sys.modules.pop(module_name, None)
+        if previous is not None:
+            sys.modules[module_name] = previous
+
+
 def test_public_entity_authority_binds_exact_snapshot_and_address() -> None:
     private = Ed25519PrivateKey.generate()
     envelope = issue_entity_conversion(
@@ -172,18 +208,28 @@ def test_public_entity_authority_binds_exact_snapshot_and_address() -> None:
 
 def test_source_observations_are_not_completion_receipts(published_reader: Path) -> None:
     raw = _raw()
+    raw["data"]["conversationHistory"][1]["messages"][0]["contents"].insert(
+        0,
+        {"$type": "reasoning", "text": "private rationale"},
+    )
     raw["data"]["conversationHistory"][1]["usage"] = {
         "inputTokenCount": 7,
         "outputTokenCount": None,
         "totalTokenCount": None,
     }
     converted = convert_agent_observations(raw, published_reader=published_reader)
+    assert converted["invocationFailurePolicy"] == "current-v1"
     assert [row["contents"][0]["text"] for row in converted["publishedReplayMessages"]] == [
         "old prompt",
         "old answer",
     ]
     assert converted["sourceDigest"] == digest(raw)
     assert converted["observations"][0]["evidence"] == "observed-original-response"
+    assert [content["text"] for message in converted["publishedReplayMessages"] for content in message["contents"]] == [
+        "old prompt",
+        "old answer",
+    ]
+    assert converted["observations"][0]["response"]["messages"][0]["contents"][0]["type"] == "text_reasoning"
     assert converted["nativeOperations"] == converted["retryAttempts"] == {}
     assert converted["runtime"]["data"]["completionReceipts"] == {}
     assert converted["sourceOptionalUsage"]["entries"][0]["usage"]["outputTokenCount"] is None
@@ -193,6 +239,8 @@ def test_queued_operations_convert_once_and_cold_entity_needs_no_reader(
     tmp_path: Path,
     published_reader: Path,
 ) -> None:
+    if not hasattr(EntityContext, "operation_id"):
+        pytest.skip("Requires the proposed SDK entity operation identity API.")
     raw = _raw()
     worker, agent, _ = _worker(tmp_path, published_reader, raw)
     request = {"message": "new prompt", "correlationId": "same-correlation"}

@@ -566,7 +566,6 @@ class AgentEntityStateProviderMixin:
 
 class InvocationFailurePolicy(str, Enum):
     CURRENT_V1 = "current-v1"
-    PUBLISHED_STREAM_FALLBACK_V1 = "published-stream-fallback-v1"
 
 
 def invocation_failure_policy_from_checkpoint(checkpoint: Mapping[str, Any]) -> InvocationFailurePolicy:
@@ -611,6 +610,8 @@ class AgentEntity:
             resolved_invocation_policy = InvocationFailurePolicy(invocation_failure_policy)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Unsupported invocation failure policy: {invocation_failure_policy!r}") from exc
+        if resolved_invocation_policy is not InvocationFailurePolicy.CURRENT_V1:
+            raise ValueError(f"Unsupported invocation failure policy: {resolved_invocation_policy.value!r}")
         if history_input not in ("durable", "transcript"):
             raise ValueError("Unsupported semantic history input policy.")
         self._history_input = history_input
@@ -625,7 +626,6 @@ class AgentEntity:
         self._high_watermark = high_watermark
         self._low_watermark = low_watermark
         self._response_delivery_window_seconds = response_delivery_window_seconds
-        self._invocation_failure_policy = resolved_invocation_policy
 
         logger.debug("[AgentEntity] Initialized with agent type: %s", type(agent).__name__)
 
@@ -1105,11 +1105,6 @@ class AgentEntity:
             return original
         return AgentEntity._to_replayable_message(message)
 
-    @staticmethod
-    def _published_v1_stream_fallback_allowed(error: Exception) -> bool:
-        """Preserve the published substring rule, including post-effect failures."""
-        return not isinstance(error, TypeError) or "__aiter__" in str(error) or "stream" in str(error)
-
     async def _invoke_agent(
         self,
         run_kwargs: dict[str, Any],
@@ -1118,11 +1113,13 @@ class AgentEntity:
         request_message: str,
         progress: InvocationProgress | None = None,
     ) -> AgentResponse:
-        """Prefer streaming under the selected semantic invocation contract.
+        """Prefer streaming, with capability fallback limited to the immediate call.
 
-        The default limits fallback to immediate capability failures. The explicit
-        published policy retries qualifying setup, iteration and finalization
-        errors even after effects. It does not promise exactly-once execution.
+        Async methods and callable objects can produce streams too. An awaited
+        no-stream refusal must not trigger a non-streaming retry, even before
+        observed progress, because arbitrary side effects cannot be ruled out.
+        Legacy synchronous refusal messages remain pre-work capability signals,
+        not a guarantee that arbitrary custom run bodies have no side effects.
         """
         callback_context: AgentCallbackContext | None = None
         if self.callback is not None:
@@ -1133,68 +1130,58 @@ class AgentEntity:
             )
 
         run_callable = self.agent.run
-        published_fallback = self._invocation_failure_policy is InvocationFailurePolicy.PUBLISHED_STREAM_FALLBACK_V1
 
         try:
             stream_candidate = run_callable(stream=True, **run_kwargs)
-            if published_fallback:
-                if inspect.isawaitable(stream_candidate):
-                    stream_candidate = await stream_candidate
-                return await self._consume_stream(
-                    stream=stream_candidate,
-                    callback_context=callback_context,
-                    progress=progress,
+        except TypeError as type_error:
+            detail = str(type_error)
+            traceback = type_error.__traceback__
+            binding_failure = traceback is not None and traceback.tb_next is None
+            while traceback is not None and traceback.tb_next is not None:
+                traceback = traceback.tb_next
+            origin_code = traceback.tb_frame.f_code if traceback is not None else None
+            capability_agent = getattr(self.agent, "_stream_capability_agent", self.agent)
+            capability_run = getattr(capability_agent, "run", None)
+            capability_run_type = type(cast(object, capability_run))
+            capability_run_call = inspect.getattr_static(capability_run_type, "__call__", None)
+            capability_run_call_code = getattr(capability_run_call, "__code__", None)
+            wrapped_binding_failure = (
+                origin_code is getattr(run_callable, "__code__", None)
+                and capability_agent is not self.agent
+            )
+            binding_failure = binding_failure or wrapped_binding_failure
+            entry_failure = origin_code is not None and (
+                origin_code is getattr(run_callable, "__code__", None)
+                or origin_code is getattr(type(run_callable).__call__, "__code__", None)
+                or origin_code is getattr(capability_run, "__code__", None)
+                or origin_code is capability_run_call_code
+                or any(
+                    origin_code is getattr(vars(base).get("run"), "__code__", None)
+                    for base in type(capability_agent).__mro__
                 )
-        except Exception as stream_error:
-            if published_fallback:
-                if not self._published_v1_stream_fallback_allowed(stream_error):
-                    raise
-            else:
-                if not isinstance(stream_error, TypeError):
-                    raise
-                type_error = stream_error
-                detail = str(type_error)
-                traceback = type_error.__traceback__
-                binding_failure = traceback is not None and traceback.tb_next is None
-                while traceback is not None and traceback.tb_next is not None:
-                    traceback = traceback.tb_next
-                origin_code = traceback.tb_frame.f_code if traceback is not None else None
-                entry_failure = origin_code is not None and (
-                    origin_code is getattr(run_callable, "__code__", None)
-                    or origin_code is getattr(type(run_callable).__call__, "__code__", None)
-                    or any(
-                        origin_code is getattr(vars(base).get("run"), "__code__", None)
-                        for base in type(self.agent).__mro__
+            )
+            # Retain explicit no-work refusals in run() or a callable's __call__,
+            # including inherited run() implementations reached through a wrapper.
+            # A helper's refusal or argument-binding error is not the entry's capability.
+            if progress is not None and (
+                progress.stream_started or progress.function_started or progress.service_completed
+            ):
+                raise
+            if not (
+                (entry_failure and detail in ("stream is not supported", "streaming not supported"))
+                or (
+                    binding_failure
+                    and (
+                        "unexpected keyword argument 'stream'" in detail
+                        or 'unexpected keyword argument "stream"' in detail
                     )
                 )
-                # Retain explicit no-work refusals in run() or a callable's __call__,
-                # including inherited run() implementations reached through a wrapper.
-                # A helper's refusal or argument-binding error is not the entry's capability.
-                if progress is not None and (
-                    progress.stream_started or progress.function_started or progress.service_completed
-                ):
-                    raise
-                if not (
-                    (entry_failure and detail in ("stream is not supported", "streaming not supported"))
-                    or (
-                        binding_failure
-                        and (
-                            "unexpected keyword argument 'stream'" in detail
-                            or 'unexpected keyword argument "stream"' in detail
-                        )
-                    )
-                ):
-                    raise
-            if published_fallback:
-                logger.warning(
-                    "Selected stream failure policy permits non-streaming fallback: %s",
-                    stream_error, exc_info=True,
-                )
-            else:
-                logger.debug(
-                    "Agent does not support streaming; invoking non-streaming run(): %s",
-                    stream_error,
-                )
+            ):
+                raise
+            logger.debug(
+                "Agent does not support streaming; invoking non-streaming run(): %s",
+                type_error,
+            )
         else:
             # Awaiting can execute middleware, models and tools, including
             # eager finalization. Its errors must never start a non-streaming retry.
@@ -1209,6 +1196,7 @@ class AgentEntity:
                 callback_context=callback_context,
                 progress=progress,
             )
+
         agent_run_response = run_callable(**run_kwargs)
         if inspect.isawaitable(agent_run_response):
             agent_run_response = await agent_run_response

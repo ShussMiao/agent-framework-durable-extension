@@ -66,6 +66,10 @@ def _replay_profile(name: str) -> object:
     return profile
 
 
+def _normalize_replay_profile(replay_profile: object | None) -> object:
+    return _replay_profile("DEFAULT") if replay_profile is None else replay_profile
+
+
 class _RegistrationSink(Protocol):
     def add_activity(self, function: Callable[..., Any], /) -> Any: ...
     def add_entity(self, entity: Any, /) -> Any: ...
@@ -128,6 +132,7 @@ def register_current_handlers(
     """
     if admission_profile not in ("migration-only", "new-workflows-only"):
         raise ValueError("Unsupported deployment admission profile.")
+    replay_profile = _normalize_replay_profile(replay_profile)
     verify_checkpoint_bundle(bundle_directory, bundle_sha256=bundle_sha256)
     scope = CheckpointScope(backend_id, hub, registration.definition_digest)
     store.require_active(scope, generation, bundle_sha256=bundle_sha256)

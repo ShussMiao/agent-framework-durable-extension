@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, TypeGuard
 
 from agent_framework import Agent, AgentMiddleware, AgentResponse, Content, Message, SupportsAgentRun
+from durabletask.entities import EntityContext
 
 from agent_framework_durabletask._async_bridge import run_agent_coroutine
 from agent_framework_durabletask._entities import AgentEntity, DurableTaskEntityStateProvider
@@ -37,12 +38,12 @@ def _is_core_agent(agent: SupportsAgentRun) -> TypeGuard[Agent[Any]]:
     return isinstance(agent, Agent)
 
 
-def published_replay_message(message: Any) -> Message | None:
-    """Project current Core content through the published persisted replay policy."""
+def _published_message(message: Any, *, include_reasoning: bool) -> Message | None:
     contents: list[Content] = []
     for item in message.contents:
-        if item.type == "reasoning":
-            contents.append(Content.from_text_reasoning(text=item.text))
+        if item.type in ("reasoning", "text_reasoning"):
+            if include_reasoning:
+                contents.append(Content.from_text_reasoning(text=item.text))
         elif item.type == "function_call":
             arguments = item.arguments
             if isinstance(arguments, str):
@@ -93,6 +94,15 @@ def published_replay_message(message: Any) -> Message | None:
     )
 
 
+def published_replay_message(message: Any) -> Message | None:
+    """Project current Core content through the published persisted replay policy."""
+    return _published_message(message, include_reasoning=False)
+
+
+def _published_poll_message(message: Any) -> Message | None:
+    return _published_message(message, include_reasoning=True)
+
+
 class PublishedCheckpointReplay(AgentMiddleware):
     def __init__(self, messages: list[JsonObject]) -> None:
         self.messages = messages
@@ -120,6 +130,10 @@ class PublishedCheckpointReplayAgent:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._agent, name)
+
+    @property
+    def _stream_capability_agent(self) -> SupportsAgentRun:
+        return self._agent
 
     def create_session(self, *, session_id: str | None = None) -> Any:
         return self._agent.create_session(session_id=session_id)
@@ -163,7 +177,7 @@ def published_poll_view(response: Any, *, generated_failure: bool = False) -> Ag
             usage.setdefault(key, None)
     return AgentResponse(
         messages=[
-            published_replay_message(message)
+            _published_poll_message(message)
             or Message(
                 message.role,
                 [],
@@ -194,7 +208,7 @@ def empty_checkpoint(entity_scope: str) -> JsonObject:
         "retryPolicy": RETRY_POLICY,
         "retryAttempts": {},
         "nativeOperations": {},
-        "invocationFailurePolicy": "published-stream-fallback-v1",
+        "invocationFailurePolicy": "current-v1",
         "sourceWriter": "checkpoint-native/1",
         "sourceSessionObservation": None,
         "sourceOptionalUsage": {"profile": "published-optional-usage/1", "entries": []},
@@ -278,6 +292,14 @@ class CheckpointEntityStateProvider(DurableTaskEntityStateProvider):
 
     _checkpoint: JsonObject | None
 
+    def _allowed_entity_operations(self) -> tuple[str, ...]:
+        return ("run", "reset", "delete")
+
+    def _initialize_entity_context(self, context: EntityContext) -> None:
+        if context.operation not in self._allowed_entity_operations():
+            raise ValueError(f"Checkpoint entity operation '{context.operation}' is not supported.")
+        super()._initialize_entity_context(context)
+
     def checkpoint(self) -> JsonObject:
         raise NotImplementedError
 
@@ -329,6 +351,9 @@ def create_entity(agent: SupportsAgentRun, *, entity_id: str) -> type[Checkpoint
             for observation in checkpoint["observations"]:
                 if observation.get("nativeOperationId") == native_operation_id:
                     return deepcopy(observation.get("nativeResponse", observation["response"]))
+            completed_before_run = (
+                selected["runtimeCorrelation"] in checkpoint["runtime"]["data"].get("completionReceipts", {})
+            )
             if checkpoint.get("publicInvocationPolicy") != PUBLIC_POLICY:
                 raise ValueError("Unsupported public invocation compatibility policy.")
             if checkpoint.get("publicReplayPolicy") != REPLAY_POLICY:
@@ -347,8 +372,8 @@ def create_entity(agent: SupportsAgentRun, *, entity_id: str) -> type[Checkpoint
             if _is_core_agent(agent):
                 core_invocation = copy(agent)
                 core_invocation.middleware = [
-                    *(core_invocation.middleware or []),
                     PublishedCheckpointReplay(replay_messages),
+                    *(core_invocation.middleware or []),
                 ]
                 invocation_agent = core_invocation
             else:
@@ -362,6 +387,15 @@ def create_entity(agent: SupportsAgentRun, *, entity_id: str) -> type[Checkpoint
                 invocation_failure_policy=invocation_failure_policy_from_checkpoint(checkpoint),
             )
             core_response = run_agent_coroutine(self._agent_entity.run(invocation))
+            if (
+                completed_before_run
+                or core_response.additional_properties.get("durable_status") == "already_completed"
+            ):
+                response = serialize_agent_response(core_response)
+                properties = response.get("additional_properties", {})
+                if properties.get("correlation_id") == invocation.correlation_id:
+                    properties["correlation_id"] = parsed.correlation_id
+                return response
             public_response = published_error_view(core_response, invocation.correlation_id)
             response = serialize_agent_response(public_response)
             # Public correlation stays original; genuine receipt identity is recorded below.
@@ -396,9 +430,24 @@ def create_entity(agent: SupportsAgentRun, *, entity_id: str) -> type[Checkpoint
             return response
 
         def reset(self) -> None:
-            self.checkpoint()
+            checkpoint = self.checkpoint()
             self.ensure_v2_writable()
-            candidate = empty_checkpoint(str(self.entity_context.entity_id))
+            if self._agent_entity is None:
+                from agent_framework_durabletask._entities import invocation_failure_policy_from_checkpoint
+
+                self._agent_entity = AgentEntity(
+                    agent,
+                    state_provider=self,
+                    retention="keep_all",
+                    max_state_bytes=None,
+                    history_input="transcript",
+                    invocation_failure_policy=invocation_failure_policy_from_checkpoint(checkpoint),
+                )
+            self._agent_entity.reset()
+            candidate = deepcopy(self.checkpoint())
+            candidate["publishedReplayMessages"] = []
+            candidate["publishedEntryCount"] = 0
+            candidate["observations"] = []
             super()._set_state_dict(candidate)
             self._checkpoint = candidate
             self._state_cache = None

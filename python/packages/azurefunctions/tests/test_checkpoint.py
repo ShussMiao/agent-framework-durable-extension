@@ -181,17 +181,15 @@ def test_checkpoint_factory_preserves_accepted_activity_inputs(tmp_path: Path, m
         json.dumps({"extensions": {"durableTask": {"storageProvider": {"workItemFilteringEnabled": True}}}}),
         encoding="utf-8",
     )
-    original = DurableFunctionsWorker.configure_replay_profile
+    original = getattr(DurableFunctionsWorker, "configure_replay_profile", None)
+    assert callable(original)
     calls: list[bool] = []
 
     def record(self, profile, *, preserve_activity_inputs=False):
         calls.append(preserve_activity_inputs)
         return original(self, profile, preserve_activity_inputs=preserve_activity_inputs)
 
-    monkeypatch.setattr(
-        "azure.durable_functions.worker.DurableFunctionsWorker.configure_replay_profile",
-        record,
-    )
+    monkeypatch.setattr(DurableFunctionsWorker, "configure_replay_profile", record)
     try:
         app = create_checkpoint_function_app(
             registration,

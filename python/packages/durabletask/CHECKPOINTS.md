@@ -26,6 +26,14 @@ original SDK task handles, not customer replay code. Native failure, control and
 result order remain backend events. An unresolved operation has no invented
 successful result or ingestion receipt.
 
+New and migrated checkpoint entities select the target `current-v1` invocation
+failure policy rather than inferring an unavailable legacy retry policy. A
+generic streaming setup, iteration or finalization failure does not start a
+second non-streaming run. The existing immediate no-stream `TypeError` fallback
+is only a capability signal, not proof that arbitrary custom agent code has no
+side effects; applications remain responsible for making external effects
+retry-safe.
+
 ## Capture the pinned producer
 
 The migration process imports `agent_framework_durabletask.checkpoint_migration`.
@@ -234,6 +242,17 @@ serialized native entity operation, never through management state overwrite.
 Its `import_checkpoint` request is `{"sourceDigest": original_source_digest}`.
 An already accepted queued operation can also perform the authorized conversion.
 Its own native identity and current invocation policy still apply.
+Only this temporary converter supports `import_checkpoint`; the cold entity
+allows `run`, `reset` and `delete` and rejects inherited state-replacement
+operations before initializing their context. Reset clears the published
+transcript and polling observations while preserving native operation identities
+and the current runtime's completion-receipt floor. A redelivered completed
+operation returns its retained result, or an already-completed response after
+delivery expires, without invoking the agent again. Replay omits reasoning,
+while response observations and polling retain it. For Core `Agent` instances,
+the imported transcript is installed before customer middleware runs, so
+customer transformations are applied to the imported context rather than
+discarded.
 
 Await the actual native conversion result, stop the converter and independently
 read the matching semantic entity state. Record that post-commit observation for
@@ -349,10 +368,12 @@ trusted Workflow manifest. Resume, terminate and restart remain backend SDK
 controls, not replacement HTTP routes added by this factory.
 
 Use the same backend/hub/keys/store/generation/bundle arguments as
-`register_current_worker`, an explicit matching replay profile and an appropriate
-host-configuration path when calling `create_checkpoint_function_app`.
-Native profiles use `ReplayProfile.DEFAULT`. Classic profiles use
-`ReplayProfile.CLASSIC_FUNCTIONS_V1`. The public factory registers through the
+`register_current_worker` and an appropriate host-configuration path when
+calling `create_checkpoint_function_app`. Standalone registration normalizes
+an omitted replay profile to `ReplayProfile.DEFAULT`. Classic Functions
+registration must select its matching profile explicitly:
+`ReplayProfile.CLASSIC_FUNCTIONS_V1`. Native profiles use
+`ReplayProfile.DEFAULT`. The public factory registers through the
 proposed native decorators and worker configuration API, not private registry
 mutation. Host environment overrides must agree with the validated file.
 

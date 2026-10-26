@@ -662,7 +662,7 @@ class TestStateReaderIntegration:
 
         state = await app._read_cached_state(client, EntityInstanceId(entity="dafx-ReaderAgent", key="session"))
 
-        assert state is not None
+        assert isinstance(state, DurableAgentState)
         assert state.schema_version == DurableAgentState.SCHEMA_VERSION
 
     @pytest.mark.parametrize("state", [None, ""], ids=["no-state", "empty-state"])

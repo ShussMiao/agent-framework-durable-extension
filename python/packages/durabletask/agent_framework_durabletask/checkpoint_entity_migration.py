@@ -87,7 +87,8 @@ def _original_reader(path: Path) -> ModuleType:
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         try:
-            spec.loader.exec_module(module)
+            # Compile only the bytes verified against the pinned release.
+            exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102
         except BaseException:
             del sys.modules[name]
             raise
@@ -148,7 +149,9 @@ def convert_agent_observations(raw: JsonObject, *, published_reader: str | Path)
     for entry in source.data.conversation_history:
         for stored in entry.messages:
             message = stored.to_chat_message()
-            contents = [content for content in message.contents if content.type != "reasoning"]
+            contents = [
+                content for content in message.contents if content.type not in ("reasoning", "text_reasoning")
+            ]
             if contents:
                 message.contents = contents
                 replay.append(message.to_dict())
@@ -171,7 +174,7 @@ def convert_agent_observations(raw: JsonObject, *, published_reader: str | Path)
         "retryPolicy": RETRY_POLICY,
         "retryAttempts": {},
         "nativeOperations": {},
-        "invocationFailurePolicy": "published-stream-fallback-v1",
+        "invocationFailurePolicy": "current-v1",
         "sourceWriter": "published-python-full-transcript/1",
         "sourceSessionObservation": deepcopy(data.get("session")),
         "sourceOptionalUsage": {"profile": "published-optional-usage/1", "entries": usage_observations},
@@ -204,6 +207,9 @@ def create_authorized_entity_converter(
     base = create_entity(agent, entity_id=entity_id)
 
     class AuthorizedConverter(base):
+        def _allowed_entity_operations(self) -> tuple[str, ...]:
+            return (*super()._allowed_entity_operations(), "import_checkpoint")
+
         def checkpoint(self) -> JsonObject:
             store.require_converting(scope, generation, bundle_sha256=bundle_sha256)
             raw = DurableTaskEntityStateProvider._get_state_dict(self)
