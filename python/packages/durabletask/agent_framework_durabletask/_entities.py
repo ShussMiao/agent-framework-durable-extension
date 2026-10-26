@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, cast
 
 from agent_framework import (
@@ -80,9 +81,23 @@ from ._shared_agent_state import (
 )
 from ._shared_state_validation import validate_completion_transition, validate_identifier, validate_timestamp
 from ._state_capacity import StateCapacityError
-from ._state_migration import migrate_legacy_state, state_snapshot_digest
 
 logger = logging.getLogger("agent_framework.durabletask")
+
+
+def migrate_legacy_state(*args: Any, **kwargs: Any) -> Any:
+    """Load migration-only conversion lazily so current-only bundles stay cold."""
+    from ._state_migration import migrate_legacy_state as migrate
+
+    return migrate(*args, **kwargs)
+
+
+def state_snapshot_digest(*args: Any, **kwargs: Any) -> Any:
+    """Load migration-only digesting lazily so current-only bundles stay cold."""
+    from ._state_migration import state_snapshot_digest as digest
+
+    return digest(*args, **kwargs)
+
 
 _SESSION_ID_KEY = "session_id"
 _DELIVERY_WINDOW_SECONDS = DELIVERY_WINDOW_SECONDS
@@ -549,6 +564,24 @@ class AgentEntityStateProviderMixin:
         logger.debug("[AgentEntityStateProviderMixin.reset] State reset complete")
 
 
+class InvocationFailurePolicy(str, Enum):
+    CURRENT_V1 = "current-v1"
+    PUBLISHED_STREAM_FALLBACK_V1 = "published-stream-fallback-v1"
+
+
+def invocation_failure_policy_from_checkpoint(checkpoint: Mapping[str, Any]) -> InvocationFailurePolicy:
+    """Resolve the invocation contract recorded by a semantic checkpoint."""
+    if checkpoint.get("contract") != "agent-semantic-checkpoint/1":
+        raise ValueError("Unsupported semantic checkpoint format for invocation policy")
+    raw_policy = checkpoint.get("invocationFailurePolicy", InvocationFailurePolicy.CURRENT_V1.value)
+    if not isinstance(raw_policy, str):
+        raise ValueError("Semantic checkpoint invocationFailurePolicy must be a string")
+    try:
+        return InvocationFailurePolicy(raw_policy)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported semantic invocation failure policy: {raw_policy!r}") from exc
+
+
 class AgentEntity:
     """Platform-agnostic agent execution logic.
 
@@ -569,10 +602,22 @@ class AgentEntity:
         high_watermark: float = HIGH_WATERMARK,
         low_watermark: float = LOW_WATERMARK,
         response_delivery_window_seconds: int = DELIVERY_WINDOW_SECONDS,
+        history_input: str = "durable",
+        invocation_failure_policy: InvocationFailurePolicy | str = InvocationFailurePolicy.CURRENT_V1,
     ) -> None:
         validate_retention(retention, high_watermark, low_watermark)
         validate_response_delivery_window(response_delivery_window_seconds)
-        self.agent = ensure_durable_history(agent, prune_excluded=prunes_excluded(retention))
+        try:
+            resolved_invocation_policy = InvocationFailurePolicy(invocation_failure_policy)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Unsupported invocation failure policy: {invocation_failure_policy!r}") from exc
+        if history_input not in ("durable", "transcript"):
+            raise ValueError("Unsupported semantic history input policy.")
+        self._history_input = history_input
+        self.agent = (
+            agent if history_input == "transcript"
+            else ensure_durable_history(agent, prune_excluded=prunes_excluded(retention))
+        )
         self.callback = callback
         self._state_provider = state_provider
         self._retention = retention
@@ -580,6 +625,7 @@ class AgentEntity:
         self._high_watermark = high_watermark
         self._low_watermark = low_watermark
         self._response_delivery_window_seconds = response_delivery_window_seconds
+        self._invocation_failure_policy = resolved_invocation_policy
 
         logger.debug("[AgentEntity] Initialized with agent type: %s", type(agent).__name__)
 
@@ -655,6 +701,8 @@ class AgentEntity:
         Returns:
             The committed migration identity and destination session identity.
         """
+        from ._state_migration import migrate_legacy_state, state_snapshot_digest
+
         self._state_provider.ensure_v2_writable()
         self._state_provider.migration_session_id()
         required = {
@@ -1057,6 +1105,11 @@ class AgentEntity:
             return original
         return AgentEntity._to_replayable_message(message)
 
+    @staticmethod
+    def _published_v1_stream_fallback_allowed(error: Exception) -> bool:
+        """Preserve the published substring rule, including post-effect failures."""
+        return not isinstance(error, TypeError) or "__aiter__" in str(error) or "stream" in str(error)
+
     async def _invoke_agent(
         self,
         run_kwargs: dict[str, Any],
@@ -1065,13 +1118,11 @@ class AgentEntity:
         request_message: str,
         progress: InvocationProgress | None = None,
     ) -> AgentResponse:
-        """Prefer streaming, with capability fallback limited to the immediate call.
+        """Prefer streaming under the selected semantic invocation contract.
 
-        Async methods and callable objects can produce streams too. An awaited
-        no-stream refusal must not trigger a non-streaming retry, even before
-        observed progress, because arbitrary side effects cannot be ruled out.
-        Legacy synchronous refusal messages remain pre-work capability signals,
-        not a guarantee that arbitrary custom run bodies have no side effects.
+        The default limits fallback to immediate capability failures. The explicit
+        published policy retries qualifying setup, iteration and finalization
+        errors even after effects. It does not promise exactly-once execution.
         """
         callback_context: AgentCallbackContext | None = None
         if self.callback is not None:
@@ -1082,45 +1133,68 @@ class AgentEntity:
             )
 
         run_callable = self.agent.run
+        published_fallback = self._invocation_failure_policy is InvocationFailurePolicy.PUBLISHED_STREAM_FALLBACK_V1
 
         try:
             stream_candidate = run_callable(stream=True, **run_kwargs)
-        except TypeError as type_error:
-            detail = str(type_error)
-            traceback = type_error.__traceback__
-            binding_failure = traceback is not None and traceback.tb_next is None
-            while traceback is not None and traceback.tb_next is not None:
-                traceback = traceback.tb_next
-            origin_code = traceback.tb_frame.f_code if traceback is not None else None
-            entry_failure = origin_code is not None and (
-                origin_code is getattr(run_callable, "__code__", None)
-                or origin_code is getattr(type(run_callable).__call__, "__code__", None)
-                or any(
-                    origin_code is getattr(vars(base).get("run"), "__code__", None) for base in type(self.agent).__mro__
+            if published_fallback:
+                if inspect.isawaitable(stream_candidate):
+                    stream_candidate = await stream_candidate
+                return await self._consume_stream(
+                    stream=stream_candidate,
+                    callback_context=callback_context,
+                    progress=progress,
                 )
-            )
-            # Retain explicit no-work refusals in run() or a callable's __call__,
-            # including inherited run() implementations reached through a wrapper.
-            # A helper's refusal or argument-binding error is not the entry's capability.
-            if progress is not None and (
-                progress.stream_started or progress.function_started or progress.service_completed
-            ):
-                raise
-            if not (
-                (entry_failure and detail in ("stream is not supported", "streaming not supported"))
-                or (
-                    binding_failure
-                    and (
-                        "unexpected keyword argument 'stream'" in detail
-                        or 'unexpected keyword argument "stream"' in detail
+        except Exception as stream_error:
+            if published_fallback:
+                if not self._published_v1_stream_fallback_allowed(stream_error):
+                    raise
+            else:
+                if not isinstance(stream_error, TypeError):
+                    raise
+                type_error = stream_error
+                detail = str(type_error)
+                traceback = type_error.__traceback__
+                binding_failure = traceback is not None and traceback.tb_next is None
+                while traceback is not None and traceback.tb_next is not None:
+                    traceback = traceback.tb_next
+                origin_code = traceback.tb_frame.f_code if traceback is not None else None
+                entry_failure = origin_code is not None and (
+                    origin_code is getattr(run_callable, "__code__", None)
+                    or origin_code is getattr(type(run_callable).__call__, "__code__", None)
+                    or any(
+                        origin_code is getattr(vars(base).get("run"), "__code__", None)
+                        for base in type(self.agent).__mro__
                     )
                 )
-            ):
-                raise
-            logger.debug(
-                "Agent does not support streaming; invoking non-streaming run(): %s",
-                type_error,
-            )
+                # Retain explicit no-work refusals in run() or a callable's __call__,
+                # including inherited run() implementations reached through a wrapper.
+                # A helper's refusal or argument-binding error is not the entry's capability.
+                if progress is not None and (
+                    progress.stream_started or progress.function_started or progress.service_completed
+                ):
+                    raise
+                if not (
+                    (entry_failure and detail in ("stream is not supported", "streaming not supported"))
+                    or (
+                        binding_failure
+                        and (
+                            "unexpected keyword argument 'stream'" in detail
+                            or 'unexpected keyword argument "stream"' in detail
+                        )
+                    )
+                ):
+                    raise
+            if published_fallback:
+                logger.warning(
+                    "Selected stream failure policy permits non-streaming fallback: %s",
+                    stream_error, exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "Agent does not support streaming; invoking non-streaming run(): %s",
+                    stream_error,
+                )
         else:
             # Awaiting can execute middleware, models and tools, including
             # eager finalization. Its errors must never start a non-streaming retry.
@@ -1347,7 +1421,9 @@ class AgentEntity:
         )
 
     def _has_context_pipeline(self) -> bool:
-        return isinstance(getattr(self.agent, "context_providers", None), (list, tuple))
+        return self._history_input == "durable" and isinstance(
+            getattr(self.agent, "context_providers", None), (list, tuple)
+        )
 
     def _session_store(self) -> EntitySessionStore:
         """Bind session persistence to the current staged data, not a stale cached copy."""

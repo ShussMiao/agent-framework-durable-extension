@@ -19,7 +19,7 @@ from durabletask.task import (
     when_any,
 )
 
-from .._executors import OrchestrationAgentExecutor
+from .._executors import AcceptanceResponsePolicy, OrchestrationAgentExecutor, RequestTimePolicy
 from .._json_payload import JsonPayload
 from .._shim import build_agent_task
 from .context import WorkflowOrchestrationContext
@@ -35,6 +35,8 @@ class DurableTaskWorkflowContext:
         context: OrchestrationContext,
         *,
         supports_event_streaming: bool = True,
+        acceptance_response_policy: AcceptanceResponsePolicy = "current",
+        request_time_policy: RequestTimePolicy = "wall-clock",
     ) -> None:
         """Wrap a durabletask orchestration context.
 
@@ -46,9 +48,17 @@ class DurableTaskWorkflowContext:
                 Durable Functions custom status is capped at 16 KB by the WebJobs
                 extension, and publishing the event log would overflow that cap and
                 fail the orchestrator.
+            acceptance_response_policy: Versioned asynchronous-start response.
+                The migration profile uses ``published-v1``.
+            request_time_policy: Select ``orchestration-clock`` for deterministic
+                new request and acceptance timestamps during checkpoint continuation.
+                The ordinary caller default remains wall-clock time.
         """
         self._context = context
-        self._executor = OrchestrationAgentExecutor(context)
+        self._executor = OrchestrationAgentExecutor(
+            context, acceptance_response_policy=acceptance_response_policy,
+            request_time_policy=request_time_policy,
+        )
         self._supports_event_streaming = supports_event_streaming
 
     # -- Properties -----------------------------------------------------------
