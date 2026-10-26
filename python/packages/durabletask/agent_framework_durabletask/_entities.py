@@ -581,6 +581,28 @@ def invocation_failure_policy_from_checkpoint(checkpoint: Mapping[str, Any]) -> 
         raise ValueError(f"Unsupported semantic invocation failure policy: {raw_policy!r}") from exc
 
 
+def filter_already_stored_messages(
+    messages: list[DurableAgentStateMessage],
+    *,
+    ingested_messages: dict[str, list[str] | None],
+    occurrence_ids: list[str] | None = None,
+) -> list[DurableAgentStateMessage]:
+    """Filter input occurrences already accepted by the durable state."""
+    kept: list[DurableAgentStateMessage] = []
+    for index, message in enumerate(messages):
+        identity = occurrence_ids[index] if occurrence_ids is not None else message.message_id
+        if identity and identity.strip():
+            fingerprint = message.ingestion_identity or message_identity(message.to_chat_message())
+            known = ingested_messages.get(identity, [])
+            if known is None or fingerprint in known:
+                continue
+            known.append(fingerprint)
+            ingested_messages[identity] = known
+            message.ingestion_occurrence = identity
+        kept.append(message)
+    return kept
+
+
 class AgentEntity:
     """Platform-agnostic agent execution logic.
 
@@ -1425,20 +1447,11 @@ class AgentEntity:
     def _drop_already_stored(
         self, messages: list[DurableAgentStateMessage], *, occurrence_ids: list[str] | None = None
     ) -> list[DurableAgentStateMessage]:
-        receipts = self.state.data.ingested_messages
-        kept: list[DurableAgentStateMessage] = []
-        for index, message in enumerate(messages):
-            identity = occurrence_ids[index] if occurrence_ids is not None else message.message_id
-            if identity and identity.strip():
-                fingerprint = message.ingestion_identity or message_identity(message.to_chat_message())
-                known = receipts.get(identity, [])
-                if known is None or fingerprint in known:
-                    continue
-                known.append(fingerprint)
-                receipts[identity] = known
-                message.ingestion_occurrence = identity
-            kept.append(message)
-        return kept
+        return filter_already_stored_messages(
+            messages,
+            ingested_messages=self.state.data.ingested_messages,
+            occurrence_ids=occurrence_ids,
+        )
 
     def _find_durable_history_provider(self) -> DurableHistoryProvider | None:
         providers = getattr(self.agent, "context_providers", None)

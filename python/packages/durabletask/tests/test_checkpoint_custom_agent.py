@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from unittest.mock import Mock
 
@@ -29,8 +30,10 @@ from durabletask.internal.entity_state_shim import StateShim
 from durabletask.task import EntityContext
 from durabletask.worker import TaskHubGrpcWorker
 
+from agent_framework_durabletask import _delivery_state
 from agent_framework_durabletask._checkpoints._agent import create_entity, empty_checkpoint
 from agent_framework_durabletask._entities import InvocationFailurePolicy, invocation_failure_policy_from_checkpoint
+from agent_framework_durabletask._shared_agent_state import DurableAgentState
 
 _ENTITY_ADDRESS = "@dafx-checkpoint-custom-agent@session-1"
 
@@ -235,6 +238,91 @@ def test_imported_transcript_runs_before_customer_middleware() -> None:
         ["new prompt"],
         ["customer middleware addition"],
     ]
+
+
+def test_checkpoint_replays_explicit_context_messages_and_occurrences() -> None:
+    agent = _SlottedCustomAgent()
+    entity_type = create_entity(agent, entity_id="checkpoint-custom-agent")
+    entity, context = _direct_entity(
+        entity_type,
+        state=empty_checkpoint(_ENTITY_ADDRESS),
+        operation="run",
+        operation_id="native-context",
+    )
+    context_messages = [
+        Message("system", ["system context"], message_id="system-context"),
+        Message(
+            "tool",
+            [Content.from_function_result(call_id="lookup", result={"ok": True})],
+            message_id="tool-result",
+        ),
+        Message(
+            "user",
+            [Content.from_uri("https://example.test/context.png", media_type="image/png")],
+            message_id="image-context",
+        ),
+        Message("user", ["same occurrence payload"], message_id="shared-message-id"),
+        Message("user", ["same occurrence payload"], message_id="shared-message-id"),
+        Message("user", ["same occurrence payload"], message_id="shared-message-id"),
+    ]
+    context_message_ids = ["system", "tool", "image", "occurrence-1", "occurrence-2", "occurrence-2"]
+    expected = [message.to_dict() for message in context_messages[:5]]
+
+    entity.run({
+        "message": "logging preview must not be replayed",
+        "correlationId": "context-only",
+        "contextMessages": [message.to_dict() for message in context_messages],
+        "contextMessageIds": context_message_ids,
+    })
+
+    assert agent.calls
+    assert all([message.to_dict() for message in transcript] == expected for _, transcript in agent.calls)
+    checkpoint = _entity_state(context)
+    assert checkpoint["publishedReplayMessages"][: len(expected)] == expected
+    assert "logging preview must not be replayed" not in _texts(agent.calls[-1][1])[0]
+
+
+def test_checkpoint_empty_context_does_not_replay_logging_preview() -> None:
+    agent = _SlottedCustomAgent()
+    entity, _ = _direct_entity(
+        create_entity(agent, entity_id="checkpoint-custom-agent"),
+        state=empty_checkpoint(_ENTITY_ADDRESS),
+        operation="run",
+        operation_id="native-empty-context",
+    )
+
+    entity.run({
+        "message": "preview only",
+        "correlationId": "empty-context",
+        "contextMessages": [],
+        "contextMessageIds": [],
+    })
+
+    assert agent.calls
+    assert all(transcript == [] for _, transcript in agent.calls)
+
+
+def test_core_checkpoint_replay_uses_explicit_context_not_preview() -> None:
+    client = ToolChatClient(tool_calls=False)
+    middleware = _AppendCustomerMessage()
+    agent = Agent(client=client, middleware=[middleware], name="checkpoint-context")
+    context_message = Message("system", ["explicit context"])
+    entity, _ = _direct_entity(
+        create_entity(agent, entity_id="checkpoint-custom-agent"),
+        state=empty_checkpoint(_ENTITY_ADDRESS),
+        operation="run",
+        operation_id="native-core-context",
+    )
+
+    entity.run({
+        "message": "preview only",
+        "correlationId": "core-context",
+        "contextMessages": [context_message.to_dict()],
+        "contextMessageIds": ["context-occurrence"],
+    })
+
+    assert middleware.seen == ["explicit context"]
+    assert _texts(client.received_messages[0]) == [["explicit context"], ["customer middleware addition"]]
 
 
 class _ReasoningAgent(_SlottedCustomAgent):
@@ -446,3 +534,98 @@ def test_reset_clears_public_state_but_preserves_native_completion_floor() -> No
     assert len(agent.calls) == 1
     assert after_redelivery["publishedReplayMessages"] == []
     assert after_redelivery["observations"] == []
+
+
+def test_reset_redelivery_preserves_published_error_view() -> None:
+    agent = _EffectBeforeStreamFailureAgent()
+    entity_type = create_entity(agent, entity_id="checkpoint-custom-agent")
+    first, first_context = _direct_entity(
+        entity_type,
+        state=None,
+        operation="run",
+        operation_id="native-failed-reset",
+    )
+    request = {"message": "effectful prompt", "correlationId": "failed-reset"}
+    first_response = first.run(request)
+    before_reset = _entity_state(first_context)
+
+    reset, reset_context = _direct_entity(entity_type, state=before_reset, operation="reset")
+    reset.reset()
+    after_reset = _entity_state(reset_context)
+
+    redelivery, _ = _direct_entity(
+        entity_type,
+        state=after_reset,
+        operation="run",
+        operation_id="native-failed-reset",
+    )
+    redelivered_response = redelivery.run(request)
+
+    assert redelivered_response == first_response
+    assert first_response["messages"][0]["contents"] == [
+        {
+            "type": "error",
+            "message": "stream failed after the effect",
+            "error_code": "RuntimeError",
+            "additional_properties": {},
+        }
+    ]
+    assert agent.effects == 1
+
+
+@pytest.mark.parametrize("mark_unavailable", [False, True], ids=["deadline-passed", "receipt-unavailable"])
+def test_native_redelivery_after_expiry_uses_runtime_receipt_not_cached_response(
+    mark_unavailable: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _SlottedCustomAgent()
+    entity_type = create_entity(agent, entity_id="checkpoint-custom-agent")
+    first, first_context = _direct_entity(
+        entity_type,
+        state=None,
+        operation="run",
+        operation_id="native-expired",
+    )
+    request = {"message": "completed prompt", "correlationId": "expired-correlation"}
+    first_response = first.run(request)
+    expired_checkpoint = _entity_state(first_context)
+    runtime_state = DurableAgentState.from_dict(expired_checkpoint["runtime"])
+    receipt = runtime_state.data.completed_correlations["expired-correlation"]
+    if mark_unavailable:
+        runtime_state.expire_responses(now=datetime.now(timezone.utc) + timedelta(days=3))
+    else:
+        result_expiry = datetime.fromisoformat(receipt["resultExpiresAt"])
+        future = result_expiry + timedelta(seconds=1)
+
+        class _FutureDateTime(datetime):
+            @classmethod
+            def now(cls, tz: Any = None) -> _FutureDateTime:
+                target = future.astimezone(tz) if tz is not None else future.replace(tzinfo=None)
+                return cls(
+                    target.year,
+                    target.month,
+                    target.day,
+                    target.hour,
+                    target.minute,
+                    target.second,
+                    target.microsecond,
+                    tzinfo=target.tzinfo,
+                )
+
+        monkeypatch.setattr(_delivery_state, "datetime", _FutureDateTime)
+    receipt = runtime_state.data.completed_correlations["expired-correlation"]
+    expired_checkpoint["runtime"] = runtime_state.to_dict()
+    assert receipt["resultState"] == ("unavailable" if mark_unavailable else "available")
+
+    redelivery, _ = _direct_entity(
+        entity_type,
+        state=expired_checkpoint,
+        operation="run",
+        operation_id="native-expired",
+    )
+    response = redelivery.run(request)
+
+    assert response != first_response
+    assert response["additional_properties"]["durable_status"] == "already_completed"
+    assert response["messages"][0]["contents"][0]["error_code"] == "response_expired"
+    assert len(agent.calls) == 1

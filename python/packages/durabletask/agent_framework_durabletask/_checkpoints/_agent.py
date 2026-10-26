@@ -18,13 +18,19 @@ from agent_framework import Agent, AgentMiddleware, AgentResponse, Content, Mess
 from durabletask.entities import EntityContext
 
 from agent_framework_durabletask._async_bridge import run_agent_coroutine
-from agent_framework_durabletask._entities import AgentEntity, DurableTaskEntityStateProvider
+from agent_framework_durabletask._entities import (
+    AgentEntity,
+    DurableTaskEntityStateProvider,
+    filter_already_stored_messages,
+)
 from agent_framework_durabletask._json_payload import JsonPayload
 from agent_framework_durabletask._models import RunRequest
 from agent_framework_durabletask._response_utils import (
     is_terminal_agent_response,
     serialize_agent_response,
+    serialize_input_message,
 )
+from agent_framework_durabletask._shared_agent_state import DurableAgentState, DurableAgentStateRequest
 
 from ._types import JsonObject, OperationAttempt
 
@@ -348,9 +354,15 @@ def create_entity(agent: SupportsAgentRun, *, entity_id: str) -> type[Checkpoint
                 entity_scope=str(self.entity_context.entity_id),
                 request_digest=digest(payload),
             )
+            runtime_state = DurableAgentState.from_dict(checkpoint["runtime"])
             for observation in checkpoint["observations"]:
                 if observation.get("nativeOperationId") == native_operation_id:
-                    return deepcopy(observation.get("nativeResponse", observation["response"]))
+                    committed_response = runtime_state.try_get_agent_response(selected["runtimeCorrelation"])
+                    if committed_response is None:
+                        raise ValueError("A cached native operation observation has no runtime completion receipt.")
+                    if committed_response.additional_properties.get("durable_status") != "already_completed":
+                        return deepcopy(observation.get("nativeResponse", observation["response"]))
+                    break
             completed_before_run = (
                 selected["runtimeCorrelation"] in checkpoint["runtime"]["data"].get("completionReceipts", {})
             )
@@ -359,7 +371,18 @@ def create_entity(agent: SupportsAgentRun, *, entity_id: str) -> type[Checkpoint
             if checkpoint.get("publicReplayPolicy") != REPLAY_POLICY:
                 raise ValueError("Checkpoint is missing its explicit published public replay contract.")
             replay_messages = deepcopy(checkpoint["publishedReplayMessages"])
-            replay_messages.append(Message(parsed.role, [Content.from_text(parsed.message)]).to_dict())
+            if invocation.context_messages is None:
+                replay_messages.append(Message(parsed.role, [Content.from_text(parsed.message)]).to_dict())
+            else:
+                replay_request = DurableAgentStateRequest.from_run_request(invocation)
+                replay_inputs = filter_already_stored_messages(
+                    replay_request.messages,
+                    ingested_messages=deepcopy(self.state.data.ingested_messages),
+                    occurrence_ids=invocation.context_message_ids,
+                )
+                replay_messages.extend(
+                    serialize_input_message(replay_input.to_chat_message()) for replay_input in replay_inputs
+                )
             # Published False sets a missing tools option, but keeps configured tools.
             if not invocation.enable_tool_calls:
                 invocation.enable_tool_calls = True
@@ -391,7 +414,9 @@ def create_entity(agent: SupportsAgentRun, *, entity_id: str) -> type[Checkpoint
                 completed_before_run
                 or core_response.additional_properties.get("durable_status") == "already_completed"
             ):
-                response = serialize_agent_response(core_response)
+                response = serialize_agent_response(
+                    published_error_view(core_response, invocation.correlation_id)
+                )
                 properties = response.get("additional_properties", {})
                 if properties.get("correlation_id") == invocation.correlation_id:
                     properties["correlation_id"] = parsed.correlation_id
