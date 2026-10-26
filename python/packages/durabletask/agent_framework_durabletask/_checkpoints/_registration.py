@@ -91,6 +91,10 @@ class Registration:
             except (TypeError, ValueError) as error:
                 raise RegistrationError("Factory must accept no arguments.") from error
             workflow = factory()
+            # The verified finder is scoped to construction. Load declared helpers now so
+            # handler-local imports resolve from the pinned module cache after it is removed.
+            for source in self.sources:
+                importlib.import_module(source.module)
             validate_workflow(workflow, continuation_profile=continuation_profile)
             return workflow
         finally:

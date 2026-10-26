@@ -329,6 +329,77 @@ def test_registration_loads_nested_package_with_portable_manifest_paths(tmp_path
         sys.modules.pop("customer", None)
 
 
+def test_cold_bundle_loads_declared_deferred_handler_imports(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    workflow = source / "workflow.py"
+    workflow.write_text(
+        "from agent_framework import Executor, WorkflowBuilder, WorkflowContext, handler\n"
+        "class Finish(Executor):\n"
+        "    @handler(input=str, output=str)\n"
+        "    async def finish(self, value: str, ctx: WorkflowContext[str]):\n"
+        "        from helper import transform\n"
+        "        await ctx.yield_output(transform(value))\n"
+        "def workflow():\n"
+        "    return WorkflowBuilder(name='deferred-import', start_executor=Finish(id='finish')).build()\n",
+        encoding="utf-8",
+    )
+    helper = source / "helper.py"
+    helper.write_text("def transform(value):\n    return value + ':trusted-helper'\n", encoding="utf-8")
+    sources = {
+        "helper": {"path": "helper.py", "sha256": hashlib.sha256(helper.read_bytes()).hexdigest()},
+        "workflow": {"path": "workflow.py", "sha256": hashlib.sha256(workflow.read_bytes()).hexdigest()},
+    }
+    (source / "registration.json").write_text(
+        json.dumps(
+            {
+                "contract": "trusted-workflow-registration/1",
+                "entrypoint": "workflow:workflow",
+                "sources": sources,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cold = tmp_path / "cold"
+    digest = build_checkpoint_bundle(
+        cold,
+        source,
+        customer_files=["workflow.py", "helper.py", "registration.json"],
+    )
+    verify_checkpoint_bundle(cold, bundle_sha256=digest)
+    env = {**os.environ, "PYTHONPATH": str(cold), "PYTHONDONTWRITEBYTECODE": "1"}
+    script = """
+import asyncio
+import sys
+from pathlib import Path
+from agent_framework_durabletask._checkpoints._registration import validate_registration
+
+assert 'helper' not in sys.modules
+
+class Context:
+    def __init__(self):
+        self.outputs = []
+    async def yield_output(self, value):
+        self.outputs.append(value)
+
+async def main():
+    registration = validate_registration(Path('customer/registration.json'))
+    workflow = registration.load_workflow(continuation_profile='published-checkpoint')
+    assert 'helper' in sys.modules
+    context = Context()
+    await workflow.executors['finish'].finish('cold', context)
+    assert context.outputs == ['cold:trusted-helper'], context.outputs
+    print('cold-deferred-import')
+
+asyncio.run(main())
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script], cwd=cold, env=env, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cold-deferred-import"
+
+
 @pytest.mark.parametrize("wrapped", [False, True], ids=["published-legacy-child", "current-child"])
 def test_child_admission_uses_native_parent_and_logical_path_not_physical_ordinal(
     tmp_path: Path,
