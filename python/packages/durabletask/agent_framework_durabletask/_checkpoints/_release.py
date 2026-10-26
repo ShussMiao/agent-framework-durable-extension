@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 else:
     OrchestrationContext = durabletask_task.OrchestrationContext
 
-from agent_framework_durabletask._json_payload import install_json_payload_converter
+from agent_framework_durabletask._json_payload import JsonPayload, install_json_payload_converter
 from agent_framework_durabletask._workflows.activity import execute_workflow_activity
 from agent_framework_durabletask._workflows.dt_context import DurableTaskWorkflowContext
 from agent_framework_durabletask._workflows.hitl_checkpoint import (
@@ -179,7 +179,7 @@ def register_current_handlers(
 
         def orchestrator(
             context: OrchestrationContext,
-            value: Any,
+            value: JsonPayload,
             graph: Workflow = graph,
         ) -> Generator[Any, Any, list[Any] | dict[str, Any]]:
             checkpoint_context = _native_context(context)

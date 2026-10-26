@@ -14,18 +14,20 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from agent_framework import Executor, WorkflowBuilder, WorkflowContext, WorkflowExecutor, handler
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from durabletask.internal import helpers
+from durabletask.internal import helpers, type_discovery
+from durabletask.serialization import JsonDataConverter
 from durabletask.worker import TaskHubGrpcWorker, _OrchestrationExecutor
 
 from agent_framework_durabletask._checkpoints import _release as checkpoint_release
 from agent_framework_durabletask._checkpoints._admission import AdmissionLedger
 from agent_framework_durabletask._checkpoints._format import encode_checkpoint_document
 from agent_framework_durabletask._checkpoints._registration import RegistrationError, validate_checkpoint
+from agent_framework_durabletask._json_payload import JsonPayload, install_json_payload_converter
 from agent_framework_durabletask._workflows.protocol import wrap_workflow_input
 from agent_framework_durabletask._workflows.serialization import (
     SUBWORKFLOW_ADDRESS_KEY,
@@ -122,6 +124,102 @@ def test_omitted_native_replay_profile_uses_sdk_default(monkeypatch: pytest.Monk
     assert checkpoint_release._normalize_replay_profile(None) is default
     explicit = object()
     assert checkpoint_release._normalize_replay_profile(explicit) is explicit
+
+
+def test_unsigned_root_type_marker_uses_native_json_payload_boundary(tmp_path: Path) -> None:
+    class CustomerMarker:
+        decoded = 0
+
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        @classmethod
+        def from_json(cls, value: dict[str, Any]) -> CustomerMarker:
+            cls.decoded += 1
+            return cls(value["value"])
+
+    class MarkerAwareConverter(JsonDataConverter):
+        def deserialize(self, data: str | None, target_type: Any = None) -> Any:
+            if data:
+                value = json.loads(data)
+                if isinstance(value, dict) and value.get("$type") == "customer-marker":
+                    return CustomerMarker.from_json(value)
+            return super().deserialize(data, target_type)
+
+    class Sink:
+        def __init__(self) -> None:
+            self.orchestrators: list[Callable[..., Any]] = []
+
+        def add_activity(self, function: Callable[..., Any], /) -> None:
+            pass
+
+        def add_entity(self, entity: Any, /) -> None:
+            pass
+
+        def add_orchestrator(
+            self, function: Callable[..., Any], /, *, replay_profile: object | None = None
+        ) -> None:
+            self.orchestrators.append(function)
+
+    manifest = _customer(tmp_path / "customer")
+    try:
+        registration = validate_registration(manifest)
+        cold = tmp_path / "cold"
+        digest = build_checkpoint_bundle(cold, manifest.parent, customer_files=["customer.py", "registration.json"])
+        scope = CheckpointScope("local", "owned", registration.definition_digest)
+        store = CheckpointStore(tmp_path / "protected" / "authority.db", create=True)
+        store.prepare(scope, "release", bundle_sha256=digest)
+        store.activate(scope, "release", expected_active=None, stop_attestation=b"local test")
+        sink = Sink()
+        checkpoint_release.register_current_handlers(
+            sink,
+            registration,
+            backend_id="local",
+            hub="owned",
+            keys={},
+            store=store,
+            generation="release",
+            bundle_sha256=digest,
+            bundle_directory=cold,
+            replay_profile=object(),
+        )
+        orchestrator = sink.orchestrators[0]
+
+        marker_wire = json.dumps({"$type": "customer-marker", "value": "unsigned"})
+        inner = MarkerAwareConverter()
+        worker = TaskHubGrpcWorker(channel=Mock(), data_converter=inner)
+        install_json_payload_converter(worker)
+        worker.add_orchestrator(orchestrator)
+        registered = worker._registry.get_orchestrator(orchestrator.__name__)
+        assert registered is orchestrator
+
+        # Sensitivity control: the ordinary native converter would materialize this marker.
+        assert isinstance(inner.deserialize(marker_wire), CustomerMarker)
+        assert CustomerMarker.decoded == 1
+        CustomerMarker.decoded = 0
+
+        input_type = type_discovery.orchestrator_input_type(registered, worker._data_converter)
+        assert input_type is JsonPayload
+        decoded = worker._data_converter.deserialize(marker_wire, input_type)
+        assert decoded == {"$type": "customer-marker", "value": "unsigned"}
+        assert not isinstance(decoded, CustomerMarker)
+        assert CustomerMarker.decoded == 0
+
+        start = helpers.new_execution_started_event(orchestrator.__name__, "unsigned-root")
+        start.executionStarted.input.value = marker_wire
+        result = _OrchestrationExecutor(
+            worker._registry,
+            logging.getLogger("unsigned-checkpoint-root"),
+            worker._data_converter,
+        ).execute(
+            "unsigned-root",
+            [],
+            [helpers.new_orchestrator_started_event(), start],
+        )
+        assert any(action.HasField("completeOrchestration") for action in result.actions)
+        assert CustomerMarker.decoded == 0
+    finally:
+        sys.modules.pop("customer", None)
 
 
 def test_registration_loads_nested_package_with_portable_manifest_paths(tmp_path: Path) -> None:
