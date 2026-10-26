@@ -76,6 +76,17 @@ _NATIVE_AUTO_CHECKPOINT_CONTRACT = "native-automatic-checkpoint/1"
 _NATIVE_CONTINUATION_PROFILE = "native-can-v1"
 
 
+def _has_native_emission_capability() -> bool:
+    context_type = getattr(durabletask_task, "OrchestrationContext", None)
+    return (
+        getattr(durabletask_task, "NATIVE_CONTINUATION_PROFILE", None) == _NATIVE_CONTINUATION_PROFILE
+        and context_type is not None
+        and hasattr(context_type, "native_continuation_profile")
+        and hasattr(context_type, "native_continuation")
+        and callable(getattr(context_type, "create_dispatch_checkpoint", None))
+    )
+
+
 def _is_checkpoint_document(value: Any) -> bool:
     return is_json_object(value) and (
         value.get("format") == FORMAT
@@ -224,11 +235,7 @@ def register_current_handlers(
         raise ValueError("Unsupported checkpoint emission profile.")
     if emission_profile != "disabled" and admission_profile != "new-workflows-only":
         raise ValueError("Automatic native emission is available only for new-workflows-only deployments.")
-    if emission_profile != "disabled" and (
-        getattr(durabletask_task, "NATIVE_CONTINUATION_PROFILE", None) != _NATIVE_CONTINUATION_PROFILE
-        or not hasattr(durabletask_task.OrchestrationContext, "native_continuation_profile")
-        or not hasattr(durabletask_task.OrchestrationContext, "native_continuation")
-    ):
+    if emission_profile != "disabled" and not _has_native_emission_capability():
         raise RuntimeError("Automatic native emission requires the matching SDK/provider proposal capability.")
     replay_profile = _normalize_replay_profile(replay_profile)
     verify_checkpoint_bundle(bundle_directory, bundle_sha256=bundle_sha256)
@@ -488,10 +495,7 @@ def register_current_worker(
     ):
         raise RuntimeError("Checkpoint registration requires the matching public SDK/host candidate.")
     if emission_profile != "disabled" and (
-        emission_profile != _NATIVE_CONTINUATION_PROFILE
-        or getattr(durabletask_task, "NATIVE_CONTINUATION_PROFILE", None) != _NATIVE_CONTINUATION_PROFILE
-        or not hasattr(durabletask_task.OrchestrationContext, "native_continuation_profile")
-        or not hasattr(durabletask_task.OrchestrationContext, "native_continuation")
+        emission_profile != _NATIVE_CONTINUATION_PROFILE or not _has_native_emission_capability()
     ):
         raise RuntimeError("Automatic native emission requires the matching SDK/provider proposal capability.")
     install_json_payload_converter(worker)

@@ -167,6 +167,50 @@ def test_native_emission_without_proposal_capability_fails_before_registration(m
     assert effects == []
 
 
+def test_native_emission_requires_dispatch_capability_before_registration(monkeypatch):
+    effects = []
+
+    class PartialContext:
+        native_continuation_profile = None
+        native_continuation = None
+
+    class Sink:
+        def add_activity(self, function):
+            effects.append("activity")
+
+        def add_entity(self, entity):
+            effects.append("entity")
+
+        def add_orchestrator(self, function, *, replay_profile=None):
+            effects.append("orchestrator")
+
+    monkeypatch.setattr(
+        _release,
+        "durabletask_task",
+        SimpleNamespace(
+            NATIVE_CONTINUATION_PROFILE="native-can-v1",
+            OrchestrationContext=PartialContext,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="matching SDK/provider proposal capability"):
+        register_current_handlers(
+            cast(Any, Sink()),
+            cast(Any, object()),
+            backend_id="test",
+            hub="test",
+            keys={},
+            store=cast(Any, object()),
+            generation="test",
+            bundle_sha256="a" * 64,
+            bundle_directory="unused",
+            admission_profile="new-workflows-only",
+            emission_profile="native-can-v1",
+        )
+
+    assert effects == []
+
+
 def test_native_emission_profile_reaches_normal_semantic_continuation(monkeypatch):
     definition = "a" * 64
     received = {}
