@@ -27,6 +27,8 @@ from agent_framework_durabletask._checkpoints import _release as checkpoint_rele
 from agent_framework_durabletask._checkpoints._admission import AdmissionLedger
 from agent_framework_durabletask._checkpoints._format import encode_checkpoint_document
 from agent_framework_durabletask._checkpoints._registration import RegistrationError, validate_checkpoint
+from agent_framework_durabletask._checkpoints._target import fan_bindings
+from agent_framework_durabletask._checkpoints._target import run as continue_checkpoint
 from agent_framework_durabletask._json_payload import JsonPayload, install_json_payload_converter
 from agent_framework_durabletask._workflows.protocol import wrap_workflow_input
 from agent_framework_durabletask._workflows.serialization import (
@@ -124,6 +126,54 @@ def test_omitted_native_replay_profile_uses_sdk_default(monkeypatch: pytest.Monk
     assert checkpoint_release._normalize_replay_profile(None) is default
     explicit = object()
     assert checkpoint_release._normalize_replay_profile(explicit) is explicit
+
+
+@pytest.mark.parametrize(("host_supports_events", "published"), [(False, False), (True, True)])
+def test_imported_event_log_publication_respects_host_capability(host_supports_events: bool, published: bool) -> None:
+    class StatusContext:
+        instance_id = "original"
+        supports_event_streaming = host_supports_events
+
+        def __init__(self) -> None:
+            self.statuses: list[dict[str, Any]] = []
+
+        def set_custom_status(self, status: dict[str, Any]) -> None:
+            self.statuses.append(status)
+
+        def wait_for_external_event(self, name: str) -> SimpleNamespace:
+            return SimpleNamespace(is_complete=False)
+
+    workflow = WorkflowBuilder(name="package-proof", start_executor=Finish(id="finish")).build()
+    state = _state()
+    event = {"type": "executor_invoked", "executor_id": "finish", "iteration": 1, "payload": "x" * 17_000}
+    state.update({
+        "phase": "hitl",
+        "eventStreaming": True,
+        "events": [event],
+        "pending": {},
+        "requests": {
+            "decision": {
+                "contract": "semantic-hitl-request/1",
+                "request_id": "decision",
+                "source_executor_id": "finish",
+                "request_data": "approve",
+                "request_type": "builtins.str",
+                "response_type": "builtins.str",
+            }
+        },
+        "waiting": ["decision"],
+        "fanBindings": fan_bindings(workflow)[0],
+        "fan": {},
+    })
+    context = StatusContext()
+
+    next(continue_checkpoint(cast(Any, context), workflow, state))
+
+    status = context.statuses[0]
+    assert ("events" in status) is published
+    assert state["eventStreaming"] is True and state["events"] == [event]
+    if not host_supports_events:
+        assert len(json.dumps(status, separators=(",", ":")).encode("utf-8")) < 16 * 1024
 
 
 def test_unsigned_root_type_marker_uses_native_json_payload_boundary(tmp_path: Path) -> None:

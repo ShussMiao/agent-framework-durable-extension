@@ -12,7 +12,7 @@ import hashlib
 import json
 from copy import copy, deepcopy
 from datetime import datetime, timezone
-from typing import Any, TypeGuard
+from typing import Any, Protocol, TypeGuard, cast
 
 from agent_framework import Agent, AgentMiddleware, AgentResponse, Content, Message, SupportsAgentRun
 from durabletask.entities import EntityContext
@@ -38,6 +38,10 @@ CONTRACT = "agent-semantic-checkpoint/1"
 RETRY_POLICY = "published-native-operation-attempts/2"
 PUBLIC_POLICY = "published-python-invocation-public-view/2"
 REPLAY_POLICY = "published-cold-content-replay/2"
+
+
+class _SupportsContextProviders(Protocol):
+    context_providers: Any
 
 
 def _is_core_agent(agent: SupportsAgentRun) -> TypeGuard[Agent[Any]]:
@@ -134,8 +138,29 @@ class PublishedCheckpointReplayAgent:
         self.name = agent.name
         self.description = agent.description
 
+    @property
+    def context_providers(self) -> Any:
+        return getattr(self._agent, "context_providers", None)
+
+    @context_providers.setter
+    def context_providers(self, providers: Any) -> None:
+        cast(_SupportsContextProviders, self._agent).context_providers = providers
+
+    def __copy__(self) -> "PublishedCheckpointReplayAgent":
+        clone = object.__new__(PublishedCheckpointReplayAgent)
+        object.__setattr__(clone, "_agent", copy(self._agent))
+        object.__setattr__(clone, "_messages", deepcopy(self._messages))
+        object.__setattr__(clone, "description", self.description)
+        object.__setattr__(clone, "id", self.id)
+        object.__setattr__(clone, "name", self.name)
+        return clone
+
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._agent, name)
+        try:
+            agent = object.__getattribute__(self, "_agent")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(agent, name)
 
     @property
     def _stream_capability_agent(self) -> SupportsAgentRun:

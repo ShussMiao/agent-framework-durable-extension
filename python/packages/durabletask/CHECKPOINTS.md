@@ -330,7 +330,8 @@ registers the same current handlers through native Functions decorators and the
 proposed public `DFApp.worker_configuration` callback. It does not inspect
 generated closures or mutate a private SDK registry. Select the deployment replay
 profile explicitly. Functions custom status does not publish accumulated workflow
-events.
+events, even when an imported checkpoint records source event streaming as enabled.
+The source checkpoint remains unchanged.
 
 The factory opts into the proposed worker setting
 `configure_replay_profile(..., preserve_activity_inputs=True)` for both native

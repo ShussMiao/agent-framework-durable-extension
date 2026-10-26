@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,7 @@ from agent_framework import (
     AgentResponse,
     AgentResponseUpdate,
     Content,
+    HistoryProvider,
     Message,
     ResponseStream,
     SupportsAgentRun,
@@ -31,8 +33,13 @@ from durabletask.task import EntityContext
 from durabletask.worker import TaskHubGrpcWorker
 
 from agent_framework_durabletask import _delivery_state
-from agent_framework_durabletask._checkpoints._agent import create_entity, empty_checkpoint
+from agent_framework_durabletask._checkpoints._agent import (
+    PublishedCheckpointReplayAgent,
+    create_entity,
+    empty_checkpoint,
+)
 from agent_framework_durabletask._entities import InvocationFailurePolicy, invocation_failure_policy_from_checkpoint
+from agent_framework_durabletask._history_provider import prepare_history_owner
 from agent_framework_durabletask._shared_agent_state import DurableAgentState
 
 _ENTITY_ADDRESS = "@dafx-checkpoint-custom-agent@session-1"
@@ -43,18 +50,20 @@ class _EntityContextWithOperationId(EntityContext):
 
 
 class _SlottedCustomAgent:
-    __slots__ = ("id", "name", "description", "calls")
+    __slots__ = ("id", "name", "description", "calls", "context_providers")
 
     id: str
     name: str | None
     description: str | None
     calls: list[tuple[bool, list[Message]]]
+    context_providers: list[HistoryProvider]
 
     def __init__(self) -> None:
         self.id = "slotted-custom"
         self.name = "slotted-custom"
         self.description = "Custom provider without Agent middleware support"
         self.calls: list[tuple[bool, list[Message]]] = []
+        self.context_providers = []
 
     def run(self, messages: Any = None, *, stream: bool = False, **kwargs: Any) -> Any:
         transcript = list(messages or [])
@@ -83,6 +92,22 @@ class _SlottedCustomAgent:
 
     def get_session(self, service_session_id: Any, *, session_id: str | None = None) -> Any:
         raise NotImplementedError
+
+
+class _ExternalHistoryProvider(HistoryProvider):
+    def __init__(self) -> None:
+        super().__init__("checkpoint-external")
+
+    async def get_messages(self, session_id: str | None, **kwargs: Any) -> list[Message]:
+        return []
+
+    async def save_messages(
+        self,
+        session_id: str | None,
+        messages: Sequence[Message],
+        **kwargs: Any,
+    ) -> None:
+        return None
 
 
 def _run_native_operation(
@@ -238,6 +263,23 @@ def test_imported_transcript_runs_before_customer_middleware() -> None:
         ["new prompt"],
         ["customer middleware addition"],
     ]
+
+
+def test_custom_checkpoint_replay_copies_agent_before_replacing_history_provider() -> None:
+    agent = _SlottedCustomAgent()
+    provider = _ExternalHistoryProvider()
+    agent.context_providers = [provider]
+    replay = PublishedCheckpointReplayAgent(agent, [])
+
+    prepared = prepare_history_owner(replay, service_owns_history=True)
+
+    assert isinstance(prepared, PublishedCheckpointReplayAgent)
+    assert prepared is not replay
+    replacement = prepared.context_providers[0]
+    assert getattr(replacement, "__wrapped__", None) is provider
+    assert agent.context_providers == [provider]
+    asyncio.run(prepared.run(messages=[]))
+    assert agent.calls == [(False, [])]
 
 
 def test_checkpoint_replays_explicit_context_messages_and_occurrences() -> None:

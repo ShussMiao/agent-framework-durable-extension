@@ -346,7 +346,8 @@ def run(
     iteration = checkpoint["iteration"]
     phase = checkpoint["phase"]
     waiting = list(checkpoint["waiting"])
-    events: list[dict[str, Any]] = list(checkpoint["events"]) if checkpoint["eventStreaming"] else []
+    publish_events = checkpoint["eventStreaming"] and ctx.supports_event_streaming
+    events: list[dict[str, Any]] = list(checkpoint["events"]) if publish_events else []
     children: list[dict[str, Any]] = list(checkpoint.get("children", []))
 
     def child_executor(identifier: str) -> WorkflowExecutor:
@@ -356,11 +357,11 @@ def run(
         return executor
 
     def emit(event_type: str, executor: str) -> None:
-        if checkpoint["eventStreaming"]:
+        if publish_events:
             events.append({"type": event_type, "executor_id": executor, "iteration": iteration})
 
     def append_events(result: current.ExecutorResult) -> None:
-        if checkpoint["eventStreaming"] and result.activity_result:
+        if publish_events and result.activity_result:
             captured = result.activity_result.get("events")
             if is_list(captured):
                 for event in captured:
@@ -371,7 +372,7 @@ def run(
     def status(subworkflows: dict[str, Any] | None = None) -> None:
         is_waiting = bool(requests) and not pending and not subworkflows
         value: dict[str, Any] = {"state": "waiting_for_human_input" if is_waiting else "running"}
-        if checkpoint["eventStreaming"]:
+        if publish_events:
             value["events"] = list(events)
         if is_waiting:
             value["pending_requests"] = {
