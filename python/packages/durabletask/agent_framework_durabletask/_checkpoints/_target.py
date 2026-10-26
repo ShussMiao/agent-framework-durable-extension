@@ -688,7 +688,10 @@ def run(
                     },
                 }
             )
-            yield ctx.create_dispatch_checkpoint(json.loads(payload))
+            create_checkpoint = getattr(ctx, "create_dispatch_checkpoint", None)
+            if not callable(create_checkpoint):
+                raise RuntimeError("Automatic checkpoint emission requires the native replay-fence SDK proposal.")
+            yield create_checkpoint(json.loads(payload))
             return outputs
     if checkpoint["is_child"]:
         return {SUBWORKFLOW_RESULT_KEY: True, "outputs": outputs, "events": events}
