@@ -11,6 +11,7 @@ import marshal
 import os
 import struct
 import sys
+import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -174,6 +175,102 @@ def test_original_reader_executes_verified_bytes_not_timestamp_valid_bytecode(
     try:
         loaded = migration._original_reader(reader)
         assert loaded.reader_value == "verified source"
+    finally:
+        sys.modules.pop(module_name, None)
+        if previous is not None:
+            sys.modules[module_name] = previous
+
+
+def test_original_reader_serializes_concurrent_first_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = b"DurableAgentState = type('DurableAgentState', (), {})\n"
+    reader = tmp_path / "reader.py"
+    reader.write_bytes(source)
+    monkeypatch.setattr(migration, "PUBLISHED_READER_SHA256", hashlib.sha256(source).hexdigest())
+    module_name = "agent_framework_durabletask._migration_original_state"
+    previous = sys.modules.pop(module_name, None)
+    first_exec_started = threading.Event()
+    allow_first_exec = threading.Event()
+    second_lock_attempted = threading.Event()
+    actual_exec = __import__("builtins").exec
+    results: dict[str, Any] = {}
+    failures: list[BaseException] = []
+
+    class ObservedLock:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+
+        def __enter__(self) -> ObservedLock:
+            if threading.current_thread().name == "reader-second":
+                second_lock_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+            self._lock.release()
+
+    def gated_exec(code: Any, globals: Any = None, locals: Any = None) -> None:
+        if globals is not None and globals.get("__name__") == module_name:
+            first_exec_started.set()
+            assert allow_first_exec.wait(timeout=5)
+        if locals is None:
+            actual_exec(code, globals)
+        else:
+            actual_exec(code, globals, locals)
+
+    def load(key: str) -> None:
+        try:
+            results[key] = migration._original_reader(reader)
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(__import__("builtins"), "exec", gated_exec)
+    monkeypatch.setattr(migration, "_ORIGINAL_READER_LOCK", ObservedLock())
+    first = threading.Thread(target=load, args=("first",), name="reader-first")
+    second = threading.Thread(target=load, args=("second",), name="reader-second")
+
+    try:
+        first.start()
+        assert first_exec_started.wait(timeout=5)
+        second.start()
+        assert second_lock_attempted.wait(timeout=5)
+        allow_first_exec.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert failures == []
+        assert results["first"] is results["second"]
+        assert hasattr(results["second"], "DurableAgentState")
+    finally:
+        allow_first_exec.set()
+        if first.ident is not None:
+            first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+        sys.modules.pop(module_name, None)
+        if previous is not None:
+            sys.modules[module_name] = previous
+
+
+def test_original_reader_removes_module_after_initialization_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = b"raise RuntimeError('reader initialization failed')\n"
+    reader = tmp_path / "reader.py"
+    reader.write_bytes(source)
+    monkeypatch.setattr(migration, "PUBLISHED_READER_SHA256", hashlib.sha256(source).hexdigest())
+    module_name = "agent_framework_durabletask._migration_original_state"
+    previous = sys.modules.pop(module_name, None)
+
+    try:
+        with pytest.raises(RuntimeError, match="reader initialization failed"):
+            migration._original_reader(reader)
+        assert module_name not in sys.modules
     finally:
         sys.modules.pop(module_name, None)
         if previous is not None:

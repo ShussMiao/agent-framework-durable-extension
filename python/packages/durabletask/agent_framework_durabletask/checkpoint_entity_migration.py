@@ -17,6 +17,7 @@ import json
 import sys
 from copy import deepcopy
 from pathlib import Path
+from threading import RLock
 from types import ModuleType
 from typing import Any, Mapping
 
@@ -40,6 +41,7 @@ from ._json_payload import JsonPayload
 from ._response_utils import is_terminal_agent_response, serialize_agent_response
 
 PUBLISHED_READER_SHA256 = "96092e073a9f993d4c802c6db29007e7ae4dad9122f9472bdc4132a06c128d49"
+_ORIGINAL_READER_LOCK = RLock()
 
 
 def entity_conversion_binding(scope: CheckpointScope, *, entity: str) -> dict[str, object]:
@@ -80,19 +82,21 @@ def _original_reader(path: Path) -> ModuleType:
     if hashlib.sha256(source).hexdigest() != PUBLISHED_READER_SHA256:
         raise ValueError("Published agent reader differs from the pinned release.")
     name = "agent_framework_durabletask._migration_original_state"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, path)
-        if spec is None or spec.loader is None:
-            raise ValueError("Published agent reader cannot be loaded.")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        try:
-            # Compile only the bytes verified against the pinned release.
-            exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102
-        except BaseException:
-            del sys.modules[name]
-            raise
-    return sys.modules[name]
+    with _ORIGINAL_READER_LOCK:
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise ValueError("Published agent reader cannot be loaded.")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                # Compile only the bytes verified against the pinned release.
+                exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102
+            except BaseException:
+                if sys.modules.get(name) is module:
+                    del sys.modules[name]
+                raise
+        return sys.modules[name]
 
 
 def _validate_usage(usage: Any) -> None:
