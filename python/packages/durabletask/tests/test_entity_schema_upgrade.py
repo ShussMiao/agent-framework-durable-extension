@@ -41,7 +41,7 @@ from agent_framework_durabletask._durable_agent_state import DurableAgentStateRe
 
 def _native(*, legacy: bool = True, evidence: Any = None) -> tuple[Any, RecordingChatClient]:
     worker = DurableTaskSchedulerWorker(
-        host_address="localhost:1", taskhub="test", token_credential=None, channel=Mock()
+        host_address="localhost:1", taskhub="test", token_credential=None
     )
     model = RecordingChatClient()
     DurableAIAgentWorker(
@@ -464,7 +464,7 @@ def test_generated_workflow_replays_historical_dispatch_and_versions_only_new_st
     baseline = TaskHubGrpcWorker(channel=Mock())
     DurableAIAgentWorker(baseline, deployment_mode="isolated_v2").configure_workflow(workflow)
     upgraded = DurableTaskSchedulerWorker(
-        host_address="localhost:1", taskhub="test", token_credential=None, channel=Mock()
+        host_address="localhost:1", taskhub="test", token_credential=None
     )
     DurableAIAgentWorker(upgraded, deployment_mode="two_phase", process_legacy_entities=True).configure_workflow(
         workflow
