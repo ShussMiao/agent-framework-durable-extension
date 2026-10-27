@@ -20,12 +20,12 @@ from agent_framework import WorkflowEvent
 from durabletask.azuremanaged.client import DurableTaskSchedulerClient
 from durabletask.client import OrchestrationStatus, TaskHubGrpcClient
 
+from .._models import AgentSessionId
 from .naming import (
     iter_subworkflow_instances,
     qualify_subworkflow_request_id,
     split_subworkflow_request_id,
     validate_dts_instance_id,
-    workflow_orchestrator_name,
 )
 from .protocol import validate_workflow_start_input, wrap_workflow_input
 from .serialization import (
@@ -72,11 +72,13 @@ class DurableWorkflowClient:
         ```
     """
 
-    def __init__(self, client: TaskHubGrpcClient, *, workflow_name: str | None = None):
+    def __init__(self, client: TaskHubGrpcClient, *, workflow_name: str | None = None, entity_version: int = 1):
         """Initialize the workflow client wrapper.
 
         Args:
             client: The durabletask client instance to wrap.
+            entity_version: Two for new workflows in a two-phase deployment. This
+                selects a versioned orchestration name, not a new instance ID.
             workflow_name: Optional default workflow name to target. When set, the
                 per-call ``workflow_name`` may be omitted. When a worker hosts a
                 single workflow, set this once here; when it hosts several, either
@@ -84,6 +86,8 @@ class DurableWorkflowClient:
                 each call.
         """
         self._client = client
+        AgentSessionId.to_entity_name("validation", entity_version=entity_version)
+        self._entity_version = entity_version
         self._default_workflow_name = workflow_name
         logger.debug("[DurableWorkflowClient] Initialized with client type: %s", type(client).__name__)
 
@@ -124,7 +128,9 @@ class DurableWorkflowClient:
         Returns:
             The orchestration instance ID, for use with ``await_workflow_output``.
         """
-        orchestration_name = workflow_orchestrator_name(self._resolve_workflow_name(workflow_name))
+        orchestration_name = AgentSessionId.to_entity_name(
+            self._resolve_workflow_name(workflow_name), entity_version=self._entity_version
+        )
         if instance_id is not None and isinstance(self._client, DurableTaskSchedulerClient):
             validate_dts_instance_id(instance_id)
         validate_workflow_start_input(input)
@@ -154,7 +160,7 @@ class DurableWorkflowClient:
         name = workflow_name or self._default_workflow_name
         if not name:
             return True
-        expected = workflow_orchestrator_name(name)
+        expected = AgentSessionId.to_entity_name(name, entity_version=self._entity_version)
         actual = getattr(state, "name", None)
         return isinstance(actual, str) and actual.casefold() == expected.casefold()
 
