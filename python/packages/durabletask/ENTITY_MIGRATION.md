@@ -56,7 +56,7 @@ New workers now register `dafx-{agent}` alongside `dafx-v2-{agent}` and both gen
 
 Conversion receives detached JSON. Failed validation or conversion leaves raw state unchanged and does not decode the operation request or call the agent, tools or providers. An operation that fails before its host commit can be converted again on retry/restart. This does not make model calls or external provider writes exactly once. Existing invocation safety and backend commit semantics still apply.
 
-State budgets include the persisted `dafxSchema` metadata during retention and maintenance checks. In-place conversion measures the final marked snapshot, excluding the export API's temporary ownership-transfer record. The enclosing operation still applies its normal budget before committing any additional state.
+State budgets include the persisted `dafxSchema` metadata during retention and maintenance checks. In-place conversion measures the final marked snapshot, excluding the export API's temporary ownership-transfer record. The enclosing operation still applies its normal budget before committing any additional state. For the separate export/import API, an otherwise empty destination initialized by reset remains empty even with validated schema metadata. Application fields, session state, completion receipts and existing migration bindings still prevent replacement.
 
 ## Supported historical state and evidence
 

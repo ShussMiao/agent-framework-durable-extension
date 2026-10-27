@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import azure.functions as func
 import pytest
 from _af_handler_test_support import _Client, _Host, _NonStreamingAgent
+from _migration_test_support import _migration_request
 from agent_framework import AgentExecutor, AgentResponse, Message, WorkflowBuilder
 from agent_framework_durabletask import (
     DurableAgentState,
@@ -96,6 +97,30 @@ def test_functions_reset_budget_includes_the_committed_schema_marker(headroom: i
         assert result.results[0].HasField("success"), result
         assert json.loads(result.entityState.value) == expected
     assert model.options == []
+
+
+def test_functions_export_import_accepts_reset_destination_and_preserves_cold_retry_identity() -> None:
+    app, model = _app()
+    host = _Host(app)
+    destination = "@dafx-v2-assistant@original-key"
+    reset = host.entity(destination, "reset", None)
+    assert reset.results[0].HasField("success"), reset
+    assert json.loads(reset.entityState.value)["dafxSchema"] == {"contract": "dafx.agent-state", "version": "2.0.0"}
+    request = _migration_request(LegacyDurableAgentState().to_dict(), destination)
+    result = host.entity(destination, "migrate", json.dumps(request), reset.entityState.value)
+    assert result.results[0].HasField("success"), result
+    committed = json.loads(result.entityState.value)
+    assert committed["data"]["migration"]["destinationSessionId"] == destination
+    restarted, cold_model = _app()
+    cold_host = _Host(restarted)
+    duplicate = cold_host.entity(destination, "migrate", json.dumps(request), result.entityState.value)
+    assert duplicate.results[0].success.result == result.results[0].success.result
+    assert json.loads(duplicate.entityState.value) == committed
+    changed = {**request, "migrationId": "different-migration"}
+    rejected = cold_host.entity(destination, "migrate", json.dumps(changed), result.entityState.value)
+    assert rejected.results[0].HasField("failure"), rejected
+    assert json.loads(rejected.entityState.value) == committed
+    assert model.options == cold_model.options == []
 
 
 @pytest.mark.parametrize("operation", ["run", "reset", "expire_responses", "delete"])

@@ -79,7 +79,12 @@ from ._shared_agent_state import (
     DurableAgentStateResponse,
     DurableAgentStateUnknownEntry,
 )
-from ._shared_state_validation import validate_completion_transition, validate_identifier, validate_timestamp
+from ._shared_state_validation import (
+    validate_completion_transition,
+    validate_identifier,
+    validate_schema_metadata,
+    validate_timestamp,
+)
 from ._state_capacity import StateCapacityError
 from ._state_migration import migrate_legacy_state, state_snapshot_digest
 
@@ -311,6 +316,12 @@ class AgentEntityStateProviderMixin:
     def _transition_validation_baseline(snapshot: dict[str, Any]) -> dict[str, Any]:
         return DurableAgentState().to_dict() if snapshot == {} else deepcopy(snapshot)
 
+    @staticmethod
+    def _is_empty_migration_snapshot(snapshot: dict[str, Any]) -> bool:
+        """Ignore only validated schema metadata when admitting an empty destination."""
+        validate_schema_metadata(snapshot)
+        return {key: value for key, value in snapshot.items() if key != "dafxSchema"} == DurableAgentState().to_dict()
+
     def _migration_binding(self, metadata: dict[str, Any], stored: Any) -> dict[str, str] | None:
         """Validate and project only the reserved migration identity fields."""
         if "migration" not in metadata:
@@ -358,7 +369,7 @@ class AgentEntityStateProviderMixin:
         elif new_binding is not None and (
             self._migration_candidate is None
             or self._state_cache is not self._migration_candidate
-            or previous != DurableAgentState().to_dict()
+            or not self._is_empty_migration_snapshot(previous)
         ):
             raise ValueError("Initial migration binding requires migrate into an empty destination.")
 
@@ -416,8 +427,7 @@ class AgentEntityStateProviderMixin:
                 raise ValueError("Committed migration binding does not match the retry request")
             self._validate_migration_write(committed_baseline, snapshot)
             return True
-        empty = DurableAgentState().to_dict()
-        if snapshot != empty or committed_baseline != empty:
+        if not self._is_empty_migration_snapshot(snapshot) or not self._is_empty_migration_snapshot(committed_baseline):
             raise ValueError(
                 "Migration destination must be empty; an existing or different migration cannot be replaced."
             )

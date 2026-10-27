@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 from _execution_test_support import JsonStateProvider, NonStreamingAgent, RecordingChatClient
+from _migration_test_support import _migration_request
 from agent_framework import AgentExecutor, AgentResponse, Message, WorkflowBuilder
 from durabletask.azuremanaged.worker import DurableTaskSchedulerWorker
 from durabletask.client import TaskHubGrpcClient
@@ -62,8 +63,13 @@ def _batch(
     *,
     name: str = "dafx-assistant",
     correlation_id: str = "turn-1",
+    payload: dict[str, Any] | None = None,
 ) -> Any:
-    wire = json.dumps({"message": "hello", "correlationId": correlation_id})
+    wire = (
+        json.dumps(payload if payload is not None else {"message": "hello", "correlationId": correlation_id})
+        if operation == "run" or payload is not None
+        else None
+    )
     request = pb.EntityBatchRequest(
         instanceId=f"@{name}@original-key",
         entityState=helpers.get_string_value(None if source is None else json.dumps(source)),
@@ -71,7 +77,7 @@ def _batch(
             pb.OperationRequest(
                 operation=operation,
                 requestId="operation-1",
-                input=helpers.get_string_value(wire if operation == "run" else None),
+                input=helpers.get_string_value(wire),
             )
         ],
     )
@@ -183,6 +189,64 @@ def test_in_place_conversion_budget_excludes_export_binding_and_includes_schema_
     else:
         assert registry.upgrade(source, context) == expected
     assert source == before
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_export_import_accepts_empty_two_phase_destination_and_protects_committed_binding(initialized: bool) -> None:
+    worker, model = _native()
+    name = "dafx-v2-assistant"
+    source = None
+    if initialized:
+        reset = _batch(worker, None, "reset", name=name)
+        assert reset.results[0].HasField("success"), reset
+        source = json.loads(reset.entityState.value)
+        assert source["dafxSchema"] == {"contract": "dafx.agent-state", "version": "2.0.0"}
+    request = _migration_request(_legacy(), f"@{name}@original-key")
+    result = _batch(worker, source, "migrate", name=name, payload=request)
+    assert result.results[0].HasField("success"), result
+    committed = json.loads(result.entityState.value)
+    assert committed["data"]["migration"]["destinationSessionId"] == f"@{name}@original-key"
+    assert committed["dafxSchema"] == {"contract": "dafx.agent-state", "version": "2.0.0"}
+    restarted, cold_model = _native()
+    duplicate = _batch(restarted, committed, "migrate", name=name, payload=request)
+    assert duplicate.results[0].success.result == result.results[0].success.result
+    assert json.loads(duplicate.entityState.value) == committed
+    changed = {**request, "migrationId": "different-migration"}
+    rejected = _batch(restarted, committed, "migrate", name=name, payload=changed)
+    assert rejected.results[0].HasField("failure"), rejected
+    assert json.loads(rejected.entityState.value) == committed
+    assert not model.received_messages and not cold_model.received_messages
+
+
+@pytest.mark.parametrize("occupied", ["root", "data", "session", "receipt"])
+def test_schema_metadata_does_not_make_occupied_migration_destinations_empty(occupied: str) -> None:
+    worker, model = _native()
+    name = "dafx-v2-assistant"
+    if occupied == "receipt":
+        prior = _batch(worker, None, name=name)
+        assert prior.results[0].HasField("success"), prior
+        source = json.loads(prior.entityState.value)
+        source["data"]["conversationHistory"] = []
+        source["data"].pop("session", None)
+    else:
+        reset = _batch(worker, None, "reset", name=name)
+        assert reset.results[0].HasField("success"), reset
+        source = json.loads(reset.entityState.value)
+        if occupied == "root":
+            source["extensionData"] = {"application": False}
+        elif occupied == "data":
+            source["data"]["application"] = {"retained": []}
+        else:
+            source["data"]["session"] = {"session_id": f"@{name}@original-key", "state": {}}
+    calls = len(model.received_messages)
+    before = deepcopy(source)
+    result = _batch(
+        worker, source, "migrate", name=name, payload=_migration_request(_legacy(), f"@{name}@original-key")
+    )
+    assert result.results[0].HasField("failure"), result
+    assert "empty" in result.results[0].failure.failureDetails.errorMessage
+    assert json.loads(result.entityState.value) == before
+    assert len(model.received_messages) == calls
 
 
 @pytest.mark.parametrize(
