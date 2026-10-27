@@ -517,6 +517,13 @@ class AgentEntityStateProviderMixin:
         finally:
             self._migration_candidate = None
 
+    def stamp_schema_metadata(self) -> None:
+        """Include writer metadata in staged state before capacity checks."""
+        if self._entity_schema_registry is not None:
+            payload = self.state.to_dict()
+            self._entity_schema_registry.stamp(payload)
+            self.state.unknown_fields["dafxSchema"] = payload["dafxSchema"]
+
     def persist_state(self) -> None:
         """Pass state to the host, which may stage rather than confirm a durable write."""
         from ._history_provider import current_durable_history_binding
@@ -530,9 +537,8 @@ class AgentEntityStateProviderMixin:
         transition_baseline = self._transition_validation_baseline(committed_snapshot)
         try:
             state.prepare_for_write(delivery_window_seconds=self._response_delivery_window_seconds())
+            self.stamp_schema_metadata()
             payload = state.to_dict()
-            if self._entity_schema_registry is not None:
-                self._entity_schema_registry.stamp(payload)
             validate_completion_transition(transition_baseline, payload)
             self._validate_migration_write(transition_baseline, payload)
         except BaseException:
@@ -742,6 +748,7 @@ class AgentEntity:
 
     def _validate_control_budget(self) -> None:
         """Reject an oversized maintenance commit, without pruning any protected state."""
+        self._state_provider.stamp_schema_metadata()
         if self._max_state_bytes is not None:
             size = len(json.dumps(self.state.to_dict(), allow_nan=False))
             if size > self._max_state_bytes:
@@ -1373,6 +1380,7 @@ class AgentEntity:
 
     async def _enforce_retention(self) -> None:
         """Apply optional whole-state pressure budgeting independently of eager pruning."""
+        self._state_provider.stamp_schema_metadata()
         if self._max_state_bytes is None:
             return
         await enforce_budget(

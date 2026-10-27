@@ -32,6 +32,8 @@ Existing clients retain generation 1 by default. Existing `DurableAgentSession` 
 
 New external generation-2 session strings have the form `@dafx-v2-{agent}@{key}`. Historical Python strings use `@{agent}@{key}`. Explicit raw keys remain historical addresses in generated HTTP and MCP endpoints. Reuse the complete returned session ID for generation-2 calls. Unknown address generations are rejected. Agent identities starting with `v{digits}-` are reserved to prevent name collisions.
 
+When a supplied logical agent name exactly matches the embedded session name, parsing preserves the historical generation. For example, `@dafx-v2-assistant@key` for the logical agent `dafx-v2-assistant` still addresses `dafx-dafx-v2-assistant`, not a new conversation. Explicit serialized generation metadata takes precedence. A new generation-2 session for that agent uses `@dafx-v2-dafx-v2-assistant@key`.
+
 Generated workflows need the same isolation for their entry point. `DurableWorkflowClient(client, workflow_name="orders", entity_version=2)` starts **new** workflows under `dafx-v2-orders`. It preserves a caller-supplied orchestration instance ID. Their agent entities use `dafx-v2-orders-{executor}`. Activity names and workflow logic are unchanged. Children inherit the entry point's generation without rewriting their existing deterministic IDs.
 
 Historical generated workflow entries remain `dafx-orders`. They select historical agent entity names on every replay, including after phase 2. Selecting routing from `is_replaying`, a current environment variable, or fleet configuration would change recorded dispatch and is not supported. For hand-written orchestrations, the additive `entity_version` on `DurableAIAgentOrchestrationContext` or Functions `get_agent` must be selected from a replay-stable recorded input/version. Keep the default 1 for existing histories.
@@ -53,6 +55,8 @@ host.add_agent(agent)
 New workers now register `dafx-{agent}` alongside `dafx-v2-{agent}` and both generated workflow entry names. There is no state scan or bulk rewrite. A historical entity upgrades on its next successful operation at the **same address**. Reading or staging alone does not write. The normal host entity commit persists the upgrade. A duplicate request whose authoritative completion is imported also commits the upgrade without invoking the agent again.
 
 Conversion receives detached JSON. Failed validation or conversion leaves raw state unchanged and does not decode the operation request or call the agent, tools or providers. An operation that fails before its host commit can be converted again on retry/restart. This does not make model calls or external provider writes exactly once. Existing invocation safety and backend commit semantics still apply.
+
+State budgets include the persisted `dafxSchema` metadata during retention and maintenance checks. In-place conversion measures the final marked snapshot, excluding the export API's temporary ownership-transfer record. The enclosing operation still applies its normal budget before committing any additional state.
 
 ## Supported historical state and evidence
 

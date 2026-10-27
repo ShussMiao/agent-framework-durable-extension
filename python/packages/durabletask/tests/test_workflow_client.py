@@ -43,6 +43,21 @@ def workflow_client(mock_client: Mock) -> DurableWorkflowClient:
 class TestStartWorkflow:
     """Test starting workflow orchestrations."""
 
+    @pytest.mark.parametrize("entity_version", [1, 2])
+    @pytest.mark.parametrize("use_default", [False, True])
+    @pytest.mark.parametrize(
+        "name", ["orders/billing", "WorkflowBuilder-12345678-1234-1234-1234-123456789abc", "x" * 64]
+    )
+    def test_rejects_unregistrable_name_before_submission(
+        self, mock_client: Mock, entity_version: int, use_default: bool, name: str
+    ) -> None:
+        client = DurableWorkflowClient(
+            mock_client, workflow_name=name if use_default else None, entity_version=entity_version
+        )
+        with pytest.raises(ValueError, match="Workflow name"):
+            client.start_workflow("hello", workflow_name=None if use_default else name)
+        mock_client.schedule_new_orchestration.assert_not_called()
+
     def test_start_workflow_schedules_orchestrator(
         self, workflow_client: DurableWorkflowClient, mock_client: Mock
     ) -> None:
@@ -130,6 +145,12 @@ class TestWorkflowNameTargeting:
 
 class TestOwnershipValidation:
     """Opt-in validation that an instance belongs to the targeted workflow."""
+
+    @pytest.mark.parametrize("entity_version", [1, 2])
+    def test_scoped_status_query_rejects_unregistrable_name(self, mock_client: Mock, entity_version: int) -> None:
+        client = DurableWorkflowClient(mock_client, workflow_name="orders/billing", entity_version=entity_version)
+        with pytest.raises(ValueError, match="Workflow name"):
+            client.get_runtime_status("instance-1")
 
     def test_runtime_status_returns_none_for_foreign_instance(self, mock_client: Mock) -> None:
         """A status query scoped to a workflow returns None for a foreign instance."""

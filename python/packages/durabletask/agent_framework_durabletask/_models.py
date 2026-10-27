@@ -314,7 +314,8 @@ class AgentSessionId:
                 (for plain strings).
             entity_version: Explicit serialized address generation. One preserves
                 historical logical names verbatim, including names containing dafx-.
-                Omission recognizes versioned external addresses.
+                Omission recognizes versioned external addresses unless the embedded
+                name matches the supplied historical logical agent name.
 
         Returns:
             AgentSessionId instance
@@ -326,7 +327,8 @@ class AgentSessionId:
         if session_id_string.startswith("@") and "@" in session_id_string[1:]:
             parts = session_id_string[1:].split("@", 1)
             name, version = parts[0], 1 if entity_version is None else entity_version
-            match = None if entity_version == 1 else re.fullmatch(r"dafx-v([0-9]+)-(.+)", name)
+            historical_name = entity_version == 1 or (entity_version is None and agent_name == name)
+            match = None if historical_name else re.fullmatch(r"dafx-v([0-9]+)-(.+)", name)
             if match is not None:
                 version, name = int(match[1]), match[2]
                 AgentSessionId.to_entity_name(name, entity_version=version)

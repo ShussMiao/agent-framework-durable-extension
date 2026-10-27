@@ -26,6 +26,7 @@ from .naming import (
     qualify_subworkflow_request_id,
     split_subworkflow_request_id,
     validate_dts_instance_id,
+    validate_workflow_name,
 )
 from .protocol import validate_workflow_start_input, wrap_workflow_input
 from .serialization import (
@@ -105,6 +106,7 @@ class DurableWorkflowClient:
                 "DurableWorkflowClient(workflow_name=...)) so the client can target the "
                 "right orchestration."
             )
+        validate_workflow_name(name)
         return name
 
     def start_workflow(
@@ -112,9 +114,10 @@ class DurableWorkflowClient:
     ) -> str:
         """Start the workflow orchestration registered by ``configure_workflow``.
 
-        This schedules the orchestration ``dafx-{workflow_name}`` that
-        ``DurableAIAgentWorker.configure_workflow`` auto-registers, so callers do
-        not need to know its internal name.
+        This schedules the validated workflow name with the configured address
+        generation, ``dafx-{workflow_name}`` or ``dafx-v2-{workflow_name}``.
+        ``DurableAIAgentWorker.configure_workflow`` registers that entry point,
+        so callers do not need to know its internal name.
 
         Args:
             input: The initial message/payload for the workflow.
@@ -152,14 +155,15 @@ class DurableWorkflowClient:
         Ownership validation is opt-in: when neither a per-call ``workflow_name``
         nor a constructor default is set there is nothing to validate against, so
         this returns ``True``. When a name is resolvable, the instance's
-        orchestration name must equal ``dafx-{workflow_name}`` (compared
-        case-insensitively, mirroring the Azure Functions host's route-scoping
-        check). This guards against addressing an instance that belongs to a
-        different workflow on the same task hub.
+        orchestration name must equal the configured generation's durable
+        workflow name (compared case-insensitively, mirroring the Azure Functions
+        host's route-scoping check). This guards against addressing an instance
+        that belongs to a different workflow on the same task hub.
         """
         name = workflow_name or self._default_workflow_name
         if not name:
             return True
+        validate_workflow_name(name)
         expected = AgentSessionId.to_entity_name(name, entity_version=self._entity_version)
         actual = getattr(state, "name", None)
         return isinstance(actual, str) and actual.casefold() == expected.casefold()

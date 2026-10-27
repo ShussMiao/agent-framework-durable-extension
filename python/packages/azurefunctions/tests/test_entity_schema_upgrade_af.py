@@ -24,13 +24,14 @@ from agent_framework_durabletask._durable_agent_state import DurableAgentStateRe
 from agent_framework_azurefunctions import AgentFunctionApp
 
 
-def _app(*, legacy: bool = True) -> tuple[AgentFunctionApp, _Client]:
+def _app(*, legacy: bool = True, max_state_bytes: int | None = 1_048_576) -> tuple[AgentFunctionApp, _Client]:
     model = _Client({"value": "original"})
     app = AgentFunctionApp(
         agents=[_NonStreamingAgent(client=model, name="assistant")],
         deployment_mode="two_phase",
         acknowledge_host_filtering=True,
         process_legacy_entities=legacy,
+        max_state_bytes=max_state_bytes,
         enable_health_check=False,
         enable_http_endpoints=False,
     )
@@ -80,6 +81,23 @@ def test_functions_handler_upgrades_original_entity_and_cold_retry_is_noop(versi
     assert cold_model.options == []
 
 
+@pytest.mark.parametrize("headroom", [-1, 0, 1])
+def test_functions_reset_budget_includes_the_committed_schema_marker(headroom: int) -> None:
+    source = DurableAgentState().to_dict()
+    expected = deepcopy(source)
+    expected["dafxSchema"] = {"contract": "dafx.agent-state", "version": "2.0.0"}
+    size = len(json.dumps(expected, allow_nan=False).encode("ascii"))
+    app, model = _app(max_state_bytes=size + headroom)
+    result = _Host(app).entity("@dafx-v2-assistant@original-key", "reset", None, json.dumps(source))
+    if headroom < 0:
+        assert result.results[0].HasField("failure"), result
+        assert json.loads(result.entityState.value) == source
+    else:
+        assert result.results[0].HasField("success"), result
+        assert json.loads(result.entityState.value) == expected
+    assert model.options == []
+
+
 @pytest.mark.parametrize("operation", ["run", "reset", "expire_responses", "delete"])
 @pytest.mark.parametrize("invalid", ["future", "metadata", "ambiguous", "truncation", "session"])
 def test_functions_handler_rejects_unsupported_state_without_changes_or_model_calls(
@@ -103,7 +121,7 @@ def test_functions_handler_rejects_unsupported_state_without_changes_or_model_ca
     result = _Host(app).entity(
         "@dafx-assistant@original-key",
         operation,
-        json.dumps({"message": "hello", "correlationId": "turn-1"}),
+        json.dumps({"message": "hello", "correlationId": "turn-1"}) if operation == "run" else None,
         json.dumps(source),
     )
     assert result.results[0].HasField("failure"), result
@@ -257,6 +275,47 @@ async def test_registered_mcp_handler_selects_address_and_rejects_unknown_genera
     entity = client.signal_entity.call_args.args[0]
     assert entity.entity == ("dafx-web" if supplied == "original-key" else "dafx-v2-web")
     assert poll.call_args.kwargs["entity_instance_id"] == entity
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["http", "mcp"])
+@pytest.mark.parametrize("generation", [1, 2])
+async def test_registered_handlers_preserve_ambiguous_historical_logical_names(
+    monkeypatch: pytest.MonkeyPatch, protocol: str, generation: int
+) -> None:
+    app, _ = _app()
+    app.add_agent(
+        _NonStreamingAgent(client=_Client(None), name="dafx-v2-web"),
+        enable_http_endpoint=protocol == "http",
+        enable_mcp_tool_trigger=protocol == "mcp",
+    )
+    prefix = "http" if protocol == "http" else "mcptool"
+    registered = next(item for item in app.get_functions() if item.get_function_name() == f"{prefix}-dafx_v2_web")
+    handler = getattr(registered.get_user_function(), "client_function", None)
+    assert callable(handler)
+    client = Mock()
+    client.signal_entity = AsyncMock()
+    supplied = "@dafx-v2-web@original-key" if generation == 1 else "@dafx-v2-dafx-v2-web@original-key"
+    poll = AsyncMock(return_value={"status": "success", "response": "hello"})
+    monkeypatch.setattr(app, "_get_response_from_entity", poll)
+    if protocol == "http":
+        response = await handler(
+            func.HttpRequest(
+                method="POST",
+                url="http://localhost/agents/dafx-v2-web/run",
+                headers={"content-type": "application/json"},
+                params={"sessionId": supplied, "waitForResponse": "false"},
+                body=json.dumps({"message": "hello"}).encode(),
+            ),
+            client,
+        )
+        assert response.status_code == 202
+        assert json.loads(response.get_body())["sessionId"] == supplied
+    else:
+        assert await handler(json.dumps({"arguments": {"query": "hello", "sessionId": supplied}}), client) == "hello"
+    target = client.signal_entity.call_args.args[0]
+    assert target.entity == ("dafx-dafx-v2-web" if generation == 1 else "dafx-v2-dafx-v2-web")
+    assert target.key == "original-key"
 
 
 @pytest.mark.parametrize("entity_version", [1, 2])

@@ -8,12 +8,15 @@ before accepting historical entity names.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from ._retention import resolve_state_budget
 from ._shared_state_validation import validate_schema_metadata, validate_shared_state
+from ._state_capacity import StateCapacityError
 from ._state_migration import migrate_legacy_state, state_snapshot_digest
 
 _METADATA = "dafxSchema"
@@ -147,6 +150,7 @@ def agent_entity_schema_registry(
         raise ValueError("Legacy evidence requires process_legacy_entities=True.")
 
     def convert(source: dict[str, Any], context: EntityMigrationContext) -> dict[str, Any]:
+        budget = resolve_state_budget(context.max_state_bytes)
         evidence = {} if legacy_evidence_provider is None else dict(legacy_evidence_provider(deepcopy(source), context))
         if evidence.keys() - {"delivery_evidence", "completion_evidence"}:
             raise ValueError("Legacy evidence provider returned unsupported evidence fields.")
@@ -158,13 +162,17 @@ def agent_entity_schema_registry(
             migration_id=digest,
             ownership_transfer_id="in-place",
             delivery_window_seconds=context.delivery_window_seconds,
-            max_state_bytes=context.max_state_bytes,
             completion_policy="historical" if "completion_evidence" in evidence else "cutover",
             **evidence,
         ).to_dict()
         # The export API's transfer binding describes a different destination.
         # In-place conversion retains the existing address and session identity.
         del migrated["data"]["migration"]
+        migrated[_METADATA] = {"contract": _CONTRACT, "version": _CURRENT}
+        if budget is not None:
+            size = len(json.dumps(migrated, allow_nan=False))
+            if size > budget:
+                raise StateCapacityError(size_bytes=size, max_state_bytes=budget, floor_bytes=size, target_bytes=budget)
         return migrated
 
     versions = (_CURRENT, *_LEGACY) if process_legacy_entities else (_CURRENT,)

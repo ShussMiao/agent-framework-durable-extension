@@ -30,6 +30,7 @@ from agent_framework_durabletask import (
     EntitySchemaRegistry,
     LegacyDurableAgentState,
     RunRequest,
+    StateCapacityError,
     agent_entity_schema_registry,
     read_agent_state,
     state_snapshot_digest,
@@ -39,16 +40,17 @@ from agent_framework_durabletask._durable_agent_state import DurableAgentStateRe
 from agent_framework_durabletask._durable_agent_state import DurableAgentStateResponse as LegacyResponse
 
 
-def _native(*, legacy: bool = True, evidence: Any = None) -> tuple[Any, RecordingChatClient]:
-    worker = DurableTaskSchedulerWorker(
-        host_address="localhost:1", taskhub="test", token_credential=None
-    )
+def _native(
+    *, legacy: bool = True, evidence: Any = None, max_state_bytes: int | None = 1_048_576
+) -> tuple[Any, RecordingChatClient]:
+    worker = DurableTaskSchedulerWorker(host_address="localhost:1", taskhub="test", token_credential=None)
     model = RecordingChatClient()
     DurableAIAgentWorker(
         worker,
         deployment_mode="two_phase",
         process_legacy_entities=legacy,
         legacy_evidence_provider=evidence,
+        max_state_bytes=max_state_bytes,
     ).add_agent(NonStreamingAgent(client=model, name="assistant"))
     return worker, model
 
@@ -66,7 +68,11 @@ def _batch(
         instanceId=f"@{name}@original-key",
         entityState=helpers.get_string_value(None if source is None else json.dumps(source)),
         operations=[
-            pb.OperationRequest(operation=operation, requestId="operation-1", input=helpers.get_string_value(wire))
+            pb.OperationRequest(
+                operation=operation,
+                requestId="operation-1",
+                input=helpers.get_string_value(wire if operation == "run" else None),
+            )
         ],
     )
     stub = Mock()
@@ -120,6 +126,63 @@ def test_successful_processing_stamps_current_schema_without_address_replacement
     state = json.loads(result.entityState.value)
     assert state["data"]["session"]["session_id"] == "@dafx-v2-assistant@original-key"
     assert state["schemaVersion"] == state["dafxSchema"]["version"] == "2.0.0"
+
+
+@pytest.mark.parametrize("source", [None, DurableAgentState().to_dict()])
+@pytest.mark.parametrize("headroom", [-1, 0, 1])
+def test_reset_budget_measures_the_complete_marked_sdk_commit(source: Any, headroom: int) -> None:
+    expected = DurableAgentState().to_dict()
+    expected["dafxSchema"] = {"contract": "dafx.agent-state", "version": "2.0.0"}
+    size = len(json.dumps(expected, allow_nan=False).encode("ascii"))
+    worker, model = _native(max_state_bytes=size + headroom)
+    result = _batch(worker, source, "reset", name="dafx-v2-assistant")
+    if headroom < 0:
+        assert result.results[0].HasField("failure"), result
+        if source is None:
+            assert not result.entityState.value
+        else:
+            assert json.loads(result.entityState.value) == source
+    else:
+        assert result.results[0].HasField("success"), result
+        assert json.loads(result.entityState.value) == expected
+    assert not model.received_messages
+
+
+@pytest.mark.parametrize("source", [None, DurableAgentState().to_dict()])
+def test_run_retention_measures_the_complete_marked_sdk_commit(source: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_framework_durabletask import _entities
+
+    measured: list[dict[str, Any]] = []
+    enforce = _entities.enforce_budget
+
+    async def observe(state: DurableAgentState, **kwargs: Any) -> int:
+        measured.append(deepcopy(state.to_dict()))
+        return await enforce(state, **kwargs)
+
+    monkeypatch.setattr(_entities, "enforce_budget", observe)
+    worker, _ = _native()
+    result = _batch(worker, source, name="dafx-v2-assistant")
+    assert result.results[0].HasField("success"), result
+    assert measured == [json.loads(result.entityState.value)]
+
+
+@pytest.mark.parametrize("headroom", [-1, 0, 1])
+def test_in_place_conversion_budget_excludes_export_binding_and_includes_schema_marker(headroom: int) -> None:
+    source = _legacy_with_response()
+    before = deepcopy(source)
+    registry = agent_entity_schema_registry(process_legacy_entities=True)
+    expected = registry.upgrade(source, EntityMigrationContext("dafx-assistant", "original-key"))
+    assert "migration" not in expected["data"]
+    assert expected["dafxSchema"] == {"contract": "dafx.agent-state", "version": "2.0.0"}
+    size = len(json.dumps(expected, allow_nan=False).encode("ascii"))
+    context = EntityMigrationContext("dafx-assistant", "original-key", max_state_bytes=size + headroom)
+    if headroom < 0:
+        with pytest.raises(StateCapacityError) as caught:
+            registry.upgrade(source, context)
+        assert caught.value.size_bytes == size
+    else:
+        assert registry.upgrade(source, context) == expected
+    assert source == before
 
 
 @pytest.mark.parametrize(
@@ -463,9 +526,7 @@ def test_generated_workflow_replays_historical_dispatch_and_versions_only_new_st
     workflow = WorkflowBuilder(name="schema-workflow", start_executor=agent, output_from=[agent]).build()
     baseline = TaskHubGrpcWorker(channel=Mock())
     DurableAIAgentWorker(baseline, deployment_mode="isolated_v2").configure_workflow(workflow)
-    upgraded = DurableTaskSchedulerWorker(
-        host_address="localhost:1", taskhub="test", token_credential=None
-    )
+    upgraded = DurableTaskSchedulerWorker(host_address="localhost:1", taskhub="test", token_credential=None)
     DurableAIAgentWorker(upgraded, deployment_mode="two_phase", process_legacy_entities=True).configure_workflow(
         workflow
     )
