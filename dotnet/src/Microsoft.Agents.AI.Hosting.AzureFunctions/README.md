@@ -122,11 +122,11 @@ throw `DurableAgentTerminalException` and `DurableAgentResultUnavailableExceptio
 the MCP host to report as tool failures. They are never returned as successful text or JSON responses.
 Cancellation is propagated to the durable client.
 
-These endpoints use the same mailbox-aware client as `AgentRunHandle` and durable proxies. This does
-not authorize schema 2.0 writes: the [shared rollout gates](../Microsoft.Agents.AI.DurableTask/State/README.md)
-must be satisfied before a producer can be activated; this draft has only disabled internal test gates.
-Existing legacy response-format choices do not change
-the entity-state version.
+These endpoints use the same mailbox-aware client as `AgentRunHandle` and durable proxies. New sessions
+route to `dafx-v2-{agent}` entities and write schema 2.0.0 state by default, while explicit legacy session IDs
+(`@dafx-{agent}@{key}`) route to `dafx-{agent}` and are upgraded in-place to schema 2.0.0 when
+`DurableAgentsOptions.ProcessLegacyEntities` is enabled in Phase 2. Response-format choices (`"text"` or `"json"`)
+do not change the entity-state version.
 
 ### Orchestrating hosted agents
 

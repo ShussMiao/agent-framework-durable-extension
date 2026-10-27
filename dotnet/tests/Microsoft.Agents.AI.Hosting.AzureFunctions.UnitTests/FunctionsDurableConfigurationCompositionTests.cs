@@ -12,6 +12,7 @@ using Microsoft.Azure.Functions.Worker.Middleware;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 
 namespace Microsoft.Agents.AI.Hosting.AzureFunctions.UnitTests;
@@ -318,6 +319,101 @@ public sealed class FunctionsDurableConfigurationCompositionTests
         Assert.Contains("dafx-WorkflowOnlyDualTriggerAgent", functions);
         Assert.DoesNotContain("http-WorkflowOnlyDualTriggerAgent", functions);
         AssertNoDuplicates(functions);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ConfigureDurableOptions_CrossKindCollisionBetweenWorkflowV2WriterAndAgentWriter_ThrowsInvalidOperationException(
+        bool workflowsFirst)
+    {
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() =>
+            GenerateFunctionNames(builder =>
+            {
+                if (workflowsFirst)
+                {
+                    builder.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(BuildWorkflow("v2-Writer")));
+                    builder.ConfigureDurableAgents(agents => agents.AddAIAgent(new TestAgent("Writer", "desc")));
+                }
+                else
+                {
+                    builder.ConfigureDurableAgents(agents => agents.AddAIAgent(new TestAgent("Writer", "desc")));
+                    builder.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(BuildWorkflow("v2-Writer")));
+                }
+            }));
+
+        Assert.Contains("dafx-v2-Writer", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ConfigureDurableOptions_CrossKindCollisionBetweenActivityV2WriterAndAgentWriter_ThrowsInvalidOperationException(
+        bool workflowsFirst)
+    {
+        Workflow workflow = new WorkflowBuilder(new FunctionExecutor<string>("v2-Writer", (_, _, _) => default))
+            .WithName("EditorialWorkflow")
+            .Build();
+
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() =>
+            GenerateFunctionNames(builder =>
+            {
+                if (workflowsFirst)
+                {
+                    builder.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(workflow));
+                    builder.ConfigureDurableAgents(agents => agents.AddAIAgent(new TestAgent("Writer", "desc")));
+                }
+                else
+                {
+                    builder.ConfigureDurableAgents(agents => agents.AddAIAgent(new TestAgent("Writer", "desc")));
+                    builder.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(workflow));
+                }
+            }));
+
+        Assert.Contains("dafx-v2-Writer", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void MetadataTransformers_DirectCrossKindCollision_ThrowsInsteadOfSilentlyOmittingTrigger(
+        bool workflowTransformerFirst)
+    {
+        FunctionsDurableOptions workflowOptions = new();
+        workflowOptions.Workflows.AddWorkflow(BuildWorkflow("v2-Writer"));
+        DurableWorkflowsFunctionMetadataTransformer workflowTransformer = new(
+            NullLogger<DurableWorkflowsFunctionMetadataTransformer>.Instance,
+            workflowOptions);
+
+        Dictionary<string, Func<IServiceProvider, AIAgent>> agents = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Writer"] = _ => new TestAgent("Writer", "desc"),
+        };
+        DefaultFunctionsAgentOptionsProvider optionsProvider = new(
+            new Dictionary<string, FunctionsAgentOptions>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Writer"] = new() { HttpTrigger = { IsEnabled = true } },
+            });
+        using ServiceProvider emptyServices = new ServiceCollection().BuildServiceProvider();
+        DurableAgentFunctionMetadataTransformer agentTransformer = new(
+            agents,
+            NullLogger<DurableAgentFunctionMetadataTransformer>.Instance,
+            emptyServices,
+            optionsProvider);
+
+        List<IFunctionMetadata> metadata = [];
+        if (workflowTransformerFirst)
+        {
+            workflowTransformer.Transform(metadata);
+            InvalidOperationException ex = Assert.Throws<InvalidOperationException>(() => agentTransformer.Transform(metadata));
+            Assert.Contains("dafx-v2-Writer", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        else
+        {
+            agentTransformer.Transform(metadata);
+            InvalidOperationException ex = Assert.Throws<InvalidOperationException>(() => workflowTransformer.Transform(metadata));
+            Assert.Contains("dafx-v2-Writer", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     private static void AssertNoDuplicates(List<string> functionNames)

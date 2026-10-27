@@ -929,8 +929,8 @@ public sealed class AgentEntityPublicRetentionTests
             .Get(Options.DefaultName);
         Assert.Equal(["dafx-v2-agent"], phase1Filters.Entities.Select(e => e.Name));
 
-        // Verify calling an unregistered agent from an orchestration fails immediately with AgentNotRegisteredException
-        // instead of hanging when work-item filtering is enabled.
+        // By default, a worker with local agents registered still dispatches calls to remote agents hosted on other workers.
+        // When ValidateLocalAgentRegistration is opted in, calling an unregistered agent fails immediately with AgentNotRegisteredException.
         DurableTaskShimFactory phase1OrchShimFactory = new(
             new DurableTaskWorkerOptions
             {
@@ -938,6 +938,29 @@ public sealed class AgentEntityPublicRetentionTests
                 EnableEntitySupport = true,
             },
             NullLoggerFactory.Instance);
+        global::DurableTask.Core.TaskOrchestration remoteDispatchShim = phase1OrchShimFactory.CreateOrchestration<string?, string>(
+            new TaskName("RemoteAgentOrchestrator"),
+            async (ctx, _) => (await ctx.GetAgent("RemoteAgent").RunAsync("Hello")).Text);
+        global::DurableTask.Core.OrchestrationRuntimeState remoteDispatchState = new(
+        [
+            new OrchestratorStartedEvent(-1) { Timestamp = s_now.UtcDateTime },
+            new ExecutionStartedEvent(-1, "null")
+            {
+                Name = "RemoteAgentOrchestrator",
+                OrchestrationInstance = new global::DurableTask.Core.OrchestrationInstance { InstanceId = "remote-orch-1", ExecutionId = "exec-remote" },
+            },
+        ]);
+        global::DurableTask.Core.OrchestratorExecutionResult remoteDispatchResult = new global::DurableTask.Core.TaskOrchestrationExecutor(
+            remoteDispatchState,
+            remoteDispatchShim,
+            global::DurableTask.Core.BehaviorOnContinueAsNew.Carryover,
+            new TaskOrchestrationEntityParameters(),
+            global::DurableTask.Core.ErrorPropagationMode.UseFailureDetails).Execute();
+        SendEventOrchestratorAction remoteCallAction = Assert.IsType<SendEventOrchestratorAction>(
+            Assert.Single(remoteDispatchResult.Actions));
+        Assert.Equal("dafx-v2-remoteagent", EntityId.FromString(remoteCallAction.Instance!.InstanceId).Name);
+
+        phase1Provider.GetRequiredService<DurableAgentsOptions>().ValidateLocalAgentRegistration = true;
         global::DurableTask.Core.TaskOrchestration unregisteredOrchShim = phase1OrchShimFactory.CreateOrchestration<string?, string>(
             new TaskName("UnregisteredAgentOrchestrator"),
             async (ctx, _) => (await ctx.GetAgent("NonExistentAgent").RunAsync("Hello")).Text);

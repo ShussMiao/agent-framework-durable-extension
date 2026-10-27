@@ -237,6 +237,57 @@ public sealed class DurableConfigurationCompositionTests
         Assert.Equal(["dafx-v2-PrimaryAssistant"], resolved.Entities.Select(e => e.Name));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ConfigureDurableOptions_RejectsCrossKindCollisionBetweenWorkflowV2PrefixAndAgent(bool workflowFirst)
+    {
+        ServiceCollection services = new();
+
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() =>
+        {
+            if (workflowFirst)
+            {
+                services.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(BuildWorkflow("v2-Writer")));
+                services.ConfigureDurableAgents(agents => agents.AddAIAgent(new CompositionTestAgent("Writer")));
+            }
+            else
+            {
+                services.ConfigureDurableAgents(agents => agents.AddAIAgent(new CompositionTestAgent("Writer")));
+                services.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(BuildWorkflow("v2-Writer")));
+            }
+        });
+
+        Assert.Contains("dafx-v2-Writer", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ConfigureDurableOptions_RejectsCrossKindCollisionBetweenActivityV2PrefixAndAgent(bool workflowFirst)
+    {
+        ServiceCollection services = new();
+        Workflow workflowWithCollidingActivity = new WorkflowBuilder(new FunctionExecutor<string>("v2-Writer", (_, _, _) => default))
+            .WithName("PublishingWorkflow")
+            .Build();
+
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() =>
+        {
+            if (workflowFirst)
+            {
+                services.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(workflowWithCollidingActivity));
+                services.ConfigureDurableAgents(agents => agents.AddAIAgent(new CompositionTestAgent("Writer")));
+            }
+            else
+            {
+                services.ConfigureDurableAgents(agents => agents.AddAIAgent(new CompositionTestAgent("Writer")));
+                services.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(workflowWithCollidingActivity));
+            }
+        });
+
+        Assert.Contains("dafx-v2-Writer", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static DurableOptions GetRegisteredOptions(IServiceCollection services)
     {
         ServiceDescriptor descriptor = Assert.Single(

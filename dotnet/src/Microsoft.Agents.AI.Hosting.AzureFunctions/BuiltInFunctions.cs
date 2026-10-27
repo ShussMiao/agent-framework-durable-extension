@@ -1219,7 +1219,8 @@ internal static class BuiltInFunctions
         TryCombineSessionIdAliases(sessionId, null, legacyThreadId, out result);
 
     internal static string FormatResponseSessionId(AgentSessionId sessionId) =>
-        sessionId.EntityVersion == AgentSessionId.CurrentEntityVersion
+        sessionId.EntityVersion == AgentSessionId.CurrentEntityVersion &&
+        !sessionId.Key.StartsWith('@')
             ? sessionId.Key
             : sessionId.ToString();
 

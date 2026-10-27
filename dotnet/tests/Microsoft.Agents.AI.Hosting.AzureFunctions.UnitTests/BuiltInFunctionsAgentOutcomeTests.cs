@@ -305,6 +305,7 @@ public sealed class BuiltInFunctionsAgentOutcomeTests
     [Theory]
     [InlineData("@dafx-TestAgent@legacy-key", "dafx-testagent", "legacy-key", "@dafx-testagent@legacy-key", true)]
     [InlineData("@dafx-v2-TestAgent@v2-key", "dafx-v2-testagent", "v2-key", "v2-key", false)]
+    [InlineData("@dafx-v2-TestAgent@@dafx-testagent@old-key", "dafx-v2-testagent", "@dafx-testagent@old-key", "@dafx-v2-testagent@@dafx-testagent@old-key", false)]
     [InlineData("plain-key", "dafx-v2-testagent", "plain-key", "plain-key", false)]
     public async Task HttpAndMcp_FullOrBareSessionId_RoutesToExpectedEntityAndReturnsExpectedSessionIdAsync(
         string suppliedSessionId,
@@ -347,6 +348,95 @@ public sealed class BuiltInFunctionsAgentOutcomeTests
         mcpFixture.Entities.Verify(
             c => c.SignalEntityAsync(
                 new EntityInstanceId(expectedEntityName, expectedKey),
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<SignalEntityOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task HttpAndMcp_AtPrefixedCurrentVersionSessionKey_RoundTripsWithoutSwitchingToLegacyEntityAsync()
+    {
+        const string SuppliedSessionId = "@dafx-v2-TestAgent@@dafx-testagent@old-key";
+        const string ExpectedReturnedSessionId = "@dafx-v2-testagent@@dafx-testagent@old-key";
+        const string ExpectedKey = "@dafx-testagent@old-key";
+        EntityInstanceId expectedV2EntityId = new("dafx-v2-testagent", ExpectedKey);
+
+        AgentSessionId resolvedTurn1 = BuiltInFunctions.ResolveAgentSessionId(AgentName, SuppliedSessionId, "fallback");
+        Assert.Equal(AgentSessionId.CurrentEntityVersion, resolvedTurn1.EntityVersion);
+        Assert.False(resolvedTurn1.IsLegacyEntity);
+        Assert.Equal(ExpectedKey, resolvedTurn1.Key);
+        Assert.Equal(ExpectedReturnedSessionId, BuiltInFunctions.FormatResponseSessionId(resolvedTurn1));
+
+        AgentSessionId resolvedTurn2 = BuiltInFunctions.ResolveAgentSessionId(
+            AgentName,
+            BuiltInFunctions.FormatResponseSessionId(resolvedTurn1),
+            "fallback");
+        Assert.Equal(AgentSessionId.CurrentEntityVersion, resolvedTurn2.EntityVersion);
+        Assert.False(resolvedTurn2.IsLegacyEntity);
+        Assert.Equal(ExpectedKey, resolvedTurn2.Key);
+        Assert.Equal(expectedV2EntityId, resolvedTurn2.ToEntityId());
+
+        // 1. HTTP 200 OK round-trip using returned sessionId
+        using EndpointFixture httpTurn1 = new(sessionIdOverride: SuppliedSessionId);
+        HttpResponseData httpResponse1 = await BuiltInFunctions.RunAgentHttpAsync(
+            httpTurn1.Request, httpTurn1.Client.Object, httpTurn1.Context);
+        string returnedHttpSessionId = ReadBody(httpResponse1).RootElement.GetProperty("sessionId").GetString()!;
+        Assert.Equal(ExpectedReturnedSessionId, returnedHttpSessionId);
+        Assert.Equal(ExpectedReturnedSessionId, Assert.Single(httpResponse1.Headers.GetValues("x-ms-session-id")));
+
+        using EndpointFixture httpTurn2 = new(sessionIdOverride: returnedHttpSessionId);
+        HttpResponseData httpResponse2 = await BuiltInFunctions.RunAgentHttpAsync(
+            httpTurn2.Request, httpTurn2.Client.Object, httpTurn2.Context);
+        Assert.Equal(HttpStatusCode.OK, httpResponse2.StatusCode);
+        httpTurn2.Entities.Verify(
+            c => c.SignalEntityAsync(
+                expectedV2EntityId,
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<SignalEntityOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // 2. HTTP 202 Accepted round-trip using returned sessionId
+        using EndpointFixture acceptedTurn1 = new(waitForResponse: false, sessionIdOverride: SuppliedSessionId);
+        HttpResponseData acceptedResponse1 = await BuiltInFunctions.RunAgentHttpAsync(
+            acceptedTurn1.Request, acceptedTurn1.Client.Object, acceptedTurn1.Context);
+        string returnedAcceptedSessionId = ReadBody(acceptedResponse1).RootElement.GetProperty("sessionId").GetString()!;
+        Assert.Equal(ExpectedReturnedSessionId, returnedAcceptedSessionId);
+
+        using EndpointFixture acceptedTurn2 = new(waitForResponse: false, sessionIdOverride: returnedAcceptedSessionId);
+        HttpResponseData acceptedResponse2 = await BuiltInFunctions.RunAgentHttpAsync(
+            acceptedTurn2.Request, acceptedTurn2.Client.Object, acceptedTurn2.Context);
+        Assert.Equal(HttpStatusCode.Accepted, acceptedResponse2.StatusCode);
+        acceptedTurn2.Entities.Verify(
+            c => c.SignalEntityAsync(
+                expectedV2EntityId,
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<SignalEntityOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // 3. MCP JSON round-trip using returned session_id
+        using EndpointFixture mcpTurn1 = new();
+        ToolInvocationContext mcpContext1 = CreateToolContext("json");
+        mcpContext1.Arguments!["sessionId"] = SuppliedSessionId;
+        string? mcpResponse1 = await BuiltInFunctions.RunMcpToolAsync(
+            mcpContext1, mcpTurn1.Client.Object, mcpTurn1.Context);
+        string returnedMcpSessionId = JsonDocument.Parse(Assert.IsType<string>(mcpResponse1))
+            .RootElement.GetProperty("session_id").GetString()!;
+        Assert.Equal(ExpectedReturnedSessionId, returnedMcpSessionId);
+
+        using EndpointFixture mcpTurn2 = new();
+        ToolInvocationContext mcpContext2 = CreateToolContext("json");
+        mcpContext2.Arguments!["sessionId"] = returnedMcpSessionId;
+        _ = await BuiltInFunctions.RunMcpToolAsync(
+            mcpContext2, mcpTurn2.Client.Object, mcpTurn2.Context);
+        mcpTurn2.Entities.Verify(
+            c => c.SignalEntityAsync(
+                expectedV2EntityId,
                 It.IsAny<string>(),
                 It.IsAny<object>(),
                 It.IsAny<SignalEntityOptions>(),

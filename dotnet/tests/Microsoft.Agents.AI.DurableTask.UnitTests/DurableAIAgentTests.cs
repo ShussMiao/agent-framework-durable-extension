@@ -510,6 +510,54 @@ public sealed class DurableAIAgentTests
         Assert.Equal(expectedEntityInstanceId, secondEntityCall.Instance!.InstanceId);
     }
 
+    [Fact]
+    public void RunAsync_WorkerWithLocalAgentRegistered_DispatchesRemoteAgentCallByDefault()
+    {
+        DurableAgentsOptions agentOptions = new();
+        agentOptions.AddAIAgentFactory("LocalAgentA", _ => throw new NotSupportedException());
+        DurableDataConverter converter = new(agentOptions);
+        DurableTaskShimFactory shimFactory = new(
+            new DurableTaskWorkerOptions { DataConverter = converter, EnableEntitySupport = true },
+            NullLoggerFactory.Instance);
+        DateTime startTime = new(2026, 10, 27, 12, 0, 0, DateTimeKind.Utc);
+
+        static async Task<string?> MixedHostingOrchestratorAsync(TaskOrchestrationContext context)
+        {
+            DurableAIAgent remoteAgent = context.GetAgent("RemoteAgentB");
+            AgentSession remoteSession = await remoteAgent.CreateSessionAsync();
+            AgentResponse response = await remoteAgent.RunAsync("Hello remote worker", remoteSession);
+            return response.Text;
+        }
+
+        global::DurableTask.Core.TaskOrchestration shim = shimFactory.CreateOrchestration<string?, string>(
+            new TaskName("MixedHostingOrchestrator"),
+            (ctx, _) => MixedHostingOrchestratorAsync(ctx));
+        global::DurableTask.Core.OrchestrationRuntimeState state = new(
+        [
+            new OrchestratorStartedEvent(-1) { Timestamp = startTime },
+            new ExecutionStartedEvent(-1, "null")
+            {
+                Name = "MixedHostingOrchestrator",
+                OrchestrationInstance = new global::DurableTask.Core.OrchestrationInstance
+                {
+                    InstanceId = "orch-mixed-hosting",
+                    ExecutionId = "exec-1",
+                },
+            },
+        ]);
+
+        global::DurableTask.Core.OrchestratorExecutionResult step = new global::DurableTask.Core.TaskOrchestrationExecutor(
+            state,
+            shim,
+            global::DurableTask.Core.BehaviorOnContinueAsNew.Carryover,
+            new TaskOrchestrationEntityParameters()).Execute();
+
+        SendEventOrchestratorAction entityCall = Assert.IsType<SendEventOrchestratorAction>(
+            Assert.Single(step.Actions));
+        EntityId targetEntityId = EntityId.FromString(entityCall.Instance!.InstanceId);
+        Assert.Equal("dafx-v2-remoteagentb", targetEntityId.Name);
+    }
+
     private sealed class TrackingSynchronizationContext : SynchronizationContext, IDisposable
     {
         private readonly BlockingCollection<(SendOrPostCallback Callback, object? State)> _work = new();

@@ -26,9 +26,22 @@ public sealed class DurableAgentsOptions
     // workflow references it is an implementation detail of that workflow, not a separately addressable agent.
     private readonly HashSet<string> _workflowRegisteredAgents = new(StringComparer.OrdinalIgnoreCase);
 
-    internal DurableAgentsOptions()
+    internal DurableAgentsOptions(DurableOptions? parentOptions = null)
     {
+        this.ParentOptions = parentOptions;
     }
+
+    /// <summary>
+    /// Gets the parent <see cref="DurableOptions"/> container, if available.
+    /// </summary>
+    internal DurableOptions? ParentOptions { get; }
+
+    /// <summary>
+    /// Gets or sets whether orchestration-dispatched agent requests validate that the target agent is registered
+    /// in this local <see cref="DurableAgentsOptions"/> instance before serialization. Defaults to <see langword="false"/>
+    /// so workers hosting local agents can still invoke remote agents hosted on other workers in the same Task Hub.
+    /// </summary>
+    internal bool ValidateLocalAgentRegistration { get; set; }
 
     /// <summary>
     /// Gets or sets whether workers register and process legacy v1 agent entities (<c>dafx-{agent}</c>)
@@ -289,6 +302,7 @@ public sealed class DurableAgentsOptions
     internal void ValidateConfiguration()
     {
         _ = this.GetRetentionSettings();
+        this.ParentOptions?.Workflows.ValidateAllRegisteredCollisions(this.ProcessLegacyEntities);
     }
 
     private static bool ResolveProcessLegacyEntities(
@@ -452,6 +466,8 @@ public sealed class DurableAgentsOptions
         {
             throw new ArgumentException($"An agent with name '{name}' has already been registered.", paramName);
         }
+
+        this.ParentOptions?.Workflows.ValidateAgentNameCollisions(name, this.ProcessLegacyEntities);
 
         this._agentFactories[name] = factory;
         this._workflowRegisteredAgents.Remove(name);
