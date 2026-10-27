@@ -233,16 +233,21 @@ public sealed class DurableAIAgent : AIAgent
 
         try
         {
+            bool wasReplaying = this._context.IsReplaying;
             AgentResponse response = await this._context.Entities.CallEntityAsync<AgentResponse>(
                 durableSession.SessionId,
                 nameof(AgentEntity.Run),
                 request);
             if (durableSession.CanAdoptReplayedEntityVersion)
             {
-                if (this._context.IsReplaying &&
-                    DurableAgentJsonUtilities.GetResponseEntityVersion(response) is int replayedEntityVersion)
+                if (DurableAgentJsonUtilities.GetResponseEntityVersion(response) is int responseEntityVersion &&
+                    (wasReplaying || this._context.IsReplaying || responseEntityVersion != AgentSessionId.CurrentEntityVersion))
                 {
-                    durableSession.LockEntityVersion(replayedEntityVersion);
+                    durableSession.LockEntityVersion(responseEntityVersion);
+                }
+                else if (wasReplaying)
+                {
+                    durableSession.LockEntityVersion(1);
                 }
                 else if (!this._context.IsReplaying)
                 {

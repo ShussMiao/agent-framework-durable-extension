@@ -15,6 +15,13 @@ internal static class FunctionMetadataFactory
     /// <summary>
     /// Creates function metadata for a current-version entity trigger function (<c>dafx-v2-{name}</c>).
     /// </summary>
+    /// <remarks>
+    /// Side-by-side rolling upgrades across Azure Functions hosts require host-side work-item filtering
+    /// (<c>"workItemFilteringEnabled": true</c> under <c>extensions.durableTask.storageProvider</c> in <c>host.json</c>
+    /// with <c>Microsoft.Azure.Functions.Worker.Extensions.DurableTask.AzureManaged</c> <c>1.10.0+</c> /
+    /// <c>Microsoft.Azure.WebJobs.Extensions.DurableTask.AzureManaged</c> <c>1.8.0+</c>), or an offline cutover
+    /// if host filtering is not enabled.
+    /// </remarks>
     /// <param name="name">The base name used to derive the entity function name.</param>
     /// <returns>A <see cref="DefaultFunctionMetadata"/> configured for an entity trigger.</returns>
     internal static DefaultFunctionMetadata CreateEntityTrigger(string name) =>

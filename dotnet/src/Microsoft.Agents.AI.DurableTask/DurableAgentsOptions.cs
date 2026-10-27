@@ -42,6 +42,15 @@ public sealed class DurableAgentsOptions
     /// leaving existing <c>dafx-{agent}</c> sessions on the base entity queue for v1 workers.
     /// </para>
     /// <para>
+    /// For Azure Functions hosts sharing a Task Hub during a rolling upgrade, distinct entity trigger names
+    /// require host-side work-item filtering so an unfiltered host does not receive entity work for a trigger
+    /// generation it does not register. Reference <c>Microsoft.Azure.Functions.Worker.Extensions.DurableTask</c>
+    /// <c>1.19.0+</c> and <c>Microsoft.Azure.Functions.Worker.Extensions.DurableTask.AzureManaged</c> <c>1.10.0+</c>
+    /// (which brings <c>Microsoft.Azure.WebJobs.Extensions.DurableTask.AzureManaged</c> <c>1.8.0+</c>) and set
+    /// <c>"workItemFilteringEnabled": true</c> under <c>extensions.durableTask.storageProvider</c> in <c>host.json</c>,
+    /// or perform an offline-only cutover when host-side work-item filtering is not enabled.
+    /// </para>
+    /// <para>
     /// Enable this setting (<see langword="true"/> or <c>DURABLE_AGENTS_PROCESS_LEGACY_ENTITIES=true</c>)
     /// in Phase 2 after all legacy v1 workers have been stopped. V2 workers will then register and filter
     /// both <c>dafx-v2-{agent}</c> and <c>dafx-{agent}</c> entities and upgrade loaded 1.x state in-place

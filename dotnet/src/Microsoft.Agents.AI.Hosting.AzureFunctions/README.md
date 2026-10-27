@@ -61,6 +61,36 @@ app.Run();
 
 By default, each agent can be invoked via a built-in HTTP trigger function at the route `http[s]://[host]/api/agents/{agentName}/run`.
 
+### Host-side work-item filtering and rolling upgrades
+
+New sessions target `dafx-v2-{agent}` entity triggers by default, while `DurableAgentsOptions.ProcessLegacyEntities`
+(or `DURABLE_AGENTS_PROCESS_LEGACY_ENTITIES=true`) additionally registers `dafx-{agent}` triggers in Phase 2 after
+v1 workers are stopped. On Azure Functions, distinct entity trigger names only isolate dispatch across side-by-side
+hosts when host-side work-item filtering is enabled. Reference `Microsoft.Azure.Functions.Worker` `2.52.0+`,
+`Microsoft.Azure.Functions.Worker.Extensions.DurableTask` `1.19.0+`, and
+`Microsoft.Azure.Functions.Worker.Extensions.DurableTask.AzureManaged` `1.10.0+` (which brings
+`Microsoft.Azure.WebJobs.Extensions.DurableTask.AzureManaged` `1.8.0+`), and set `"workItemFilteringEnabled": true`
+in `host.json`:
+
+```json
+{
+  "version": "2.0",
+  "extensions": {
+    "durableTask": {
+      "hubName": "default",
+      "storageProvider": {
+        "type": "AzureManaged",
+        "connectionStringName": "DURABLE_TASK_SCHEDULER_CONNECTION_STRING",
+        "workItemFilteringEnabled": true
+      }
+    }
+  }
+}
+```
+
+When host-side work-item filtering is not enabled on the participating Functions hosts, use an offline rollout
+instead of running v1 and v2 Functions hosts concurrently against the same Task Hub.
+
 ### Agent completion outcomes
 
 HTTP fire-and-forget calls return `202 Accepted`; this acknowledges dispatch, not successful execution.

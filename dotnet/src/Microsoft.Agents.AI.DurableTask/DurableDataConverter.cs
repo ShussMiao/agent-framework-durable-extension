@@ -88,7 +88,8 @@ internal sealed class DurableDataConverter(DurableAgentsOptions? agentOptions = 
         }
 
         if (value is RunRequest { TargetAgentName: string targetAgentName } &&
-            agentOptions?.ContainsAgent(targetAgentName) == false)
+            agentOptions?.GetAgentFactories().Count > 0 &&
+            !agentOptions.ContainsAgent(targetAgentName))
         {
             throw new AgentNotRegisteredException(targetAgentName);
         }

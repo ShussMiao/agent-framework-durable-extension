@@ -467,7 +467,7 @@ internal static class BuiltInFunctions
                     req,
                     context,
                     HttpStatusCode.Gone,
-                    sessionId.Key,
+                    FormatResponseSessionId(sessionId),
                     "completedResultUnavailable",
                     "resultUnavailable",
                     exception.Message,
@@ -481,7 +481,7 @@ internal static class BuiltInFunctions
                     req,
                     context,
                     HttpStatusCode.InternalServerError,
-                    sessionId.Key,
+                    FormatResponseSessionId(sessionId),
                     "failed",
                     exception.Code ?? "terminalFailure",
                     exception.Message,
@@ -493,7 +493,7 @@ internal static class BuiltInFunctions
                 req,
                 context,
                 HttpStatusCode.OK,
-                sessionId.Key,
+                FormatResponseSessionId(sessionId),
                 agentResponse,
                 usedLegacyAgentHttpNames);
         }
@@ -508,7 +508,7 @@ internal static class BuiltInFunctions
         return await CreateAcceptedResponseAsync(
             req,
             context,
-            sessionId.Key,
+            FormatResponseSessionId(sessionId),
             usedLegacyAgentHttpNames);
     }
 
@@ -579,7 +579,7 @@ internal static class BuiltInFunctions
         using MemoryStream stream = new();
         await serializer.SerializeAsync(
             stream,
-            new AgentMcpSuccessResponse("success", (int)HttpStatusCode.OK, sessionId.Key, agentResponse),
+            new AgentMcpSuccessResponse("success", (int)HttpStatusCode.OK, FormatResponseSessionId(sessionId), agentResponse),
             typeof(AgentMcpSuccessResponse),
             functionContext.CancellationToken);
         return Encoding.UTF8.GetString(stream.ToArray());
@@ -1217,6 +1217,11 @@ internal static class BuiltInFunctions
 
     internal static bool TryCombineSessionIdAliases(string? sessionId, string? legacyThreadId, out string? result) =>
         TryCombineSessionIdAliases(sessionId, null, legacyThreadId, out result);
+
+    internal static string FormatResponseSessionId(AgentSessionId sessionId) =>
+        sessionId.EntityVersion == AgentSessionId.CurrentEntityVersion
+            ? sessionId.Key
+            : sessionId.ToString();
 
     internal static AgentSessionId ResolveAgentSessionId(
         string agentName,

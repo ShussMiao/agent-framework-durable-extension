@@ -45,7 +45,8 @@ internal partial class AgentEntity
             return false;
         }
 
-        if (!this._schemaV2WritesEnabled &&
+        if ((!this._schemaV2WritesEnabled ||
+             this.IsLegacyMigrationAuthorized(operation.Context.Id, persistedState)) &&
             !resultCleanup && persistedState.Data.ExpirationTimeUtc.HasValue)
         {
             return false;

@@ -2,9 +2,17 @@
 
 using System.Collections.Concurrent;
 using System.Text;
+using System.Text.Json;
+using DurableTask.Core.Command;
+using DurableTask.Core.Entities;
+using DurableTask.Core.History;
+using Microsoft.Agents.AI.DurableTask.State;
 using Microsoft.DurableTask;
 using Microsoft.DurableTask.Entities;
+using Microsoft.DurableTask.Worker;
+using Microsoft.DurableTask.Worker.Shims;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 
 namespace Microsoft.Agents.AI.DurableTask.UnitTests;
@@ -261,6 +269,143 @@ public sealed class DurableAIAgentTests
         Assert.Same(agent, capturedRunContext.Agent);
         Assert.Same(session, capturedRunContext.Session);
         Assert.Same(previousRunContext, AIAgent.CurrentRunContext);
+    }
+
+    [Theory]
+    [InlineData(false, null, "dafx-testagent")]
+    [InlineData(false, 1, "dafx-testagent")]
+    [InlineData(false, 2, "dafx-v2-testagent")]
+    [InlineData(true, null, "dafx-testagent")]
+    [InlineData(true, 1, "dafx-testagent")]
+    [InlineData(true, 2, "dafx-v2-testagent")]
+    public void RunAsync_PendingOrCompletedFirstTurnAcrossCutover_PreservesEntityVersionOnNextTurn(
+        bool responseRecordedBeforeCutover,
+        int? explicitResponseEntityVersion,
+        string expectedSecondTurnEntityName)
+    {
+        DurableDataConverter converter = new();
+        DurableTaskShimFactory shimFactory = new(
+            new DurableTaskWorkerOptions { DataConverter = converter, EnableEntitySupport = true },
+            NullLoggerFactory.Instance);
+
+        async Task<string?> TwoTurnOrchestratorAsync(TaskOrchestrationContext context)
+        {
+            DurableAIAgent agent = context.GetAgent("TestAgent");
+            AgentSession session = await agent.CreateSessionAsync();
+            AgentResponse first = await agent.RunAsync("turn 1", session);
+            if (responseRecordedBeforeCutover)
+            {
+                _ = await context.WaitForExternalEvent<string>("Continue");
+            }
+
+            AgentResponse second = await agent.RunAsync($"turn 2 after {first.Text}", session);
+            return $"{session.GetService<AgentSessionId>()}:{second.Text}";
+        }
+
+        DateTime startTime = new(2026, 10, 27, 12, 0, 0, DateTimeKind.Utc);
+
+        // Step 1: Execute orchestration up to the first entity call so we capture the deterministic request ID and input.
+        global::DurableTask.Core.TaskOrchestration initialShim = shimFactory.CreateOrchestration<string?, string>(
+            new TaskName("TwoTurnOrchestrator"),
+            (ctx, _) => TwoTurnOrchestratorAsync(ctx));
+        global::DurableTask.Core.OrchestrationRuntimeState initialState = new(
+        [
+            new OrchestratorStartedEvent(-1) { Timestamp = startTime },
+            new ExecutionStartedEvent(-1, "null")
+            {
+                Name = "TwoTurnOrchestrator",
+                OrchestrationInstance = new global::DurableTask.Core.OrchestrationInstance
+                {
+                    InstanceId = "orch-cutover-1",
+                    ExecutionId = "exec-1",
+                },
+            },
+        ]);
+        global::DurableTask.Core.OrchestratorExecutionResult firstStep = new global::DurableTask.Core.TaskOrchestrationExecutor(
+            initialState,
+            initialShim,
+            global::DurableTask.Core.BehaviorOnContinueAsNew.Carryover,
+            new TaskOrchestrationEntityParameters()).Execute();
+
+        SendEventOrchestratorAction firstEntityCall = Assert.IsType<SendEventOrchestratorAction>(
+            Assert.Single(firstStep.Actions));
+        string sessionKey = EntityId.FromString(firstEntityCall.Instance!.InstanceId).Key;
+        string scheduledEntityInstanceId = new EntityId(
+            expectedSecondTurnEntityName,
+            sessionKey).ToString();
+        using JsonDocument requestDoc = JsonDocument.Parse(firstEntityCall.EventData!);
+        string requestId = requestDoc.RootElement.GetProperty("id").GetString()!;
+
+        // Build either an unversioned legacy response or a durable-envelope response with explicit entityVersion.
+        AgentResponse firstTurnResponse = new(new ChatMessage(ChatRole.Assistant, "first-reply"));
+        if (explicitResponseEntityVersion is int version)
+        {
+            DateTimeOffset completedAt = new(startTime);
+            DurableAgentStateTerminalResult terminalResult = DurableAgentStateTerminalResult.FromResponse(
+                "corr-1",
+                firstTurnResponse,
+                completedAt);
+            DurableAgentJsonUtilities.CaptureRetainedResult(firstTurnResponse, terminalResult.Response!);
+            DurableAgentJsonUtilities.CaptureResponseEntityVersion(firstTurnResponse, version);
+        }
+
+        string serializedAgentResponse = converter.Serialize(firstTurnResponse);
+        string entityResponseEventJson = JsonSerializer.Serialize(new { result = serializedAgentResponse });
+
+        // Step 2: Resume after v2 cutover. When responseRecordedBeforeCutover is false, the first entity call was
+        // scheduled before cutover (EventSent in PastEvents) and its response arrives after cutover (EventRaised in NewEvents),
+        // so IsReplaying is true before CallEntityAsync and false after awaiting CallEntityAsync.
+        List<HistoryEvent> pastEvents =
+        [
+            new OrchestratorStartedEvent(-1) { Timestamp = startTime },
+            new ExecutionStartedEvent(-1, "null")
+            {
+                Name = "TwoTurnOrchestrator",
+                OrchestrationInstance = new global::DurableTask.Core.OrchestrationInstance
+                {
+                    InstanceId = "orch-cutover-1",
+                    ExecutionId = "exec-1",
+                },
+            },
+            new EventSentEvent(firstEntityCall.Id)
+            {
+                InstanceId = scheduledEntityInstanceId,
+                Name = firstEntityCall.EventName,
+                Input = firstEntityCall.EventData,
+            },
+            new OrchestratorCompletedEvent(-1),
+        ];
+
+        if (responseRecordedBeforeCutover)
+        {
+            pastEvents.Add(new OrchestratorStartedEvent(-1) { Timestamp = startTime.AddSeconds(1) });
+            pastEvents.Add(new EventRaisedEvent(-1, entityResponseEventJson) { Name = requestId });
+            pastEvents.Add(new OrchestratorCompletedEvent(-1));
+        }
+
+        global::DurableTask.Core.OrchestrationRuntimeState cutoverState = new(pastEvents);
+        cutoverState.AddEvent(new OrchestratorStartedEvent(-1) { Timestamp = startTime.AddSeconds(2) });
+        if (responseRecordedBeforeCutover)
+        {
+            cutoverState.AddEvent(new EventRaisedEvent(-1, "\"go\"") { Name = "Continue" });
+        }
+        else
+        {
+            cutoverState.AddEvent(new EventRaisedEvent(-1, entityResponseEventJson) { Name = requestId });
+        }
+
+        global::DurableTask.Core.TaskOrchestration cutoverShim = shimFactory.CreateOrchestration<string?, string>(
+            new TaskName("TwoTurnOrchestrator"),
+            (ctx, _) => TwoTurnOrchestratorAsync(ctx));
+        global::DurableTask.Core.OrchestratorExecutionResult secondStep = new global::DurableTask.Core.TaskOrchestrationExecutor(
+            cutoverState,
+            cutoverShim,
+            global::DurableTask.Core.BehaviorOnContinueAsNew.Carryover,
+            new TaskOrchestrationEntityParameters()).Execute();
+
+        SendEventOrchestratorAction secondEntityCall = Assert.IsType<SendEventOrchestratorAction>(
+            Assert.Single(secondStep.Actions));
+        Assert.Equal(scheduledEntityInstanceId, secondEntityCall.Instance!.InstanceId);
     }
 
     private sealed class TrackingSynchronizationContext : SynchronizationContext, IDisposable

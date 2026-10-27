@@ -301,6 +301,29 @@ public sealed class DurableAgentResponseSerializationTests
         Assert.DoesNotContain("$microsoftAgentFrameworkDurableTask", wire, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Serialize_RunRequestWithTargetAgentName_AllowsEmptyOptionsAndRejectsUnregisteredWhenAgentsConfigured()
+    {
+        RunRequest request = new([new ChatMessage(ChatRole.User, "hello")])
+        {
+            TargetAgentName = "RemoteAgent",
+        };
+
+        // Orchestration-only worker (0 local agents registered in DurableAgentsOptions): must not throw.
+        DurableDataConverter emptyOptionsConverter = new(new DurableAgentsOptions());
+        string serialized = emptyOptionsConverter.Serialize(request);
+        Assert.NotEmpty(serialized);
+
+        // Worker with local agent registrations: must reject unregistered TargetAgentName.
+        DurableAgentsOptions populatedOptions = new();
+        populatedOptions.AddAIAgentFactory("RegisteredAgent", _ => throw new NotSupportedException());
+        DurableDataConverter populatedOptionsConverter = new(populatedOptions);
+
+        AgentNotRegisteredException ex = Assert.Throws<AgentNotRegisteredException>(
+            () => populatedOptionsConverter.Serialize(request));
+        Assert.Equal("RemoteAgent", ex.AgentName);
+    }
+
     private static JsonElement SerializeNative(AgentResponse response) =>
         JsonSerializer.SerializeToElement(response, DurableAgentJsonUtilities.DefaultOptions.GetTypeInfo(typeof(AgentResponse)));
 

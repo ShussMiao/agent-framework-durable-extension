@@ -303,13 +303,14 @@ public sealed class BuiltInFunctionsAgentOutcomeTests
     }
 
     [Theory]
-    [InlineData("@dafx-TestAgent@legacy-key", "dafx-testagent", "legacy-key", true)]
-    [InlineData("@dafx-v2-TestAgent@v2-key", "dafx-v2-testagent", "v2-key", false)]
-    [InlineData("plain-key", "dafx-v2-testagent", "plain-key", false)]
-    public async Task HttpAndMcp_FullOrBareSessionId_RoutesToExpectedEntityAndReturnsSessionKeyAsync(
+    [InlineData("@dafx-TestAgent@legacy-key", "dafx-testagent", "legacy-key", "@dafx-testagent@legacy-key", true)]
+    [InlineData("@dafx-v2-TestAgent@v2-key", "dafx-v2-testagent", "v2-key", "v2-key", false)]
+    [InlineData("plain-key", "dafx-v2-testagent", "plain-key", "plain-key", false)]
+    public async Task HttpAndMcp_FullOrBareSessionId_RoutesToExpectedEntityAndReturnsExpectedSessionIdAsync(
         string suppliedSessionId,
         string expectedEntityName,
         string expectedKey,
+        string expectedResponseSessionId,
         bool expectedIsLegacy)
     {
         AgentSessionId resolved = BuiltInFunctions.ResolveAgentSessionId(AgentName, suppliedSessionId, "fallback");
@@ -317,12 +318,16 @@ public sealed class BuiltInFunctionsAgentOutcomeTests
         Assert.Equal(expectedKey, resolved.Key);
         Assert.Equal(expectedIsLegacy, resolved.IsLegacyEntity);
         Assert.Equal(new EntityInstanceId(expectedEntityName, expectedKey), resolved.ToEntityId());
+        Assert.Equal(expectedResponseSessionId, BuiltInFunctions.FormatResponseSessionId(resolved));
 
         using EndpointFixture httpFixture = new(sessionIdOverride: suppliedSessionId);
         HttpResponseData httpResponse = await BuiltInFunctions.RunAgentHttpAsync(
             httpFixture.Request, httpFixture.Client.Object, httpFixture.Context);
         Assert.Equal(HttpStatusCode.OK, httpResponse.StatusCode);
-        Assert.Equal(expectedKey, Assert.Single(httpResponse.Headers.GetValues("x-ms-session-id")));
+        Assert.Equal(expectedResponseSessionId, Assert.Single(httpResponse.Headers.GetValues("x-ms-session-id")));
+        using JsonDocument httpDoc = ReadBody(httpResponse);
+        Assert.Equal(expectedResponseSessionId, httpDoc.RootElement.GetProperty("sessionId").GetString());
+        Assert.Equal(expectedResponseSessionId, httpDoc.RootElement.GetProperty("session_id").GetString());
         httpFixture.Entities.Verify(
             c => c.SignalEntityAsync(
                 new EntityInstanceId(expectedEntityName, expectedKey),
@@ -338,10 +343,83 @@ public sealed class BuiltInFunctionsAgentOutcomeTests
         string? mcpResponse = await BuiltInFunctions.RunMcpToolAsync(
             mcpContext, mcpFixture.Client.Object, mcpFixture.Context);
         using JsonDocument mcpDoc = JsonDocument.Parse(Assert.IsType<string>(mcpResponse));
-        Assert.Equal(expectedKey, mcpDoc.RootElement.GetProperty("session_id").GetString());
+        Assert.Equal(expectedResponseSessionId, mcpDoc.RootElement.GetProperty("session_id").GetString());
         mcpFixture.Entities.Verify(
             c => c.SignalEntityAsync(
                 new EntityInstanceId(expectedEntityName, expectedKey),
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<SignalEntityOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task HttpAndMcp_LegacySessionId_RoundTripsReturnedSessionIdAcrossTurnsAsync()
+    {
+        const string SuppliedLegacySessionId = "@dafx-TestAgent@legacy-key";
+        const string ExpectedReturnedLegacySessionId = "@dafx-testagent@legacy-key";
+        EntityInstanceId expectedLegacyEntityId = new("dafx-testagent", "legacy-key");
+
+        // 1. HTTP 200 OK round-trip using returned sessionId
+        using EndpointFixture httpTurn1 = new(sessionIdOverride: SuppliedLegacySessionId);
+        HttpResponseData httpResponse1 = await BuiltInFunctions.RunAgentHttpAsync(
+            httpTurn1.Request, httpTurn1.Client.Object, httpTurn1.Context);
+        string returnedHttpSessionId = ReadBody(httpResponse1).RootElement.GetProperty("sessionId").GetString()!;
+        Assert.Equal(ExpectedReturnedLegacySessionId, returnedHttpSessionId);
+        Assert.Equal(ExpectedReturnedLegacySessionId, Assert.Single(httpResponse1.Headers.GetValues("x-ms-session-id")));
+
+        using EndpointFixture httpTurn2 = new(sessionIdOverride: returnedHttpSessionId);
+        HttpResponseData httpResponse2 = await BuiltInFunctions.RunAgentHttpAsync(
+            httpTurn2.Request, httpTurn2.Client.Object, httpTurn2.Context);
+        Assert.Equal(HttpStatusCode.OK, httpResponse2.StatusCode);
+        httpTurn2.Entities.Verify(
+            c => c.SignalEntityAsync(
+                expectedLegacyEntityId,
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<SignalEntityOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // 2. HTTP 202 Accepted round-trip using returned sessionId
+        using EndpointFixture acceptedTurn1 = new(waitForResponse: false, sessionIdOverride: SuppliedLegacySessionId);
+        HttpResponseData acceptedResponse1 = await BuiltInFunctions.RunAgentHttpAsync(
+            acceptedTurn1.Request, acceptedTurn1.Client.Object, acceptedTurn1.Context);
+        string returnedAcceptedSessionId = ReadBody(acceptedResponse1).RootElement.GetProperty("sessionId").GetString()!;
+        Assert.Equal(ExpectedReturnedLegacySessionId, returnedAcceptedSessionId);
+
+        using EndpointFixture acceptedTurn2 = new(waitForResponse: false, sessionIdOverride: returnedAcceptedSessionId);
+        HttpResponseData acceptedResponse2 = await BuiltInFunctions.RunAgentHttpAsync(
+            acceptedTurn2.Request, acceptedTurn2.Client.Object, acceptedTurn2.Context);
+        Assert.Equal(HttpStatusCode.Accepted, acceptedResponse2.StatusCode);
+        acceptedTurn2.Entities.Verify(
+            c => c.SignalEntityAsync(
+                expectedLegacyEntityId,
+                It.IsAny<string>(),
+                It.IsAny<object>(),
+                It.IsAny<SignalEntityOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // 3. MCP JSON round-trip using returned session_id
+        using EndpointFixture mcpTurn1 = new();
+        ToolInvocationContext mcpContext1 = CreateToolContext("json");
+        mcpContext1.Arguments!["sessionId"] = SuppliedLegacySessionId;
+        string? mcpResponse1 = await BuiltInFunctions.RunMcpToolAsync(
+            mcpContext1, mcpTurn1.Client.Object, mcpTurn1.Context);
+        string returnedMcpSessionId = JsonDocument.Parse(Assert.IsType<string>(mcpResponse1))
+            .RootElement.GetProperty("session_id").GetString()!;
+        Assert.Equal(ExpectedReturnedLegacySessionId, returnedMcpSessionId);
+
+        using EndpointFixture mcpTurn2 = new();
+        ToolInvocationContext mcpContext2 = CreateToolContext("json");
+        mcpContext2.Arguments!["sessionId"] = returnedMcpSessionId;
+        _ = await BuiltInFunctions.RunMcpToolAsync(
+            mcpContext2, mcpTurn2.Client.Object, mcpTurn2.Context);
+        mcpTurn2.Entities.Verify(
+            c => c.SignalEntityAsync(
+                expectedLegacyEntityId,
                 It.IsAny<string>(),
                 It.IsAny<object>(),
                 It.IsAny<SignalEntityOptions>(),

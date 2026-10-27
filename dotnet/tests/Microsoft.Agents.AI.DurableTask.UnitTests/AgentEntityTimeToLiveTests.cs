@@ -177,6 +177,35 @@ public sealed class AgentEntityTimeToLiveTests
         Assert.Equal(s_startTime.AddMinutes(5).UtcDateTime, state.Data.ExpirationTimeUtc);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LegacyEntityWithExplicitExpiration_DeletesOnlyWhenProcessLegacyEntitiesEnabledAsync(
+        bool processLegacyEntities)
+    {
+        DurableAgentState state = new();
+        DateTime expiredDeadline = s_startTime.AddMinutes(-1).UtcDateTime;
+        state.Data.ExpirationTimeUtc = expiredDeadline;
+        EntityHarness harness = CreateHarness(
+            TimeSpan.FromMinutes(5),
+            state,
+            sessionIdOverride: AgentSessionId.CreateLegacy("agent", "legacy-session"));
+        harness.Options.AuthorizeLegacyMigration = null;
+        harness.Options.ProcessLegacyEntities = processLegacyEntities;
+
+        await harness.CheckExpirationAsync(new AgentEntityDeletionCheck(expiredDeadline));
+
+        if (processLegacyEntities)
+        {
+            Assert.Null(harness.State);
+        }
+        else
+        {
+            Assert.Same(state, harness.State);
+            Assert.Equal(expiredDeadline, state.Data.ExpirationTimeUtc);
+        }
+    }
+
     [Fact]
     public async Task AutoAppliesProtectedFloorWhenClearingTtlAsync()
     {
@@ -237,10 +266,11 @@ public sealed class AgentEntityTimeToLiveTests
         TimeSpan? timeToLive,
         DurableAgentState? state = null,
         bool registerAgent = true,
-        Action? onSignal = null)
+        Action? onSignal = null,
+        AgentSessionId? sessionIdOverride = null)
     {
         const string AgentName = "agent";
-        AgentSessionId sessionId = new(AgentName, "session");
+        AgentSessionId sessionId = sessionIdOverride ?? new(AgentName, "session");
         DurableAgentsOptions options = new()
         {
             DefaultTimeToLive = timeToLive,

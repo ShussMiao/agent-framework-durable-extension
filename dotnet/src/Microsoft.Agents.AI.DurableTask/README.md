@@ -246,6 +246,36 @@ or read them without running new turns, consistent with the
 [isolated rollout](../../../docs/features/durable-agents/durable-state-architecture.md) and the
 [maintainer-approved migration follow-up](https://github.com/microsoft/agent-framework-durable-extension/pull/95#discussion_r4168013434).
 
+For side-by-side rolling upgrades, standalone workers automatically register work-item filters via
+`UseWorkItemFilters()` for `dafx-v2-{agent}` (Phase 1) and add `dafx-{agent}` when
+`DurableAgentsOptions.ProcessLegacyEntities = true` (or `DURABLE_AGENTS_PROCESS_LEGACY_ENTITIES=true`)
+in Phase 2 after all v1 workers are stopped. On Azure Functions, distinct entity trigger names alone
+do not isolate dispatch unless the Functions host also enables work-item filtering: reference
+`Microsoft.Azure.Functions.Worker` `2.52.0+`,
+`Microsoft.Azure.Functions.Worker.Extensions.DurableTask` `1.19.0+`, and
+`Microsoft.Azure.Functions.Worker.Extensions.DurableTask.AzureManaged` `1.10.0+` (which resolves
+`Microsoft.Azure.WebJobs.Extensions.DurableTask.AzureManaged` `1.8.0+`), and enable
+`"workItemFilteringEnabled": true` under `extensions.durableTask.storageProvider` in `host.json`:
+
+```json
+{
+  "version": "2.0",
+  "extensions": {
+    "durableTask": {
+      "hubName": "default",
+      "storageProvider": {
+        "type": "AzureManaged",
+        "connectionStringName": "DURABLE_TASK_SCHEDULER_CONNECTION_STRING",
+        "workItemFilteringEnabled": true
+      }
+    }
+  }
+}
+```
+
+If host-side work-item filtering is not enabled on both old and new Azure Functions deployments, perform
+an offline cutover instead of running v1 and v2 Functions hosts side by side on the same Task Hub.
+
 The default in-memory history pipeline is entity-owned and appends its model transcript to
 `conversationHistory`. Custom providers, model services, and opaque `CurrentRequestOnly` agents remain
 authoritative for their own transcripts. They append no new request or response mirrors to

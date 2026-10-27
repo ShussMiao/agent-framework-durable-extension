@@ -132,4 +132,49 @@ public sealed class FunctionMetadataFactoryTests
         Assert.NotNull(metadata.RawBindings);
         Assert.Contains("Run the MyWorkflow workflow", metadata.RawBindings[0]);
     }
+
+    [Fact]
+    public void AzureFunctionsSamples_EnableHostWorkItemFilteringInHostJson()
+    {
+        string samplesPath = FindSamplesPath();
+        string[] sampleDirectories =
+        [
+            .. Directory.GetDirectories(Path.Combine(samplesPath, "DurableAgents", "AzureFunctions")),
+            .. Directory.GetDirectories(Path.Combine(samplesPath, "DurableWorkflows", "AzureFunctions")),
+        ];
+
+        Assert.NotEmpty(sampleDirectories);
+        foreach (string sampleDirectory in sampleDirectories)
+        {
+            string hostPath = Path.Combine(sampleDirectory, "host.json");
+            Assert.True(File.Exists(hostPath), $"Missing host.json in {sampleDirectory}.");
+
+            using JsonDocument host = JsonDocument.Parse(File.ReadAllText(hostPath));
+            JsonElement storageProvider = host.RootElement
+                .GetProperty("extensions")
+                .GetProperty("durableTask")
+                .GetProperty("storageProvider");
+
+            Assert.True(
+                storageProvider.TryGetProperty("workItemFilteringEnabled", out JsonElement filteringEnabled) &&
+                filteringEnabled.ValueKind == JsonValueKind.True,
+                $"{hostPath} must enable host-side work-item filtering (workItemFilteringEnabled: true).");
+        }
+    }
+
+    private static string FindSamplesPath()
+    {
+        for (DirectoryInfo? directory = new(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            string candidate = Path.Combine(directory.FullName, "samples");
+            if (Directory.Exists(Path.Combine(candidate, "DurableAgents", "AzureFunctions")) &&
+                Directory.Exists(Path.Combine(candidate, "DurableWorkflows", "AzureFunctions")))
+            {
+                return candidate;
+            }
+        }
+
+        throw new DirectoryNotFoundException(
+            $"Could not locate the 'dotnet/samples' directory by walking up from '{AppContext.BaseDirectory}'.");
+    }
 }
