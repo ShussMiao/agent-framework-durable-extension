@@ -408,6 +408,108 @@ public sealed class DurableAIAgentTests
         Assert.Equal(scheduledEntityInstanceId, secondEntityCall.Instance!.InstanceId);
     }
 
+    [Theory]
+    [InlineData("@dafx-v2-testagent@2f60edd06ae75fb7896f3b75fb95552e", "dafx-v2-testagent", 2)]
+    [InlineData("@dafx-testagent@2f60edd06ae75fb7896f3b75fb95552e", "dafx-testagent", 1)]
+    public void RunAsync_PlainJsonSerializedResponseWithAgentId_PreservesEntityVersionAcrossMultiTurnOrchestration(
+        string responseAgentId,
+        string expectedSecondTurnEntityName,
+        int expectedEntityVersion)
+    {
+        DurableDataConverter converter = new();
+        DurableTaskShimFactory shimFactory = new(
+            new DurableTaskWorkerOptions { DataConverter = converter, EnableEntitySupport = true },
+            NullLoggerFactory.Instance);
+        DateTime startTime = new(2026, 10, 27, 12, 0, 0, DateTimeKind.Utc);
+
+        static async Task<string?> ChainedOrchestratorAsync(TaskOrchestrationContext context)
+        {
+            DurableAIAgent writer = context.GetAgent("TestAgent");
+            AgentSession writerSession = await writer.CreateSessionAsync();
+            AgentResponse initial = await writer.RunAsync("Write a tagline.", writerSession);
+            AgentResponse refined = await writer.RunAsync($"Improve: {initial.Text}", writerSession);
+            return refined.Text;
+        }
+
+        global::DurableTask.Core.TaskOrchestration initialShim = shimFactory.CreateOrchestration<string?, string>(
+            new TaskName("ChainedOrchestrator"),
+            (ctx, _) => ChainedOrchestratorAsync(ctx));
+        global::DurableTask.Core.OrchestrationRuntimeState initialState = new(
+        [
+            new OrchestratorStartedEvent(-1) { Timestamp = startTime },
+            new ExecutionStartedEvent(-1, "null")
+            {
+                Name = "ChainedOrchestrator",
+                OrchestrationInstance = new global::DurableTask.Core.OrchestrationInstance
+                {
+                    InstanceId = "orch-functions-chaining",
+                    ExecutionId = "exec-1",
+                },
+            },
+        ]);
+        global::DurableTask.Core.OrchestratorExecutionResult firstStep = new global::DurableTask.Core.TaskOrchestrationExecutor(
+            initialState,
+            initialShim,
+            global::DurableTask.Core.BehaviorOnContinueAsNew.Carryover,
+            new TaskOrchestrationEntityParameters()).Execute();
+
+        SendEventOrchestratorAction firstEntityCall = Assert.IsType<SendEventOrchestratorAction>(
+            Assert.Single(firstStep.Actions));
+        string sessionKey = EntityId.FromString(firstEntityCall.Instance!.InstanceId).Key;
+        string expectedEntityInstanceId = new EntityId(expectedSecondTurnEntityName, sessionKey).ToString();
+        using JsonDocument requestDoc = JsonDocument.Parse(firstEntityCall.EventData!);
+        string requestId = requestDoc.RootElement.GetProperty("id").GetString()!;
+
+        // Simulate Azure Functions GrpcEntityRunner.LoadAndRunAsync, which serializes AgentResponse with
+        // JsonDataConverter.Default (no $microsoftAgentFrameworkDurableTask envelope) while preserving AgentId.
+        AgentResponse plainEntityResponse = new(new ChatMessage(ChatRole.Assistant, "initial tagline"))
+        {
+            AgentId = responseAgentId,
+        };
+        string plainJson = JsonSerializer.Serialize(plainEntityResponse, DurableAgentJsonUtilities.DefaultOptions);
+        Assert.DoesNotContain("$microsoftAgentFrameworkDurableTask", plainJson, StringComparison.Ordinal);
+
+        AgentResponse deserialized = Assert.IsType<AgentResponse>(converter.Deserialize(plainJson, typeof(AgentResponse)));
+        Assert.Equal(expectedEntityVersion, DurableAgentJsonUtilities.GetResponseEntityVersion(deserialized));
+
+        string entityResponseEventJson = JsonSerializer.Serialize(new { result = plainJson });
+        global::DurableTask.Core.OrchestrationRuntimeState secondTurnState = new(
+        [
+            new OrchestratorStartedEvent(-1) { Timestamp = startTime },
+            new ExecutionStartedEvent(-1, "null")
+            {
+                Name = "ChainedOrchestrator",
+                OrchestrationInstance = new global::DurableTask.Core.OrchestrationInstance
+                {
+                    InstanceId = "orch-functions-chaining",
+                    ExecutionId = "exec-1",
+                },
+            },
+            new EventSentEvent(firstEntityCall.Id)
+            {
+                InstanceId = expectedEntityInstanceId,
+                Name = firstEntityCall.EventName,
+                Input = firstEntityCall.EventData,
+            },
+            new OrchestratorCompletedEvent(-1),
+        ]);
+        secondTurnState.AddEvent(new OrchestratorStartedEvent(-1) { Timestamp = startTime.AddSeconds(1) });
+        secondTurnState.AddEvent(new EventRaisedEvent(-1, entityResponseEventJson) { Name = requestId });
+
+        global::DurableTask.Core.TaskOrchestration secondShim = shimFactory.CreateOrchestration<string?, string>(
+            new TaskName("ChainedOrchestrator"),
+            (ctx, _) => ChainedOrchestratorAsync(ctx));
+        global::DurableTask.Core.OrchestratorExecutionResult secondStep = new global::DurableTask.Core.TaskOrchestrationExecutor(
+            secondTurnState,
+            secondShim,
+            global::DurableTask.Core.BehaviorOnContinueAsNew.Carryover,
+            new TaskOrchestrationEntityParameters()).Execute();
+
+        SendEventOrchestratorAction secondEntityCall = Assert.IsType<SendEventOrchestratorAction>(
+            Assert.Single(secondStep.Actions));
+        Assert.Equal(expectedEntityInstanceId, secondEntityCall.Instance!.InstanceId);
+    }
+
     private sealed class TrackingSynchronizationContext : SynchronizationContext, IDisposable
     {
         private readonly BlockingCollection<(SendOrPostCallback Callback, object? State)> _work = new();

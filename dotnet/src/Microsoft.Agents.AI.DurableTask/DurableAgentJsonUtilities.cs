@@ -115,9 +115,29 @@ internal static partial class DurableAgentJsonUtilities
     internal static int? GetResponseEntityVersion(AgentResponse response)
     {
         ArgumentNullException.ThrowIfNull(response);
-        return s_responseEntityVersionsByResponse.TryGetValue(response, out ResponseEntityVersionHolder? holder)
-            ? holder.Value
-            : null;
+        if (s_responseEntityVersionsByResponse.TryGetValue(response, out ResponseEntityVersionHolder? holder))
+        {
+            return holder.Value;
+        }
+
+        return TryParseEntityVersionFromAgentId(response.AgentId);
+    }
+
+    internal static int? TryParseEntityVersionFromAgentId(string? agentId)
+    {
+        if (!string.IsNullOrWhiteSpace(agentId) && agentId[0] == '@')
+        {
+            try
+            {
+                return AgentSessionId.Parse(agentId).EntityVersion;
+            }
+            catch (ArgumentException)
+            {
+                // Ignore non-dafx AgentId values.
+            }
+        }
+
+        return null;
     }
 
     internal static void CaptureResponseEntityVersion(AgentResponse response, int entityVersion)

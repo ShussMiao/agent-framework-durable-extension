@@ -61,9 +61,12 @@ internal sealed class DurableDataConverter(DurableAgentsOptions? agentOptions = 
             : JsonSerializer.Deserialize(data, targetType, s_options);
         if (deserialized is AgentResponse response)
         {
+            int resolvedEntityVersion = durableMetadata.EntityVersion
+                ?? DurableAgentJsonUtilities.TryParseEntityVersionFromAgentId(response.AgentId)
+                ?? 1;
             DurableAgentJsonUtilities.CaptureResponseEntityVersion(
                 response,
-                durableMetadata.EntityVersion ?? 1);
+                resolvedEntityVersion);
             if (durableMetadata.RetainedResult is JsonElement result)
             {
                 DurableAgentJsonUtilities.CaptureRetainedResult(response, result);
