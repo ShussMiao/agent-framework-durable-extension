@@ -55,6 +55,11 @@ internal sealed class ExecutorRegistry
             throw new InvalidOperationException($"Executor '{executorId}' not found in workflow.");
         }
 
+        if (binding is RequestPortBinding or SubworkflowBinding)
+        {
+            return;
+        }
+
         if (this._executors.TryGetValue(executorName, out ExecutorRegistration? existing))
         {
             if ((existing.Binding is AIAgentBinding) != (binding is AIAgentBinding))

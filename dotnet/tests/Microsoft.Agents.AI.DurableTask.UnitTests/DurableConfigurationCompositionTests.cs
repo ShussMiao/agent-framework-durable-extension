@@ -288,6 +288,50 @@ public sealed class DurableConfigurationCompositionTests
         Assert.Contains("dafx-v2-Writer", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ConfigureDurableOptions_AllowsRequestPortAndSubworkflowAliasSharingNameWithAgent(bool workflowFirst)
+    {
+        ServiceCollection services = new();
+        FunctionExecutor<string> childStart = new("child-start", (_, _, _) => default);
+        Workflow subWorkflow = new WorkflowBuilder(childStart)
+            .WithName("ChildReviewWorkflow")
+            .Build();
+        FunctionExecutor<string> parentStart = new("parent-start", (_, _, _) => default);
+        RequestPort<string, string> requestPort = RequestPort.Create<string, string>("ApprovalAgent");
+        ExecutorBinding subWorkflowAlias = subWorkflow.BindAsExecutor("SubworkflowAgent");
+        Workflow parentWorkflow = new WorkflowBuilder(parentStart)
+            .WithName("ParentApprovalWorkflow")
+            .AddEdge(parentStart, requestPort)
+            .AddEdge(requestPort, subWorkflowAlias)
+            .Build();
+
+        if (workflowFirst)
+        {
+            services.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(parentWorkflow));
+            services.ConfigureDurableAgents(agents =>
+            {
+                agents.AddAIAgent(new CompositionTestAgent("ApprovalAgent"));
+                agents.AddAIAgent(new CompositionTestAgent("SubworkflowAgent"));
+            });
+        }
+        else
+        {
+            services.ConfigureDurableAgents(agents =>
+            {
+                agents.AddAIAgent(new CompositionTestAgent("ApprovalAgent"));
+                agents.AddAIAgent(new CompositionTestAgent("SubworkflowAgent"));
+            });
+            services.ConfigureDurableWorkflows(workflows => workflows.AddWorkflow(parentWorkflow));
+        }
+
+        DurableOptions options = GetRegisteredOptions(services);
+        Assert.True(options.Agents.ContainsAgent("ApprovalAgent"));
+        Assert.True(options.Agents.ContainsAgent("SubworkflowAgent"));
+        Assert.Contains("ParentApprovalWorkflow", options.Workflows.Workflows.Keys);
+    }
+
     private static DurableOptions GetRegisteredOptions(IServiceCollection services)
     {
         ServiceDescriptor descriptor = Assert.Single(

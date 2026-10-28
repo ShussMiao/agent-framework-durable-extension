@@ -140,8 +140,9 @@ public sealed class DurableAgentsOptions
     /// When persistent request outcomes are enabled, committed runs schedule entity-local payload cleanup.
     /// Physical removal may lag expiry; polling reports unavailable without modifying state.
     /// Imported states without a scheduled check need an explicit cleanup operation or a successful new run.
-    /// This setting does not activate mailbox persistence by itself. SchemaV2 deployment acknowledgement
-    /// activates schema 2 for new entity generations; existing legacy sessions are not migrated.
+    /// New sessions write schema 2.0.0 state on <c>dafx-v2-{agent}</c> entities by default, while enabling
+    /// <see cref="ProcessLegacyEntities"/> in Phase 2 registers legacy <c>dafx-{agent}</c> entities and upgrades
+    /// loaded schema 1.x state in-place to schema 2.0.0 on the next turn.
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">The retention period is not positive.</exception>
     public TimeSpan? ResultRetentionPeriod
