@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -29,13 +30,19 @@ from agent_framework_durabletask._durable_agent_state import DurableAgentStateRe
 pytestmark = pytest.mark.integration
 
 
+def _local_emulator_endpoint(endpoint: str) -> str:
+    match = re.fullmatch(r"(?:localhost|127\.0\.0\.1):([0-9]{1,5})", endpoint)
+    if match is None or not 1 <= int(match.group(1)) <= 65535:
+        raise ValueError("This test accepts only a local emulator host:port, never a cloud scheduler.")
+    return endpoint
+
+
 @pytest.mark.parametrize("populated", [False, True])
 def test_local_dts_two_phase_upgrade_at_original_entity_address(populated: bool) -> None:
     endpoint = os.getenv("DTS_ENTITY_MIGRATION_ENDPOINT")
     if not endpoint:
         pytest.skip("Set DTS_ENTITY_MIGRATION_ENDPOINT to a task-owned local DTS emulator.")
-    if not endpoint.startswith(("localhost:", "127.0.0.1:")):
-        pytest.fail("This test accepts only a local emulator, never an authenticated cloud scheduler.")
+    endpoint = _local_emulator_endpoint(endpoint)
 
     def worker() -> DurableTaskSchedulerWorker:
         return DurableTaskSchedulerWorker(

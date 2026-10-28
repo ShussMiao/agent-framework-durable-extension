@@ -43,6 +43,16 @@ def workflow_client(mock_client: Mock) -> DurableWorkflowClient:
 class TestStartWorkflow:
     """Test starting workflow orchestrations."""
 
+    @pytest.mark.parametrize("generation", [1, 2])
+    def test_valid_version_looking_workflow_name_preserves_logical_name_and_instance_id(
+        self, mock_client: Mock, generation: int
+    ) -> None:
+        client = DurableWorkflowClient(mock_client, workflow_name="v2-orders", entity_version=generation)
+        client.start_workflow("go", instance_id="original")
+        expected = "dafx-v2-orders" if generation == 1 else "dafx-v2-v2-orders"
+        assert mock_client.schedule_new_orchestration.call_args.args == (expected,)
+        assert mock_client.schedule_new_orchestration.call_args.kwargs["instance_id"] == "original"
+
     @pytest.mark.parametrize("entity_version", [1, 2])
     @pytest.mark.parametrize("use_default", [False, True])
     @pytest.mark.parametrize(

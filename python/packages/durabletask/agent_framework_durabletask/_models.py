@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, cast
 from agent_framework import AgentSession
 
 from ._constants import REQUEST_RESPONSE_FORMAT_TEXT
+from ._durable_names import durable_name
 
 if TYPE_CHECKING:  # pragma: no cover - type checking imports only
     from pydantic import BaseModel
@@ -277,12 +278,7 @@ class AgentSessionId:
     @staticmethod
     def to_entity_name(name: str, *, entity_version: int = 1) -> str:
         """Resolve an explicitly supported address generation without guessing."""
-        if type(entity_version) is not int or entity_version not in (1, 2):
-            raise ValueError("Unsupported DAFX entity address version.")
-        if not isinstance(name, str) or not name or re.match(r"v[0-9]+-", name, re.IGNORECASE):
-            raise ValueError("Agent names must be nonempty and cannot start with a reserved version prefix.")
-        prefix = AgentSessionId.ENTITY_NAME_PREFIX if entity_version == 1 else "dafx-v2-"
-        return f"{prefix}{name}"
+        return durable_name(name, entity_version=entity_version)
 
     @staticmethod
     def with_random_key(name: str, *, entity_version: int = 1) -> AgentSessionId:

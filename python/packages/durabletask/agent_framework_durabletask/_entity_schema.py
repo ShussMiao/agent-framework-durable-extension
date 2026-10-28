@@ -151,9 +151,17 @@ def agent_entity_schema_registry(
 
     def convert(source: dict[str, Any], context: EntityMigrationContext) -> dict[str, Any]:
         budget = resolve_state_budget(context.max_state_bytes)
-        evidence = {} if legacy_evidence_provider is None else dict(legacy_evidence_provider(deepcopy(source), context))
+        supplied: Mapping[str, Any] = (
+            {} if legacy_evidence_provider is None else legacy_evidence_provider(deepcopy(source), context)
+        )
+        if not isinstance(supplied, Mapping):
+            raise ValueError("Legacy evidence provider must return a mapping.")
+        evidence = dict(supplied)
         if evidence.keys() - {"delivery_evidence", "completion_evidence"}:
             raise ValueError("Legacy evidence provider returned unsupported evidence fields.")
+        for field, value in evidence.items():
+            if not isinstance(value, dict):
+                raise ValueError(f"Supplied {field} must be a journal object, not null or another value type.")
         digest = state_snapshot_digest(source)
         migrated = migrate_legacy_state(
             source,

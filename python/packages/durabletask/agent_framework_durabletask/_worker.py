@@ -31,6 +31,7 @@ from ._configuration import (
     validate_runtime_deployment,
 )
 from ._constants import DELIVERY_WINDOW_SECONDS
+from ._durable_names import validate_two_phase_name
 from ._entities import create_agent_entity_class
 from ._entity_schema import LegacyEvidenceProvider, agent_entity_schema_registry
 from ._feature_usage import FeatureIndex
@@ -51,6 +52,7 @@ from ._workflows.naming import (
     validate_executor_id,
     validate_workflow_name,
     workflow_executor_activity_name,
+    workflow_orchestrator_name,
     workflow_scoped_executor_id,
 )
 from ._workflows.orchestrator import run_workflow_orchestrator
@@ -247,6 +249,8 @@ class DurableAIAgentWorker:
             callback=effective_callback,
         )
         identities = dict(self._registration_identities)
+        if self._two_phase:
+            validate_two_phase_name(registration_name)
         for version in self._entity_versions:
             RegistrationIdentity(agent, agent, "entity", settings, f"agent '{registration_name}'").reserve(
                 identities,
@@ -416,13 +420,15 @@ class DurableAIAgentWorker:
         identities = dict(self._registration_identities)
         for hosted in hosted_workflows:
             validate_workflow_name(hosted.name)
+            if self._two_phase:
+                validate_two_phase_name(hosted.name)
             for executor_id in hosted.executors:
                 validate_executor_id(executor_id)
             label = f"workflow '{hosted.name}'"
             for version in self._entity_versions:
                 RegistrationIdentity(hosted, hosted, "orchestration", settings, label).reserve(
                     identities,
-                    AgentSessionId.to_entity_name(hosted.name, entity_version=version),
+                    workflow_orchestrator_name(hosted.name, entity_version=version),
                     namespace="orchestrator-name",
                 )
             plan = plan_workflow_registration(hosted)
@@ -580,7 +586,7 @@ class DurableAIAgentWorker:
 
     def _register_versioned_workflow_orchestrator(self, workflow: Workflow, entity_version: int) -> None:
         captured_workflow = workflow
-        orchestrator_name = AgentSessionId.to_entity_name(workflow.name, entity_version=entity_version)
+        orchestrator_name = workflow_orchestrator_name(workflow.name, entity_version=entity_version)
 
         def workflow_orchestrator(context: OrchestrationContext, input_data: JsonPayload) -> Any:
             # Reject legacy recorded starts before entering the changed engine.

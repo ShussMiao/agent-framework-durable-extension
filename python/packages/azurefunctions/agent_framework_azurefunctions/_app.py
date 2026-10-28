@@ -73,6 +73,7 @@ from agent_framework_durabletask import (
     validate_workflow_start_input,
     wrap_workflow_input,
 )
+from agent_framework_durabletask._durable_names import validate_two_phase_name
 from agent_framework_durabletask._entities import (
     _validation_diagnostic,  # pyright: ignore[reportPrivateUsage]
     create_agent_entity_class,
@@ -669,6 +670,8 @@ class AgentFunctionApp(df.DFApp):
         if not isinstance(name, str) or not name:
             raise ValueError("Agent must have a name to be registered")
         validate_agent_configuration(agent, retention=settings.retention)
+        if self._deployment_mode == "two_phase":
+            validate_two_phase_name(name)
         label = f"workflow '{owner.name}' agent '{name}'" if owner is not None else f"agent '{name}'"
         identity = RegistrationIdentity(agent if owner is None else owner, agent, "entity", settings, label, endpoints)
         for version in self._entity_versions:
@@ -690,12 +693,14 @@ class AgentFunctionApp(df.DFApp):
         hosted_workflows = list(collect_hosted_workflows(workflow))
         for hosted in hosted_workflows:
             validate_workflow_name(hosted.name)
+            if self._deployment_mode == "two_phase":
+                validate_two_phase_name(hosted.name)
             for executor_id in hosted.executors:
                 validate_executor_id(executor_id)
             label = f"workflow '{hosted.name}'"
             identity = RegistrationIdentity(hosted, hosted, "orchestration", settings, label)
             for version in self._entity_versions:
-                orchestrator_name = AgentSessionId.to_entity_name(hosted.name, entity_version=version)
+                orchestrator_name = workflow_orchestrator_name(hosted.name, entity_version=version)
                 identity.reserve(identities, orchestrator_name, namespace="orchestrator-name")
                 identity.reserve(identities, orchestrator_name, namespace="function-name")
             plan = plan_workflow_registration(hosted)
@@ -970,7 +975,7 @@ class AgentFunctionApp(df.DFApp):
 
     def _register_versioned_workflow_function(self, workflow: Workflow, entity_version: int) -> None:
         captured_workflow = workflow
-        orchestrator_name = AgentSessionId.to_entity_name(workflow.name, entity_version=entity_version)
+        orchestrator_name = workflow_orchestrator_name(workflow.name, entity_version=entity_version)
 
         @self.function_name(orchestrator_name)
         @self.orchestration_trigger(context_name="context")
@@ -1010,7 +1015,7 @@ class AgentFunctionApp(df.DFApp):
         not have to change URLs as an app grows.
         """
         workflow_name = workflow.name
-        orchestrator_name = AgentSessionId.to_entity_name(workflow_name, entity_version=self._entity_versions[0])
+        orchestrator_name = workflow_orchestrator_name(workflow_name, entity_version=self._entity_versions[0])
 
         @self.function_name(self._workflow_route_function_name(workflow, "start"))
         @self.route(route=f"workflow/{workflow_name}/run", methods=["POST"])
@@ -1317,7 +1322,7 @@ class AgentFunctionApp(df.DFApp):
         to host/runtime casing differences.
         """
         expected = {
-            AgentSessionId.to_entity_name(workflow_name, entity_version=version).casefold()
+            workflow_orchestrator_name(workflow_name, entity_version=version).casefold()
             for version in self._entity_versions
         }
         name = getattr(status, "name", None)

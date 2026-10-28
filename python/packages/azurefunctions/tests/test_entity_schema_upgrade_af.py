@@ -4,6 +4,7 @@
 
 import json
 from copy import deepcopy
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import azure.functions as func
@@ -25,7 +26,9 @@ from agent_framework_durabletask._durable_agent_state import DurableAgentStateRe
 from agent_framework_azurefunctions import AgentFunctionApp
 
 
-def _app(*, legacy: bool = True, max_state_bytes: int | None = 1_048_576) -> tuple[AgentFunctionApp, _Client]:
+def _app(
+    *, legacy: bool = True, max_state_bytes: int | None = 1_048_576, evidence: Any = None
+) -> tuple[AgentFunctionApp, _Client]:
     model = _Client({"value": "original"})
     app = AgentFunctionApp(
         agents=[_NonStreamingAgent(client=model, name="assistant")],
@@ -33,6 +36,7 @@ def _app(*, legacy: bool = True, max_state_bytes: int | None = 1_048_576) -> tup
         acknowledge_host_filtering=True,
         process_legacy_entities=legacy,
         max_state_bytes=max_state_bytes,
+        legacy_evidence_provider=evidence,
         enable_health_check=False,
         enable_http_endpoints=False,
     )
@@ -80,6 +84,33 @@ def test_functions_handler_upgrades_original_entity_and_cold_retry_is_noop(versi
     assert retry.results[0].success.result == result.results[0].success.result
     assert json.loads(retry.entityState.value) == upgraded
     assert cold_model.options == []
+
+
+@pytest.mark.parametrize("evidence", [[], {"completion_evidence": None}, {"delivery_evidence": None}])
+@pytest.mark.parametrize("populated", [False, True])
+def test_functions_supplied_malformed_evidence_rejects_before_model_and_preserves_state(
+    evidence: Any, populated: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy = LegacyDurableAgentState()
+    if populated:
+        legacy.data.conversation_history.append(
+            LegacyRequest.from_run_request(RunRequest(message="old request", correlation_id="old-turn"))
+        )
+    source = legacy.to_dict()
+    before = deepcopy(source)
+    app, model = _app(evidence=lambda *_: evidence)
+    decode = Mock(side_effect=AssertionError("must not decode rejected input"))
+    monkeypatch.setattr("agent_framework_durabletask._entities.RunRequest.from_dict", decode)
+    result = _Host(app).entity(
+        "@dafx-assistant@original-key",
+        "run",
+        json.dumps({"message": "hello", "correlationId": "turn-1"}),
+        json.dumps(source),
+    )
+    assert result.results[0].HasField("failure"), result
+    assert json.loads(result.entityState.value) == before == source
+    decode.assert_not_called()
+    assert model.options == []
 
 
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
@@ -222,6 +253,49 @@ def test_functions_http_and_mcp_keep_existing_addresses_and_version_new_sessions
     context = Mock()
     assert app.get_agent(context, "assistant")._executor.entity_version == 1
     assert app.get_agent(context, "assistant", entity_version=2)._executor.entity_version == 2
+
+
+@pytest.mark.parametrize("name", ["v2-assistant", "V3-customer"])
+def test_functions_isolated_historical_version_looking_names_keep_registered_and_parsed_addresses(name: str) -> None:
+    app = AgentFunctionApp(
+        agents=[_NonStreamingAgent(client=_Client(None), name=name)],
+        deployment_mode="isolated_v2",
+        enable_health_check=False,
+        enable_http_endpoints=False,
+    )
+    names = {function.get_function_name() for function in app.get_functions()}
+    assert f"dafx-{name}" in names
+    assert app._create_session_id(name, f"@{name}@key").entity_name == f"dafx-{name}"
+    assert app._create_session_id(name, "key").entity_name == f"dafx-{name}"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_functions_two_phase_namespace_policy_does_not_apply_to_other_generations(legacy: bool) -> None:
+    app, _ = _app(legacy=legacy)
+    with pytest.raises(ValueError, match="two.phase.*namespace"):
+        app.add_agent(_NonStreamingAgent(client=_Client(None), name="V2-assistant"))
+    app.add_agent(_NonStreamingAgent(client=_Client(None), name="V3-customer"))
+    names = {function.get_function_name() for function in app.get_functions()}
+    assert "dafx-v2-V3-customer" in names
+    assert ("dafx-V3-customer" in names) == legacy
+
+
+@pytest.mark.parametrize("mode", ["isolated_v2", "two_phase"])
+def test_functions_workflow_registration_checks_only_opted_in_namespace(mode: str) -> None:
+    agent = AgentExecutor(_NonStreamingAgent(client=_Client(None), name="assistant"), id="chat")
+    workflow = WorkflowBuilder(name="v2-orders", start_executor=agent, output_from=[agent]).build()
+    app = AgentFunctionApp(
+        deployment_mode=mode,
+        acknowledge_host_filtering=mode == "two_phase",
+        enable_health_check=False,
+        enable_http_endpoints=False,
+    )
+    if mode == "two_phase":
+        with pytest.raises(ValueError, match="two.phase.*namespace"):
+            app.configure_workflow(workflow)
+    else:
+        app.configure_workflow(workflow)
+        assert "dafx-v2-orders" in {function.get_function_name() for function in app.get_functions()}
 
 
 @pytest.mark.asyncio

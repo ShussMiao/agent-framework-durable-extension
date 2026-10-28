@@ -23,6 +23,7 @@ from .._executors import OrchestrationAgentExecutor
 from .._json_payload import JsonPayload
 from .._shim import build_agent_task
 from .context import WorkflowOrchestrationContext
+from .naming import workflow_name_from_orchestrator, workflow_orchestrator_name
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,10 @@ class DurableTaskWorkflowContext:
 
     def call_sub_orchestrator(self, name: str, input: Any, instance_id: str | None = None) -> Any:
         if self._entity_version == 2:
-            name = f"dafx-v2-{name.removeprefix('dafx-')}"
+            logical_name = workflow_name_from_orchestrator(name)
+            if logical_name is None:
+                raise ValueError(f"Expected a DAFX workflow orchestration name, got {name!r}.")
+            name = workflow_orchestrator_name(logical_name, entity_version=self._entity_version)
         return cast(
             Any,
             self._context.call_sub_orchestrator(

@@ -6,6 +6,7 @@ import json
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import Mock
 
@@ -39,6 +40,30 @@ from agent_framework_durabletask import (
 )
 from agent_framework_durabletask._durable_agent_state import DurableAgentStateRequest as LegacyRequest
 from agent_framework_durabletask._durable_agent_state import DurableAgentStateResponse as LegacyResponse
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://cloud.example:443",
+        "cloud.example:8080",
+        "127.0.0.1:8080@cloud.example",
+        "localhost:0",
+        "localhost:65536",
+    ],
+)
+def test_local_acceptance_rejects_non_loopback_or_invalid_endpoints(endpoint: str) -> None:
+    from test_entity_migration_dts import _local_emulator_endpoint
+
+    with pytest.raises(ValueError, match="local emulator"):
+        _local_emulator_endpoint(endpoint)
+
+
+@pytest.mark.parametrize("endpoint", ["localhost:8080", "127.0.0.1:18080"])
+def test_local_acceptance_accepts_only_explicit_loopback_ports(endpoint: str) -> None:
+    from test_entity_migration_dts import _local_emulator_endpoint
+
+    assert _local_emulator_endpoint(endpoint) == endpoint
 
 
 def _native(
@@ -340,14 +365,47 @@ def test_cutover_does_not_authorize_other_ambiguous_state(invalid: str) -> None:
     assert model.received_messages == []
 
 
-@pytest.mark.parametrize("evidence", [None, {}, {"results": []}])
-def test_invalid_supplied_completion_evidence_never_falls_back_to_cutover(evidence: Any) -> None:
-    source = _legacy_with_response()
-    worker, model = _native(evidence=lambda snapshot, context: {"completion_evidence": evidence})
+@pytest.mark.parametrize("populated", [False, True])
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        None,
+        [],
+        (),
+        [("completion_evidence", {})],
+        {"completion_evidence": None},
+        {"delivery_evidence": None},
+        {"completion_evidence": []},
+        {"delivery_evidence": []},
+        {"completion_evidence": {}},
+        {"delivery_evidence": {}},
+    ],
+)
+def test_invalid_supplied_evidence_rejects_before_request_decode_or_effects(
+    evidence: Any, populated: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _legacy_with_response() if populated else _legacy()
+    before = deepcopy(source)
+    worker, model = _native(evidence=lambda snapshot, context: evidence)
+    decode = Mock(side_effect=AssertionError("must not decode rejected input"))
+    monkeypatch.setattr("agent_framework_durabletask._entities.RunRequest.from_dict", decode)
     result = _batch(worker, source)
     assert result.results[0].HasField("failure"), result
-    assert json.loads(result.entityState.value) == source
+    assert json.loads(result.entityState.value) == before == source
+    decode.assert_not_called()
     assert model.received_messages == []
+
+
+@pytest.mark.parametrize("provider", [None, lambda *_: {}, lambda *_: MappingProxyType({})])
+def test_omitted_evidence_and_empty_mapping_intentionally_start_cutover(provider: Any) -> None:
+    source = _legacy_with_response()
+    worker, model = _native(evidence=provider)
+    result = _batch(worker, source)
+    assert result.results[0].HasField("success"), result
+    state = json.loads(result.entityState.value)
+    assert set(state["data"]["completionReceipts"]) == {"turn-1"}
+    assert "old-turn" not in state["data"]["terminalResults"]
+    assert len(model.received_messages) == 1
 
 
 def test_cutover_preserves_valid_session_and_opaque_json_without_recovering_old_completions() -> None:
@@ -477,6 +535,78 @@ def test_client_new_addresses_and_serialized_old_addresses_are_not_retargeted() 
     assert DurableAgentSession.from_dict(ambiguous_old.to_dict()).durable_session_id == ambiguous_old.durable_session_id
     with pytest.raises(ValueError, match="Unsupported"):
         AgentSessionId.parse("@dafx-v3-assistant@original-key")
+
+
+@pytest.mark.parametrize("name", ["v2-assistant", "V3-customer"])
+def test_historical_version_looking_names_keep_client_serialization_and_isolated_registration(name: str) -> None:
+    client = DurableAIAgentClient(Mock())
+    session = client.get_agent(name).create_session()
+    assert session.durable_session_id is not None
+    address = session.durable_session_id.entity_name
+    assert address == f"dafx-{name}"
+    restored = DurableAgentSession.from_dict(session.to_dict())
+    assert restored.durable_session_id == session.durable_session_id
+    assert AgentSessionId.parse(str(session.durable_session_id), agent_name=name).entity_name == address
+    native = TaskHubGrpcWorker(channel=Mock())
+    DurableAIAgentWorker(native, deployment_mode="isolated_v2").add_agent(
+        NonStreamingAgent(client=RecordingChatClient(), name=name)
+    )
+    assert native._registry.get_entity(address.lower()) is not None
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("name", ["v2-assistant", "V2-assistant"])
+def test_two_phase_rejects_names_in_its_actual_generation_two_namespace_before_registration(
+    legacy: bool, name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native = DurableTaskSchedulerWorker(host_address="localhost:1", taskhub="test", token_credential=None)
+    host = DurableAIAgentWorker(native, deployment_mode="two_phase", process_legacy_entities=legacy)
+    add = Mock(wraps=native.add_entity)
+    monkeypatch.setattr(native, "add_entity", add)
+    with pytest.raises(ValueError, match="two.phase.*namespace"):
+        host.add_agent(NonStreamingAgent(client=RecordingChatClient(), name=name))
+    add.assert_not_called()
+    host.add_agent(NonStreamingAgent(client=RecordingChatClient(), name="V3-customer"))
+    assert native._registry.get_entity("dafx-v2-v3-customer") is not None
+
+
+@pytest.mark.parametrize("mode", ["isolated_v2", "two_phase"])
+def test_workflow_registration_separates_historical_formatting_and_two_phase_eligibility(mode: str) -> None:
+    native = DurableTaskSchedulerWorker(host_address="localhost:1", taskhub="test", token_credential=None)
+    executor = AgentExecutor(NonStreamingAgent(client=RecordingChatClient(), name="assistant"), id="chat")
+    workflow = WorkflowBuilder(name="v2-orders", start_executor=executor, output_from=[executor]).build()
+    host = DurableAIAgentWorker(native, deployment_mode=mode)
+    if mode == "two_phase":
+        with pytest.raises(ValueError, match="two.phase.*namespace"):
+            host.configure_workflow(workflow)
+        assert not native._registry.orchestrators
+    else:
+        host.configure_workflow(workflow)
+        assert native._registry.get_orchestrator("dafx-v2-orders") is not None
+
+
+@pytest.mark.parametrize("generation", [1, 2])
+def test_nested_workflow_dispatch_and_cold_replay_preserve_recorded_generation(generation: int) -> None:
+    from _workflow_replay_test_support import _Episodes
+    from test_workflow_sdk_history_replay import _graph
+
+    workflow, _ = _graph(mixed=True)
+    native = DurableTaskSchedulerWorker(host_address="localhost:1", taskhub="test", token_credential=None)
+    DurableAIAgentWorker(native, deployment_mode="two_phase", process_legacy_entities=True).configure_workflow(workflow)
+    episodes = _Episodes(workflow, worker=native)
+    prefix = "dafx-" if generation == 1 else "dafx-v2-"
+    episodes.start(f"{prefix}audit-mixed", input=wrap_workflow_input("go"), instance_id="original-root")
+    episodes.complete_named("original-root", "seed")
+    children = [instance for instance in episodes.names if instance != "original-root"]
+    assert len(children) == 1
+    child = children[0]
+    assert episodes.names[child] == f"{prefix}audit-inner"
+    from agent_framework_durabletask._workflows.naming import subworkflow_instance_id
+
+    assert child == subworkflow_instance_id("original-root", "sub", 0)
+    episodes.complete_named(child, "b")
+    episodes.cold("original-root")
+    episodes.cold(child)
 
 
 def test_registry_extends_synthetic_versions_without_guessing_production_v3() -> None:
